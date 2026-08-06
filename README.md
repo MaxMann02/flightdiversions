@@ -155,6 +155,36 @@ Later Telegram-gegevens aanpassen: bewerk
 `/etc/systemd/system/flightdiversions.service`, dan
 `sudo systemctl daemon-reload && sudo systemctl restart flightdiversions`.
 
+### Google Cloud Free Tier (alternatief — ook écht gratis, altijd aan)
+
+Zelfde soort "voor altijd gratis" VM als Oracle hierboven, andere partij —
+handig als Oracle's accountverificatie vastloopt (een bekend, wijdverspreid
+probleem bij hen). Alleen gratis in de regio's `us-west1`, `us-central1` of
+`us-east1` — geen functioneel probleem, het dashboard laadt vanuit de VS
+iets trager, de scan-loops en Telegram-meldingen zelf merken daar niets van.
+
+1. Account op [console.cloud.google.com](https://console.cloud.google.com)
+   (creditcard voor verificatie, geen kosten binnen de gratis grenzen).
+2. Maak een project aan, dan **Compute Engine > VM instances > Create
+   Instance**:
+   - Region: **verplicht** een van `us-west1` / `us-central1` / `us-east1`
+   - Machine type: `e2-micro` (E2-serie)
+   - Boot disk: Ubuntu 22.04+ LTS, standaard schijf ≤30GB (binnen gratis grens)
+   - Create
+3. **VPC network > Firewall > Create Firewall Rule**: naam bv.
+   `allow-8787`, Source IP ranges `0.0.0.0/0`, Protocols/ports `tcp:8787`.
+4. Klik in de console op **SSH** naast je instance — opent direct een
+   terminal in de browser, geen sleutelbeheer nodig.
+5. Zelfde commando's als bij Oracle (stap 5 hierboven):
+   ```bash
+   git clone https://github.com/MaxMann02/flightdiversions.git
+   cd flightdiversions
+   TELEGRAM_BOT_TOKEN=xxx TELEGRAM_CHAT_ID=yyy bash deploy/setup_oracle_vm.sh
+   ```
+   (het script heet naar Oracle maar is gewoon generieke Ubuntu-setup, werkt hier identiek)
+6. Dashboard/link: `http://<EXTERNAL_IP>:8787` (extern IP staat bij de
+   instance in de console).
+
 **Let op: sqlite-data overleeft een herstart niet zonder persistente
 opslag.** `data/flightdiversions.sqlite3` (event-geschiedenis, geleerde
 routes, cooldowns) en `data/airports.csv` staan op de lokale schijf van het
