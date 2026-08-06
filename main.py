@@ -11,7 +11,7 @@ import certifi
 import db as db_module
 import providers
 import weather
-from airports import AirportDB, route_plausible
+from airports import AirportDB, ROUTE_REVALIDATION_WINDOW_S, route_plausible
 from config import CONFIG
 from detector import detect_emergency, detect_signal_lost_near_airport, evaluate
 from notifier import notify
@@ -38,6 +38,19 @@ async def enrich_and_dispatch(session, store: TrackStore, cfg: dict, events: lis
                 ev.confidence = "WAARSCHIJNLIJK"
                 ev.message += " (grondstatus niet bevestigd door tweede bron)"
                 log.warning("cross-provider disagreement on %s, downgraded", ev.callsign or ev.hex)
+
+        # The 'emergency status' ADS-B subfield (nordo/lifeguard/minfuel/...)
+        # is a separate, much less reliable signal than the 7700/7600/7500
+        # squawk codes — see providers.cross_provider_confirms_emergency's
+        # docstring for the live evidence. Squawk-code emergencies stay
+        # trusted as-is; only the status-field path gets corroborated.
+        if (cfg["cross_provider_consensus_enabled"] and ev.event_type == "emergency"
+                and ev.squawk not in providers.EMERGENCY_SQUAWKS):
+            confirmed = await providers.cross_provider_confirms_emergency(session, ev.hex)
+            if confirmed is False:
+                ev.confidence = "WAARSCHIJNLIJK"
+                ev.message += " (niet bevestigd door tweede bron — mogelijk onjuiste data)"
+                log.warning("emergency-status niet bevestigd door tweede provider voor %s, gedegradeerd", ev.callsign or ev.hex)
 
         if cfg["weather_enrichment_enabled"] and ev.weather_icao:
             metar = await weather.get_metar(session, ev.weather_icao)
@@ -131,6 +144,7 @@ async def tier1_loop(session, store: TrackStore, airport_db: AirportDB, cfg: dic
                                     log.info("adsbdb route voor %s lijkt niet te kloppen met huidige positie, genegeerd", cs)
                                     route = None
                             t.route = route
+                            t.route_resolved_ts = now if route is not None else None
                             # A route-less result only counts as "checked" (i.e.
                             # never retried again) once adsbdb gave a definitive
                             # answer. If the lookup merely failed to reach adsbdb,
@@ -157,16 +171,23 @@ async def tier1_loop(session, store: TrackStore, airport_db: AirportDB, cfg: dic
                 # only reveal itself as wrong later in the flight. This is a
                 # cheap, local geometry check — no extra API calls.
                 if track.route and ac.get("lat") is not None and not ac.get("on_ground"):
-                    # check_progress=False: this is the ONGOING recheck of an
-                    # already-trusted route, not the initial resolution — see
-                    # route_plausible's docstring for why the along-track
-                    # progress requirement is dropped here specifically (it
-                    # also flagged genuine diversions that fly straight past
-                    # their destination, not just bad callsign data).
+                    # Strict (check_progress=True) only within
+                    # ROUTE_REVALIDATION_WINDOW_S of resolution — long enough
+                    # to catch a callsign collision that looked plausible by
+                    # chance at first and reveals itself soon after (the
+                    # original motivating case), short enough that it can't
+                    # also strip a real, still-developing diversion. Past
+                    # that window: cross-track-only, see route_plausible's
+                    # docstring for why no fixed progress threshold can do
+                    # both jobs at once.
+                    within_revalidation_window = (
+                        track.route_resolved_ts is not None
+                        and now - track.route_resolved_ts < ROUTE_REVALIDATION_WINDOW_S
+                    )
                     if not route_plausible(
                         track.route["origin_lat"], track.route["origin_lon"],
                         track.route["destination_lat"], track.route["destination_lon"],
-                        ac["lat"], ac["lon"], check_progress=False,
+                        ac["lat"], ac["lon"], check_progress=within_revalidation_window,
                     ):
                         log.info("route voor %s niet meer plausibel gezien huidige positie, losgelaten", track.callsign)
                         track.route = None

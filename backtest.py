@@ -14,7 +14,7 @@ Run: `python backtest.py`
 import math
 from dataclasses import dataclass, field
 
-from airports import AirportDB, bearing_deg, route_plausible
+from airports import AirportDB, ROUTE_REVALIDATION_WINDOW_S, bearing_deg, route_plausible
 from config import CONFIG
 from detector import detect_emergency, detect_signal_lost_near_airport, evaluate
 from state import TrackStore
@@ -101,25 +101,32 @@ def run_case(case: Case, airport_db: AirportDB, cfg: dict | None = None) -> list
                 ac["lat"], ac["lon"],
             ):
                 track.route = None
+                track.route_resolved_ts = None
             else:
                 track.route = candidate
+                track.route_resolved_ts = s.t
             track.route_checked = True
 
         # Mirrors main.py's tier1_loop: re-check plausibility every cycle
-        # while airborne, using the relaxed (cross-track-only) check
-        # main.py uses for an already-trusted route — see route_plausible's
-        # check_progress docstring. Needed so a case like ATL->MCO->FLL
-        # below (a genuine diversion that overflies its destination in a
-        # near-straight line) actually exercises whether track.route
+        # while airborne. Strict (check_progress=True) only within
+        # ROUTE_REVALIDATION_WINDOW_S of resolution, relaxed (cross-track-
+        # only) after that — see route_plausible's check_progress docstring.
+        # Needed so a case like ATL->MCO->FLL below (a genuine diversion
+        # that overflies its destination in a near-straight line, well
+        # outside that window) actually exercises whether track.route
         # survives to the eventual landing, not just whether the geometry
         # detectors fire along the way. Resets route_checked on failure too
         # (mirrors main.py) so the block above gets a chance to re-resolve
         # (and, per its own strict check, re-reject) on the next cycle.
         if track.route and ac.get("lat") is not None and not ac["on_ground"]:
+            within_revalidation_window = (
+                track.route_resolved_ts is not None
+                and s.t - track.route_resolved_ts < ROUTE_REVALIDATION_WINDOW_S
+            )
             if not route_plausible(
                 track.route["origin_lat"], track.route["origin_lon"],
                 track.route["destination_lat"], track.route["destination_lon"],
-                ac["lat"], ac["lon"], check_progress=False,
+                ac["lat"], ac["lon"], check_progress=within_revalidation_window,
             ):
                 track.route = None
                 track.route_checked = False
@@ -202,10 +209,107 @@ def report_case(case: Case, airport_db: AirportDB, cfg: dict | None = None) -> d
     }
 
 
+# Real production data-quality issues, not diversion incidents — caught
+# live 2026-08-06 shortly after first deployment. Both callsigns resolved
+# to a filed adsbdb route that passed the OLD 1.5x route_plausible
+# threshold despite being clearly wrong for the aircraft actually observed
+# (AAL974: filed SBGL->JFK, but a domestic 737 near Dallas — a widebody-only
+# international route mismatch; SWA2820: filed KMCO->KMHT, but mid a
+# Chicago-Savannah rotation). Not Case objects like the incidents above:
+# the point here isn't "does a detector fire", it's "does route_plausible
+# correctly reject this at resolution so nothing downstream ever sees a
+# route for it at all" — a Case's expected_type/real_decision_t framing
+# doesn't fit a should-never-fire assertion. See BACKTEST_LOG.md round 7.
+BAD_ROUTE_REGRESSIONS = [
+    {
+        "name": "AAL974 filed SBGL->JFK, actually a domestic 737 near Dallas",
+        "origin": (-22.809999, -43.250557),   # SBGL
+        "dest": (40.639801, -73.7789),         # KJFK
+        "actual_pos": (32.815464, -97.167234),  # live position, 2026-08-06
+    },
+    {
+        "name": "SWA2820 filed KMCO->KMHT, actually mid Chicago-Savannah rotation",
+        "origin": (28.4294, -81.3090),    # KMCO
+        "dest": (42.9326, -71.4357),       # KMHT
+        "actual_pos": (37.941191, -85.617888),  # live position, 2026-08-06
+    },
+]
+
+
+def check_bad_route_regressions() -> bool:
+    print("\n=== route_plausible bad-data regression checks ===")
+    all_ok = True
+    for case in BAD_ROUTE_REGRESSIONS:
+        rejected = not route_plausible(*case["origin"], *case["dest"], *case["actual_pos"])
+        print(f"  {case['name']}: {'OK (correctly rejected)' if rejected else 'FAIL (would still be trusted!)'}")
+        all_ok = all_ok and rejected
+    return all_ok
+
+
+def check_course_deviation_holding_suppression() -> bool:
+    """DAL2564 (live, 2026-08-06): flagged course_deviation while actually
+    circling in a holding pattern near an airport at 24000ft with no
+    resolved route (adsbdb had no data, so detect_holding_pattern's own
+    route gate meant it never even ran — see its docstring).
+
+    Not a Case: the point is a should-mostly-NOT-fire assertion, and
+    honestly, not an absolute one — the very first turn of a freshly-
+    observed hold can still fire once (a repeating pattern can't be told
+    apart from a real turn before it's actually repeated at least once).
+    What the fix guarantees is that it does NOT keep re-firing on every
+    subsequent turn of the same ongoing hold: each turn is its own
+    detector hit (course_deviation has no memory of "already alerted on
+    this hold" the way alert_cooldown_seconds gates repeat DISPATCHES of
+    an identical event_type — a hold with turns spaced further apart than
+    the cooldown window would previously have kept clearing it and firing
+    again, turn after turn, for as long as the hold lasted). See
+    BACKTEST_LOG.md round 7."""
+    import math
+    from detector import detect_course_deviation
+    from state import AircraftTrack, TrackPoint
+
+    print("\n=== course_deviation / holding-pattern suppression check ===")
+    cfg = CONFIG
+
+    # Realistic racetrack sampling at 60s: a straight leg (stable heading)
+    # for a couple samples, then a ~180deg reversal turn, repeating — the
+    # "stable, sudden change, held for one more sample" shape that used to
+    # look identical to a genuine diversion turn every single lap.
+    headings = [10, 10, 10, 10, 190, 190, 10, 10, 190, 190, 10, 10, 190, 190]
+    track = AircraftTrack(hex="dal2564_regression")
+    fired_at = []
+    for i, hdg in enumerate(headings):
+        lat = 28.5 + 0.03 * math.sin(math.radians(hdg))
+        lon = -81.3 + 0.03 * math.cos(math.radians(hdg))
+        track.history.append(TrackPoint(ts=i * 60.0, lat=lat, lon=lon, alt_baro=24000, track=hdg, on_ground=False))
+        ev = detect_course_deviation(track, {"on_ground": False, "squawk": "1000"}, cfg)
+        if ev:
+            fired_at.append(i)
+    no_repeats = len(fired_at) <= 1
+    print(f"  DAL2564-style sustained hold, route unknown, 24000ft: fired at {fired_at or 'never'} "
+          f"— {'OK (no repeated false positives)' if no_repeats else 'FAIL (still repeats)'}")
+
+    # Sanity check: a genuine one-off sudden turn (not part of a repeating
+    # pattern, far net displacement) must still fire — proves the
+    # suppression isn't silencing course_deviation altogether.
+    track2 = AircraftTrack(hex="real_diversion_regression")
+    fired2 = False
+    for i, hdg in enumerate([90, 90, 90, 210, 210]):
+        track2.history.append(TrackPoint(ts=i * 60.0, lat=40.0 + i * 0.5, lon=-70.0 + i * 0.3,
+                                          alt_baro=35000, track=hdg, on_ground=False))
+        if detect_course_deviation(track2, {"on_ground": False, "squawk": "1000"}, cfg):
+            fired2 = True
+    print(f"  genuine one-off turn (not a hold): {'OK (still fires)' if fired2 else 'FAIL (suppression too broad!)'}")
+
+    return no_repeats and fired2
+
+
 def main():
     from backtest_cases import CASES
     airport_db = AirportDB()
     results = [report_case(c, airport_db) for c in CASES]
+    bad_route_ok = check_bad_route_regressions()
+    holding_suppression_ok = check_course_deviation_holding_suppression()
 
     print("\n=== summary ===")
     hits = sum(1 for r in results if r["detected"])
@@ -215,6 +319,8 @@ def main():
             print(f"  {r['case']}: lead {fmt_t(r['lead_seconds'])}")
         else:
             print(f"  {r['case']}: MISSED")
+    print(f"bad-route regression checks: {'all OK' if bad_route_ok else 'FAIL — see above'}")
+    print(f"course_deviation holding-pattern suppression: {'OK' if holding_suppression_ok else 'FAIL — see above'}")
 
 
 if __name__ == "__main__":

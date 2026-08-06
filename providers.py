@@ -120,6 +120,31 @@ async def cross_provider_agrees(session: aiohttp.ClientSession, hex_id: str, exp
     return ac.get("on_ground") == expected_on_ground
 
 
+async def cross_provider_confirms_emergency(session: aiohttp.ClientSession, hex_id: str) -> bool | None:
+    """Soft corroboration specifically for the ADS-B 'emergency status'
+    subfield (nordo/lifeguard/minfuel/downed/unlawful/general — the
+    non-'none' values of the `emergency` field), as opposed to the
+    7700/7600/7500 squawk codes, which stay fully trusted on their own
+    (a deliberate 4-digit pilot action, not something decode noise
+    produces). Live-tested: 4 real events in one session (EWG3BZ/EWG45B/
+    ITY067/a fourth), all squawking 1000 specifically, all reporting a
+    serious emergency status (nordo/lifeguard) that had no other
+    corroborating signal and didn't hold up — squawk 1000 is a normal
+    Mode-S conspicuity code used where ATC doesn't assign a discrete
+    squawk (common in parts of Europe), not an emergency code, so this
+    looks like a real decode/reporting quirk tied to that code path
+    specifically, not a one-off. Checks whether airplanes.live's own view
+    of this aircraft ALSO reports a non-'none' emergency status. Returns
+    None if the second provider has no data at all (unreachable/not
+    found) — caller should treat that as 'unconfirmed, not disproven',
+    same convention as cross_provider_agrees."""
+    ac = await fetch_single_aircraft(session, hex_id, base=AIRPLANESLIVE_BASE)
+    if ac is None:
+        return None
+    emergency = ac.get("emergency")
+    return bool(emergency) and emergency != "none"
+
+
 _route_cache: dict[str, dict | None] = {}
 # Separate from _route_cache: tracks callsigns whose most recent lookup
 # attempt failed to even reach adsbdb (timeout, connection error, non-200,

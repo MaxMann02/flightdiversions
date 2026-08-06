@@ -134,6 +134,25 @@ def _deviation_context(track: AircraftTrack, p_latest) -> str:
     return f" (nieuwe koers wijst niet richting oorspronkelijke bestemming {dest})"
 
 
+def _rotation_and_radius(track: AircraftTrack, n: int) -> tuple[float, float] | None:
+    """Total heading rotation (deg) and max centroid radius (nm) across the
+    last n history points, or None if there isn't enough history / heading
+    data yet. Shared by detect_holding_pattern (its primary signal) and
+    detect_course_deviation (as a suppression check — see its use there for
+    why a tight, high-rotation loiter needs to be told apart from a genuine
+    diversion turn there too, not just in detect_holding_pattern itself)."""
+    if len(track.history) < n:
+        return None
+    window = list(track.history)[-n:]
+    if any(p.track is None for p in window):
+        return None
+    total_rotation = sum(angle_diff_deg(window[i].track, window[i + 1].track) for i in range(len(window) - 1))
+    lat_c = sum(p.lat for p in window) / len(window)
+    lon_c = sum(p.lon for p in window) / len(window)
+    max_radius = max(haversine_nm(lat_c, lon_c, p.lat, p.lon) for p in window)
+    return total_rotation, max_radius
+
+
 def detect_course_deviation(track: AircraftTrack, ac: dict, cfg: dict, airport_db=None) -> Event | None:
     """Flags a SUDDEN, SUSTAINED change from the aircraft's own recent stable
     heading, rather than comparing to a straight-line bearing to the
@@ -177,6 +196,27 @@ def detect_course_deviation(track: AircraftTrack, ac: dict, cfg: dict, airport_d
         track.pending_deviation = None
         if not held:
             return None
+
+        # A held turn can also just be one leg of a racetrack/orbit hold —
+        # live-tested (DAL2564, "route unknown" so detect_holding_pattern
+        # itself never even ran, since it requires track.route): the "held
+        # for one more cycle" confirmation above isn't enough alone, since a
+        # hold's leg between turns can itself span multiple sample
+        # intervals and look just as "held" as a genuine diversion turn.
+        # Reuse detect_holding_pattern's own geometric signature (tight
+        # radius + high total rotation) as a targeted extra check —
+        # deliberately NOT gated on track.route the way
+        # detect_holding_pattern itself is: its route gate exists to tell
+        # "holding at the destination" apart from "holding elsewhere", a
+        # question that doesn't matter here — a tight, high-rotation loiter
+        # isn't a diversion turn either way, route known or not.
+        rotation_check = _rotation_and_radius(track, cfg["holding_pattern_samples"])
+        if rotation_check:
+            recent_rotation, recent_radius = rotation_check
+            if (recent_rotation >= cfg["holding_pattern_min_rotation_deg"]
+                    and recent_radius <= cfg["holding_pattern_max_radius_nm"]):
+                return None
+
         note = _probable_destination_note(airport_db, p_latest.lat, p_latest.lon, p_latest.track) if airport_db else ""
         return Event(
             hex=track.hex, callsign=track.callsign, event_type="course_deviation",
@@ -412,23 +452,18 @@ def detect_holding_pattern(track: AircraftTrack, ac: dict, airport_db, cfg: dict
         track.holding_streak = 0
         return None
 
-    window = list(track.history)[-n:]
-    if any(p.track is None for p in window):
+    rotation_check = _rotation_and_radius(track, n)
+    if rotation_check is None:
         return None
-
-    total_rotation = sum(angle_diff_deg(window[i].track, window[i + 1].track) for i in range(len(window) - 1))
+    total_rotation, max_radius = rotation_check
     if total_rotation < cfg["holding_pattern_min_rotation_deg"]:
         track.holding_streak = 0
         return None
-
-    lat_c = sum(p.lat for p in window) / len(window)
-    lon_c = sum(p.lon for p in window) / len(window)
-    max_radius = max(haversine_nm(lat_c, lon_c, p.lat, p.lon) for p in window)
     if max_radius > cfg["holding_pattern_max_radius_nm"]:
         track.holding_streak = 0
         return None  # spread too wide — a normal route with some turns, not a tight loiter
 
-    last = window[-1]
+    last = track.history[-1]
     nearest, _dist = airport_db.nearest_large(last.lat, last.lon, max_km=90.0)
     if not nearest:
         track.holding_streak = 0

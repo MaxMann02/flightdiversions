@@ -24,6 +24,16 @@ class AircraftTrack:
     callsign: str = ""
     route: dict | None = None
     route_checked: bool = False
+    # When the current route (if any) was assigned. Lets main.py's ongoing
+    # recheck apply the strict route_plausible check (check_progress=True)
+    # only for a bounded window after resolution — long enough to catch a
+    # callsign collision that "looks plausible by chance at first, reveals
+    # itself wrong soon after" (the original motivating case for this
+    # recheck), short enough that it can't also strip a real diversion
+    # that's still developing well past that window. See
+    # main.py's ROUTE_REVALIDATION_WINDOW_S and airports.route_plausible's
+    # docstring for why a single fixed threshold can't do both jobs at once.
+    route_resolved_ts: float | None = None
     history: deque = field(default_factory=lambda: deque(maxlen=HISTORY_MAXLEN))
     last_seen: float = 0.0
     # None = never observed yet (distinct from False = "was airborne last

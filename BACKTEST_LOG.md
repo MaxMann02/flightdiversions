@@ -412,4 +412,120 @@ different, route-independent heuristic (e.g. sustained airborne time +
 abrupt reversal + landing somewhere other than the departure point,
 without needing a filed route) — a real new detector to design and
 backtest from scratch, not a fix to an existing one. Good candidate for
-the next session with real budget for it.
+the next session with real budget for it. **Update, round 7: the user
+explicitly said this class doesn't matter to them — deprioritized, not
+being pursued.**
+
+## Round 7 — 2026-08-06 (same day) — first live production findings
+
+First round driven by REAL false positives observed on the live-deployed
+dashboard (Google Cloud VM, Telegram wired up), not backtest/synthetic
+review. Four issues reported in one batch; all four had a real, fixable
+root cause — none were "tune the threshold" hand-waves.
+
+**1. `route_plausible`'s 1.5x threshold was too loose for real bad adsbdb
+data.** AAL974 resolved to a filed SBGL(Rio)->KJFK route while actually a
+domestic 737 near Dallas (a widebody-only international route mismatch —
+adsbdb's schedule data for that flight number is stale); SWA2820 resolved
+to KMCO->KMHT while actually mid a Chicago-Savannah rotation. Queried both
+live (adsb.lol) to confirm real positions, computed their actual
+sum-of-distances ratios: 1.381x and 1.332x respectively — both UNDER the
+old 1.5x threshold, both comfortably ABOVE every legitimate backtest
+case's worst point (max 1.087x, EK225's real 5-hour diversion). Tightened
+`ROUTE_PLAUSIBLE_PROGRESS_MULTIPLIER` to 1.2x (new named constant in
+`airports.py`, replacing the inline `1.5`) — clean margin on both sides of
+that gap.
+
+Tightening alone only protects FUTURE resolutions, though — a track that
+already has a bad route assigned never gets re-offered to the strict
+check (`route_checked` latches, and the ongoing recheck deliberately went
+cross-track-only earlier this session specifically so it wouldn't strip a
+real diversion). Added `AircraftTrack.route_resolved_ts` and
+`ROUTE_REVALIDATION_WINDOW_S` (20min, `airports.py`): the ongoing recheck
+uses the strict check only within that window of resolution, then falls
+back to cross-track-only — catches a route that "looked plausible by
+chance, revealed itself wrong soon after" (the original UAL840 motivation)
+without being able to strip a genuine diversion still developing an hour+
+later. Verified the 20min window doesn't clip any legitimate backtest
+case (all deviate well after 20min, or never exceed 1.2x at all) and that
+both AAL974/SWA2820 fail even outside a grace window (their ratios are
+static/observed, not developing).
+
+Added `check_bad_route_regressions()` to `backtest.py` (not a `Case` —
+these are "should never even get a route" assertions, not "detector
+should fire" ones) using the exact real coordinates queried live. Both
+now correctly rejected.
+
+**2. `course_deviation` repeatedly false-fired on holding patterns with no
+resolved route.** DAL2564: flagged mid-turn in a normal hold near an
+airport, 24000ft, `route unknown`. `detect_holding_pattern` itself
+requires `track.route` (deliberately — without a route it can't tell
+"holding at destination" from "holding elsewhere", and fired 369 times in
+one run early in this project without that gate, per its own docstring)
+— so it never even ran for this track, leaving `course_deviation`'s own
+documented-but-unmitigated orbit vulnerability (see its docstring, "a
+single turn looks identical whether it's a diversion or one leg of a
+loiter pattern") fully exposed. The existing "held for one more cycle"
+stage-2 confirmation isn't enough on its own: a hold's leg between turns
+can itself span multiple sample intervals and look exactly as "held" as a
+genuine turn.
+
+Fix: extracted `_rotation_and_radius()` (total heading rotation + centroid
+radius over a window) out of `detect_holding_pattern` into a shared
+helper, and added it as a suppression check in `course_deviation`'s
+stage-2 confirmation — deliberately NOT gated on `track.route` the way
+`detect_holding_pattern` itself is, since "is this a tight, high-rotation
+loiter" doesn't need to know WHERE it's holding, only that it is one.
+Refactored `detect_holding_pattern` to use the same helper (behavior
+unchanged — AI850's case still fires at the identical +40m00s).
+
+Added `check_course_deviation_holding_suppression()` — a hand-built
+racetrack sample sequence (stable leg, ~180° reversal, repeat, matching
+real ATC hold timing) confirms course_deviation doesn't keep re-firing
+turn after turn for a sustained hold (a genuine, if not 100% absolute,
+improvement: the very first turn of a freshly-observed hold can still
+fire once, since a repeating pattern can't be recognized as such before
+it's repeated — but that's a single alert, not one per turn for the
+hold's whole duration), while a genuine one-off turn with real
+displacement still correctly fires.
+
+**3. The ADS-B 'emergency status' subfield produced false BEVESTIGD
+emergency alerts, all on squawk 1000.** Four live cases (EWG3BZ "nordo",
+EWG45B "lifeguard", ITY067 "lifeguard", a fourth) — all squawking 1000
+(a normal Mode-S conspicuity code used where ATC doesn't assign a
+discrete squawk, common in parts of Europe, NOT an emergency code) yet
+all reporting a serious `emergency` field value with nothing else
+corroborating it. This is a real field (`raw.get("emergency")`, passed
+through unmodified in `providers._normalize_aircraft` — not something the
+code invented or misread), distinct from the 7700/7600/7500 squawk codes,
+which remain a deliberate, reliable pilot action and stay untouched.
+Given the pattern (4/4 on the same unrelated squawk code, no
+corroborating symptom), this looks like a real upstream decode/reporting
+quirk tied to that code path — not confirmed via any public source, but
+the empirical pattern across 4 independent flights is strong enough to
+act on regardless of the exact root cause.
+
+Fix: added `providers.cross_provider_confirms_emergency()` (mirrors the
+existing `cross_provider_agrees` used for `wrong_airport`) — checks
+whether airplanes.live's own view of the aircraft ALSO shows a non-'none'
+emergency status. Wired into `main.py`'s `enrich_and_dispatch` for
+`event_type == "emergency"` specifically when `ev.squawk` is NOT one of
+the 7700/7600/7500 codes — downgrades to WAARSCHIJNLIJK on disagreement,
+same pattern as the existing wrong_airport check, leaves squawk-code
+emergencies alone entirely. Verified the corroboration function directly
+with mocked provider responses: disagreement -> False, agreement -> True,
+second-provider-unreachable -> None (unconfirmed, not penalized) — not
+addable to the geometry-only backtest harness since it's a live-network
+dispatch-time enrichment, not detector logic.
+
+**4. Dashboard showed "SQ 1000" with no explanation**, read by the user as
+possibly meaning something was wrong. Changed the label to "Squawk" in
+`Flight Diversions Dashboard.dc.html`.
+
+**Result:** 8/8 incident cases + all bad-route/holding-suppression
+regression checks pass. First round where every finding came from a real,
+live, currently-deployed system rather than research/backtest review —
+notably, the codebase's OWN cross-provider-corroboration pattern (built
+for `wrong_airport`) turned out to generalize cleanly to a completely
+different, unanticipated failure mode (the emergency status field) once
+one was actually found in production.

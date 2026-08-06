@@ -121,6 +121,28 @@ def angle_diff_deg(a: float, b: float) -> float:
 EARTH_RADIUS_NM = 3440.065
 
 
+# How much slack (as a multiple of the direct route length) a resolved
+# route's along-track progress is allowed before route_plausible's strict
+# (check_progress=True) mode rejects it. Live-production evidence, not just
+# backtest: two real adsbdb mismatches caught in production (AAL974
+# resolved to a filed SBGL->JFK route while actually a domestic 737 near
+# Dallas — a widebody-only route mismatch adsbdb likely never updated after
+# the flight number was reassigned; SWA2820 resolved to KMCO->KMHT while
+# actually flying a Chicago-Savannah rotation) both sat at 1.33-1.38x — the
+# OLD 1.5x threshold let both through. Every legitimate case in
+# backtest_cases.py (including EK225's 5-hour, ~2500nm real diversion)
+# stays under 1.09x even at its most extreme point. 1.2x sits with
+# comfortable margin on both sides of that gap.
+ROUTE_PLAUSIBLE_PROGRESS_MULTIPLIER = 1.2
+
+# How long after a route is (re-)resolved callers should still apply the
+# strict, check_progress=True test (rather than the relaxed, cross-track-
+# only one) — see route_plausible's docstring for why neither check alone
+# can do this job forever. Used by both main.py's ongoing recheck and
+# backtest.py's mirror of it.
+ROUTE_REVALIDATION_WINDOW_S = 20 * 60
+
+
 def route_plausible(origin_lat, origin_lon, dest_lat, dest_lon, cur_lat, cur_lon, check_progress: bool = True) -> bool:
     """Sanity check for adsbdb route data before trusting it. Live-tested:
     reused/generic callsigns (regional carriers, charter/on-demand operators
@@ -132,31 +154,34 @@ def route_plausible(origin_lat, origin_lon, dest_lat, dest_lon, cur_lat, cur_lon
     thing that's wrong, not the aircraft's behavior — better to fall back to
     "route unknown" than to alarm on bad reference data.
 
-    check_progress (default True, used when a route is FIRST resolved in
-    main.py) also requires along-route progress to add up (dist_from_origin
-    + dist_to_dest <= 1.5x route length) — reasonable at resolution time,
-    since a genuinely-matched route shouldn't already show a huge detour on
-    its very first data point.
+    check_progress (default True, used when a route is FIRST resolved, and
+    for a bounded revalidation window afterward — see main.py's
+    ROUTE_REVALIDATION_WINDOW_S) also requires along-route progress to add
+    up (dist_from_origin + dist_to_dest <= ROUTE_PLAUSIBLE_PROGRESS_MULTIPLIER
+    x route length) — reasonable early on, since a genuinely-matched route
+    shouldn't show a huge detour that soon.
 
-    check_progress=False (used for main.py's ONGOING mid-flight recheck of
-    an already-trusted route) drops that requirement and relies on
-    cross-track distance alone. Found via backtest reproduction: the strict
-    progress check also flags a GENUINE diversion that simply continues in
-    a straight line past its filed destination toward a further alternate —
-    e.g. a missed approach continuing on to another airport instead of
-    holding (see backtest_cases.py's ATL->MCO->FLL case). Cross-track
-    distance stays ~0 for that pattern (it's not a lateral deviation at
-    all), yet the progress ratio clears 1.5x once the overrun passes just
-    25% of the route's own length — trips easily on short/medium routes.
-    Using that to strip an already-trusted route mid-flight cost more real
-    detections (corridor_deviation/premature_descent/holding_pattern/
-    landed_wrong_airport all depend on track.route, and nothing ever resets
-    route_checked back to False once main.py's recheck clears it) than the
-    bad-callsign-data cases the check was protecting against. Cross-track
-    distance alone still catches that original motivating case (a callsign
-    collision onto a totally different flight's route, e.g. the documented
-    Portland->SF example above) — an unrelated flight is normally nowhere
-    near the filed route's line, not just further along it."""
+    check_progress=False (used for main.py's ONGOING recheck of a route
+    that's already survived its revalidation window) drops that
+    requirement and relies on cross-track distance alone. Found via
+    backtest reproduction: the strict progress check also flags a GENUINE
+    diversion that simply continues in a straight line past its filed
+    destination toward a further alternate — e.g. a missed approach
+    continuing on to another airport instead of holding (see
+    backtest_cases.py's ATL->MCO->FLL case). Cross-track distance stays ~0
+    for that pattern (it's not a lateral deviation at all), yet the
+    progress ratio clears the threshold once the overrun passes a modest
+    fraction of the route's own length — and grows UNboundedly the further
+    a real diversion continues, so no fixed progress threshold can ever be
+    both loose enough to tolerate a real overflight-diversion and tight
+    enough to reject bad route data at the same ratio (production evidence
+    above: AAL974/SWA2820's bad-data ratio of 1.33-1.38x is comfortably
+    BELOW what ATL->MCO->FLL's legitimate overflight case reaches, 1.88x).
+    That's why this is check_progress=False rather than just a looser
+    multiplier: no single number can do that job forever, so the ongoing
+    check gives up on progress entirely and leans on cross-track distance,
+    which a genuine diversion (still moving toward some real destination)
+    doesn't blow past the way a wrong route match does."""
     route_len = haversine_nm(origin_lat, origin_lon, dest_lat, dest_lon)
     if route_len < 1:
         return False
@@ -167,7 +192,7 @@ def route_plausible(origin_lat, origin_lon, dest_lat, dest_lon, cur_lat, cur_lon
         return True
     dist_from_origin = haversine_nm(origin_lat, origin_lon, cur_lat, cur_lon)
     dist_to_dest = haversine_nm(cur_lat, cur_lon, dest_lat, dest_lon)
-    return dist_from_origin + dist_to_dest <= route_len * 1.5
+    return dist_from_origin + dist_to_dest <= route_len * ROUTE_PLAUSIBLE_PROGRESS_MULTIPLIER
 
 
 def _intermediate_point(lat1, lon1, lat2, lon2, fraction):
