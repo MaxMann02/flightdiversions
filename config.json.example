@@ -1,0 +1,9 @@
+{
+  "telegram_bot_token": "123456789:AAExampleTokenReplaceMe",
+  "telegram_chat_id": "123456789",
+
+  "tier0_interval_seconds": 15,
+  "tier1_interval_seconds": 60,
+  "alert_cooldown_seconds": 1800,
+  "course_deviation_deg": 90
+}
