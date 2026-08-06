@@ -123,6 +123,38 @@ daarvan als env var meegegeven worden, in hoofdletters — bijv.
 hosting-platform heeft hiervoor een plek in zijn dashboard/CLI om env vars
 in te stellen zonder ze ergens op te slaan in de code.
 
+### Oracle Cloud Always Free (aanbevolen — écht gratis, altijd aan)
+
+1. Account aanmaken op [signup.oraclecloud.com](https://signup.oraclecloud.com)
+   (identiteitsverificatie via creditcard, wordt niet belast binnen de
+   gratis grenzen).
+2. Console > Compute > Instances > **Create Instance**:
+   - Image: Canonical Ubuntu (22.04+)
+   - Shape: `VM.Standard.A1.Flex` (Ampere/ARM, Always Free), bv. 1 OCPU / 6GB.
+     Krijg je "out of capacity"? Probeer een andere Availability Domain, of
+     val terug op `VM.Standard.E2.1.Micro` (AMD, ook Always Free, minder
+     resources maar ruim genoeg voor deze app).
+   - Zorg dat "Assign a public IPv4 address" aanstaat.
+   - Laat Oracle een SSH-sleutelpaar genereren en **download de private key**.
+3. Open de poort in Oracle's firewall: ga naar de instance > het
+   subnet-linkje > de Security List > **Add Ingress Rules** > Source CIDR
+   `0.0.0.0/0`, TCP, Destination Port `8787`.
+4. SSH naar de VM: `ssh -i pad/naar/key.key ubuntu@<PUBLIC_IP>`.
+5. Op de VM:
+   ```bash
+   git clone https://github.com/MaxMann02/flightdiversions.git
+   cd flightdiversions
+   TELEGRAM_BOT_TOKEN=xxx TELEGRAM_CHAT_ID=yyy bash deploy/setup_oracle_vm.sh
+   ```
+   Dit zet een venv op, installeert dependencies, en registreert een
+   systemd-service (`flightdiversions`) die automatisch herstart bij een
+   crash of VM-reboot — dat is de "24/7"-garantie.
+6. Dashboard/link: `http://<PUBLIC_IP>:8787`.
+
+Later Telegram-gegevens aanpassen: bewerk
+`/etc/systemd/system/flightdiversions.service`, dan
+`sudo systemctl daemon-reload && sudo systemctl restart flightdiversions`.
+
 **Let op: sqlite-data overleeft een herstart niet zonder persistente
 opslag.** `data/flightdiversions.sqlite3` (event-geschiedenis, geleerde
 routes, cooldowns) en `data/airports.csv` staan op de lokale schijf van het
