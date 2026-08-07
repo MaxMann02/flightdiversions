@@ -121,6 +121,11 @@ ATLANTA = (33.6367, -84.4281)
 ORLANDO = (28.4294, -81.3090)
 FORT_LAUDERDALE = (26.0726, -80.1527)
 
+ISTANBUL_IST = (41.2753, 28.7519)   # LTFM
+TORONTO_YYZ = (43.6772, -79.6306)   # CYYZ, filed destination — not reached
+NORTH_SEA_POINT = (56.0, 3.0)        # source says only "over the North Sea", no exact fix
+MANCHESTER = (53.3537, -2.2750)      # EGCC
+
 
 def _ai850():
     """Air India AI-850, Pune->Delhi, 25 May 2023. A320 VT-ETE held north
@@ -496,5 +501,55 @@ def _atl_mco_fll():
     )
 
 
+def _tk17():
+    """Turkish Airlines TK17, Istanbul(IST)->Toronto(YYZ), 29 Jul 2026.
+    B777-3F2ER (TC-JJR) reported a technical fault ~4h into the transatlantic
+    passage, cruising FL320, descended to FL260 over the North Sea while
+    coordinating with ATC, diverted to Manchester (EGCC) instead of
+    continuing to Toronto, landed runway 23L ~19:30 local (UK).
+    Source: https://airlive.net/tracking/2026/07/29/after-holding-pattern-over-the-north-sea-a-turkish-airlines-boeing-777-to-toronto-diverted-to-manchester/
+
+    Deliberately a different shape from the existing wrong_airport cases
+    (UA2078/TO3510/ATL-MCO-FLL): Istanbul->Toronto's great circle already
+    bows north across Europe/the UK, so IST->North Sea 4h in is plausibly
+    close to the FILED route, not a large corridor deviation the way
+    AI850/EK225 are — this case mainly checks that detect_landed_wrong_
+    airport still cleanly catches a genuine diversion via the landing
+    itself even when the in-flight geometry detectors have comparatively
+    little to grab onto, rather than adding a second data point for an
+    already-well-covered large-deviation shape."""
+    t0 = 0.0
+    FAULT_T = 240 * 60.0    # ~4h in, "roughly four hours into the transatlantic passage", FL320, technical fault, begins descent toward FL260
+    LANDING = 290 * 60.0    # ~4h50m total (16:40 IST local departure -> ~19:30 UK local landing), Manchester rwy 23L
+
+    leg_out = cruise_leg(ISTANBUL_IST, NORTH_SEA_POINT, 32000, t0, FAULT_T - t0)
+    leg_divert = descent_leg(NORTH_SEA_POINT, MANCHESTER, 32000, 1500, FAULT_T, (LANDING - 60) - FAULT_T)
+    samples = stitch(leg_out, leg_divert)
+    samples.append(ground_sample(MANCHESTER, LANDING))
+
+    from backtest import Case
+    return Case(
+        name="Turkish Airlines TK17 Istanbul-Toronto diverted to Manchester (2026-07-29)",
+        source="https://airlive.net/tracking/2026/07/29/after-holding-pattern-over-the-north-sea-a-turkish-airlines-boeing-777-to-toronto-diverted-to-manchester/",
+        hex_id="tcjjr001", callsign="THY17",
+        origin_icao="LTFM", dest_icao="CYYZ",
+        samples=samples,
+        expected_type="wrong_airport",
+        real_decision_t=FAULT_T,
+        real_decision_label="technical fault reported, begins descent/ATC coordination over the North Sea",
+        notes=("Exact position ('over the North Sea') and the FL320->FL260 descent's precise "
+               "timing/rate are approximated — source gives altitudes and a landing time but no "
+               "track. The 4h/4h50m timings are derived from the source's 'roughly four hours' "
+               "phrasing and the stated 16:40 Istanbul-local departure / ~19:30 UK-local landing, "
+               "not independently confirmed minute-by-minute. Squawk kept at 1200 throughout — "
+               "the source describes a technical fault handled via ATC coordination, not a "
+               "declared emergency/squawk change."),
+        milestones=[
+            ("technical fault at FL320, begins descending toward FL260 over the North Sea", FAULT_T),
+            ("lands Manchester (EGCC) runway 23L instead of Toronto", LANDING),
+        ],
+    )
+
+
 CASES = [_ai850(), _af9(), _ua2078(), _ua2078_signal_lost(), _ek225(), _ek225_premature_descent(), _to3510(),
-         _atl_mco_fll()]
+         _atl_mco_fll(), _tk17()]

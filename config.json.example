@@ -4,6 +4,5 @@
 
   "tier0_interval_seconds": 15,
   "tier1_interval_seconds": 60,
-  "alert_cooldown_seconds": 1800,
   "course_deviation_deg": 90
 }

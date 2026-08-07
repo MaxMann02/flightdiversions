@@ -5,6 +5,11 @@ import time
 _DB_PATH = os.path.join(os.path.dirname(__file__), "data", "flightdiversions.sqlite3")
 
 _SCHEMA = """
+-- Legacy: was the old per-(hex, event_type) Telegram-dispatch cooldown,
+-- superseded by incidents.py's state-transition-based notification gating
+-- (MASTERPLAN.md sectie 3, BACKTEST_LOG.md ronde 10). Kept (not dropped)
+-- so an existing deployed database doesn't need a migration for a table
+-- nothing writes to anymore; no code reads or writes it either.
 CREATE TABLE IF NOT EXISTS alert_cooldowns (
     hex TEXT NOT NULL,
     event_type TEXT NOT NULL,
@@ -53,12 +58,57 @@ CREATE TABLE IF NOT EXISTS sweep_status (
     last_tier1_ts REAL
 );
 INSERT OR IGNORE INTO sweep_status (id, tracked_count, last_tier0_ts, last_tier1_ts) VALUES (1, NULL, NULL, NULL);
+
+-- Incident lifecycle (MASTERPLAN.md sectie 3/9): one open "case" per
+-- aircraft-flight-instance, continuously re-scored across cycles by
+-- incidents.py, instead of the `events` table's one-row-per-dispatch model
+-- above (which stays as-is, an append-only raw log — incidents.py reads
+-- detector Events same as before, but now feeds them into a persistent,
+-- re-evaluated record instead of dispatching each one directly).
+CREATE TABLE IF NOT EXISTS incidents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    hex TEXT NOT NULL,
+    callsign TEXT,
+    state TEXT NOT NULL,
+    score REAL NOT NULL DEFAULT 0,
+    peak_score REAL NOT NULL DEFAULT 0,
+    opened_ts REAL NOT NULL,
+    last_evidence_ts REAL NOT NULL,
+    resolved_ts REAL,
+    resolution_reason TEXT,
+    origin_icao TEXT,
+    dest_icao TEXT,
+    last_lat REAL,
+    last_lon REAL,
+    last_alt REAL,
+    last_squawk TEXT,
+    aircraft_class TEXT,
+    notified_state TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_incidents_state ON incidents (state);
+CREATE INDEX IF NOT EXISTS idx_incidents_hex ON incidents (hex);
+
+CREATE TABLE IF NOT EXISTS incident_evidence (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    incident_id INTEGER NOT NULL REFERENCES incidents(id),
+    ts REAL NOT NULL,
+    source TEXT NOT NULL,
+    delta REAL NOT NULL,
+    description TEXT NOT NULL,
+    detector_confidence TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_evidence_incident ON incident_evidence (incident_id);
 """
 
 
-def connect() -> sqlite3.Connection:
-    os.makedirs(os.path.dirname(_DB_PATH), exist_ok=True)
-    conn = sqlite3.connect(_DB_PATH)
+def connect(db_path: str | None = None) -> sqlite3.Connection:
+    """db_path defaults to the real on-disk database; pass ':memory:' (or
+    any other sqlite3-accepted path) for tests so they don't touch the
+    real file — see backtest.py's incident-engine regression checks."""
+    path = db_path if db_path is not None else _DB_PATH
+    if path != ":memory:":
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    conn = sqlite3.connect(path)
     # main.py (writer) and server.py (reader) are separate processes sharing
     # this file — WAL lets the dashboard read without blocking on/being
     # blocked by the monitor's writes, and busy_timeout absorbs the rare
@@ -68,23 +118,6 @@ def connect() -> sqlite3.Connection:
     conn.executescript(_SCHEMA)
     conn.commit()
     return conn
-
-
-def load_cooldowns(conn: sqlite3.Connection) -> dict:
-    """Returns {(hex, event_type): last_alert_ts}. Loaded once at startup so
-    a restart doesn't immediately re-fire alerts we already sent."""
-    cur = conn.execute("SELECT hex, event_type, last_alert_ts FROM alert_cooldowns")
-    return {(row[0], row[1]): row[2] for row in cur.fetchall()}
-
-
-def save_cooldown(conn: sqlite3.Connection, hex_id: str, event_type: str, ts: float | None = None):
-    ts = ts or time.time()
-    conn.execute(
-        "INSERT INTO alert_cooldowns (hex, event_type, last_alert_ts) VALUES (?, ?, ?) "
-        "ON CONFLICT(hex, event_type) DO UPDATE SET last_alert_ts = excluded.last_alert_ts",
-        (hex_id, event_type, ts),
-    )
-    conn.commit()
 
 
 def record_route_observation(conn: sqlite3.Connection, callsign: str, origin_icao: str, destination_icao: str, ts: float | None = None):
@@ -178,6 +211,112 @@ def save_sweep_status(conn: sqlite3.Connection, tracked_count: int | None = None
         return
     conn.execute(f"UPDATE sweep_status SET {', '.join(updates)} WHERE id = 1", params)
     conn.commit()
+
+
+_INCIDENT_COLS = [
+    "id", "hex", "callsign", "state", "score", "peak_score", "opened_ts",
+    "last_evidence_ts", "resolved_ts", "resolution_reason", "origin_icao",
+    "dest_icao", "last_lat", "last_lon", "last_alt", "last_squawk",
+    "aircraft_class", "notified_state",
+]
+
+
+def _incident_row_to_dict(row) -> dict:
+    return dict(zip(_INCIDENT_COLS, row))
+
+
+def get_open_incident(conn: sqlite3.Connection, hex_id: str, open_states: tuple) -> dict | None:
+    """Most recent still-open incident for this hex, if any. open_states is
+    the tuple of non-terminal state strings (incidents.OPEN_STATES) — kept
+    as a parameter rather than imported here so db.py doesn't need to know
+    incidents.py's vocabulary, matching this file's existing style of
+    staying a thin, generic persistence layer."""
+    placeholders = ",".join("?" * len(open_states))
+    cur = conn.execute(
+        f"SELECT {','.join(_INCIDENT_COLS)} FROM incidents "
+        f"WHERE hex = ? AND state IN ({placeholders}) "
+        f"ORDER BY opened_ts DESC LIMIT 1",
+        (hex_id, *open_states),
+    )
+    row = cur.fetchone()
+    return _incident_row_to_dict(row) if row else None
+
+
+def create_incident(conn: sqlite3.Connection, hex_id: str, callsign: str, state: str,
+                     score: float, ts: float, aircraft_class: str | None = None) -> int:
+    cur = conn.execute(
+        "INSERT INTO incidents (hex, callsign, state, score, peak_score, opened_ts, "
+        "last_evidence_ts, aircraft_class) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (hex_id, callsign, state, score, score, ts, ts, aircraft_class),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def update_incident(conn: sqlite3.Connection, incident_id: int, **fields):
+    """Generic column update — fields are validated against _INCIDENT_COLS
+    so a typo'd kwarg fails loudly instead of silently doing nothing."""
+    if not fields:
+        return
+    unknown = set(fields) - set(_INCIDENT_COLS)
+    if unknown:
+        raise ValueError(f"unknown incident column(s): {unknown}")
+    cols = list(fields.keys())
+    conn.execute(
+        f"UPDATE incidents SET {', '.join(f'{c} = ?' for c in cols)} WHERE id = ?",
+        (*[fields[c] for c in cols], incident_id),
+    )
+    conn.commit()
+
+
+def add_incident_evidence(conn: sqlite3.Connection, incident_id: int, ts: float, source: str,
+                           delta: float, description: str, detector_confidence: str | None = None):
+    conn.execute(
+        "INSERT INTO incident_evidence (incident_id, ts, source, delta, description, detector_confidence) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (incident_id, ts, source, delta, description, detector_confidence),
+    )
+    conn.commit()
+
+
+def get_incident_evidence(conn: sqlite3.Connection, incident_id: int) -> list[dict]:
+    cur = conn.execute(
+        "SELECT ts, source, delta, description, detector_confidence FROM incident_evidence "
+        "WHERE incident_id = ? ORDER BY ts ASC",
+        (incident_id,),
+    )
+    cols = ["ts", "source", "delta", "description", "detector_confidence"]
+    return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+def get_active_incidents(conn: sqlite3.Connection, visible_states: tuple) -> list[dict]:
+    placeholders = ",".join("?" * len(visible_states))
+    cur = conn.execute(
+        f"SELECT {','.join(_INCIDENT_COLS)} FROM incidents "
+        f"WHERE state IN ({placeholders}) ORDER BY score DESC",
+        visible_states,
+    )
+    return [_incident_row_to_dict(row) for row in cur.fetchall()]
+
+
+def get_recent_resolved_incidents(conn: sqlite3.Connection, since_ts: float, limit: int = 20) -> list[dict]:
+    cur = conn.execute(
+        f"SELECT {','.join(_INCIDENT_COLS)} FROM incidents "
+        f"WHERE resolved_ts IS NOT NULL AND resolved_ts >= ? ORDER BY resolved_ts DESC LIMIT ?",
+        (since_ts, limit),
+    )
+    return [_incident_row_to_dict(row) for row in cur.fetchall()]
+
+
+def count_incidents_by_resolution(conn: sqlite3.Connection, since_ts: float) -> dict:
+    """{resolution_reason: count} for incidents resolved since since_ts —
+    backs the dashboard's precision-rate stat (MASTERPLAN.md sectie 10)."""
+    cur = conn.execute(
+        "SELECT resolution_reason, COUNT(*) FROM incidents "
+        "WHERE resolved_ts IS NOT NULL AND resolved_ts >= ? GROUP BY resolution_reason",
+        (since_ts,),
+    )
+    return {reason: count for reason, count in cur.fetchall()}
 
 
 def get_sweep_status(conn: sqlite3.Connection) -> dict:

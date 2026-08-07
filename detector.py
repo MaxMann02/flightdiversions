@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 
 import db as db_module
-from airports import angle_diff_deg, bearing_deg, cross_track_distance_nm, crosses_russian_airspace_zone, haversine_nm
+from airports import angle_diff_deg, bearing_deg, cross_track_distance_nm, haversine_nm
 from providers import EMERGENCY_SQUAWKS
 from state import AircraftTrack
 
@@ -28,6 +28,11 @@ class Event:
     alt: float | None = None
     origin_icao: str | None = None
     dest_icao: str | None = None
+    # Structured flag so callers (incidents.py's scoring) don't need to
+    # pattern-match ev.message text. Currently only set by
+    # detect_holding_pattern (holding AT the planned destination is weaker
+    # evidence than holding somewhere else — see its docstring).
+    at_destination: bool = False
 
 
 def _probable_destination_note(airport_db, lat: float, lon: float, heading: float) -> str:
@@ -217,6 +222,18 @@ def detect_course_deviation(track: AircraftTrack, ac: dict, cfg: dict, airport_d
                     and recent_radius <= cfg["holding_pattern_max_radius_nm"]):
                 return None
 
+        # Bow-tolerance check (MASTERPLAN.md sectie 8), same rationale as
+        # detect_route_corridor_deviation: a held turn that still points
+        # broadly toward the filed destination is more likely a real
+        # airway/STAR turn than a diversion. Only applicable when a route
+        # is known — course_deviation is deliberately route-independent
+        # otherwise (see this function's docstring), so this can't run
+        # universally the way it does in detect_route_corridor_deviation.
+        if track.route:
+            bearing_to_dest = bearing_deg(p_latest.lat, p_latest.lon, track.route["destination_lat"], track.route["destination_lon"])
+            if angle_diff_deg(p_latest.track, bearing_to_dest) <= cfg["corridor_deviation_bow_heading_deg"]:
+                return None
+
         note = _probable_destination_note(airport_db, p_latest.lat, p_latest.lon, p_latest.track) if airport_db else ""
         return Event(
             hex=track.hex, callsign=track.callsign, event_type="course_deviation",
@@ -286,23 +303,25 @@ def detect_route_corridor_deviation(track: AircraftTrack, ac: dict, cfg: dict, a
 
     route = track.route
     route_len = haversine_nm(route["origin_lat"], route["origin_lon"], route["destination_lat"], route["destination_lon"])
-    if crosses_russian_airspace_zone(route["origin_lat"], route["origin_lon"], route["destination_lat"], route["destination_lon"]):
-        # This skip is for the LEGITIMATE case: routes that can't fly the
-        # direct line at all post-2022 and so bow far off it as normal,
-        # non-diverted routing. But it used to be unconditional, keyed only
-        # off the FILED origin/destination — so it stayed in effect for the
-        # rest of the flight even after a genuine diversion had turned the
-        # aircraft fully away from that bow and toward a different
-        # continent. Backtested against Emirates EK225 (DXB->SFO A380
-        # medical-emergency turnback to LHR, 29 Jul 2026 — the same route
-        # the threshold_nm capping above was tuned against): the blanket
-        # skip made this detector permanently blind to that diversion, even
-        # hours after the turn. A real Russia-avoidance bow still makes
-        # broad progress toward the filed destination throughout; a real
-        # diversion's heading stops pointing there at all — so only skip
-        # while the current heading still roughly does.
+    # Bow-tolerance check (MASTERPLAN.md sectie 8): a route that bows off
+    # the great-circle line but whose CURRENT heading still points broadly
+    # toward the filed destination is very likely legitimate airway/wind-
+    # optimized routing, not a diversion — a genuine diversion's heading
+    # stops pointing there at all. Originally this only ran for routes
+    # crossing the Russia/Siberia zone (crosses_russian_airspace_zone);
+    # live production data (2026-08-06) showed the identical false-positive
+    # pattern well outside that zone with no other corroborating signal
+    # (AAL168 KPDX->KCLT 503nm off, ASH4002 KIAH->KOKC 85nm off, NOZ1865
+    # LIBD->ENGM 152nm off), so this now runs for every route. Unlike the
+    # original Russia-only version, a MISSING heading sample does NOT
+    # suppress here — that fallback made sense only within the narrow
+    # Russia exception; applied globally it would risk silencing a genuine
+    # diversion during a brief heading-data gap, so we only suppress on
+    # positive evidence the aircraft is still heading toward the
+    # destination.
+    if p_latest.track is not None:
         bearing_to_dest = bearing_deg(p_latest.lat, p_latest.lon, route["destination_lat"], route["destination_lon"])
-        if p_latest.track is None or angle_diff_deg(p_latest.track, bearing_to_dest) <= cfg["corridor_deviation_bow_heading_deg"]:
+        if angle_diff_deg(p_latest.track, bearing_to_dest) <= cfg["corridor_deviation_bow_heading_deg"]:
             track.corridor_deviation_streak = 0
             return None
     buffer_nm = max(30.0, min(150.0, route_len * 0.05))
@@ -480,9 +499,11 @@ def detect_holding_pattern(track: AircraftTrack, ac: dict, airport_db, cfg: dict
         if track.holding_streak < cfg["holding_pattern_destination_min_streak"]:
             return None
         route_note = f" (dit IS de geplande bestemming {track.route['destination_icao']}, maar het wachten duurt ongewoon lang)"
+        at_destination = True
     else:
         track.holding_streak = 0
         route_note = f" (geplande bestemming was {track.route['destination_icao']})"
+        at_destination = False
 
     return Event(
         hex=track.hex, callsign=track.callsign, event_type="holding_pattern",
@@ -491,14 +512,23 @@ def detect_holding_pattern(track: AircraftTrack, ac: dict, airport_db, cfg: dict
         weather_icao=nearest["icao"], lat=last.lat, lon=last.lon,
         squawk=ac.get("squawk"), alt=last.alt_baro,
         origin_icao=track.route["origin_icao"], dest_icao=track.route["destination_icao"],
+        at_destination=at_destination,
     )
 
 
-def evaluate(track: AircraftTrack, ac: dict, airport_db, cfg: dict, db_conn=None) -> list[Event]:
+def evaluate(track: AircraftTrack, ac: dict, airport_db, cfg: dict, db_conn=None, skip_behavioral: bool = False) -> list[Event]:
+    """skip_behavioral=True runs only detect_emergency — used for aircraft
+    classified as military/helicopter/GA-private/business-jet (classify.py)
+    when classification_suppress_non_airliner is on. A real emergency
+    squawk from any aircraft class is still real, urgent evidence, so
+    detect_emergency always runs regardless of this flag. See
+    MASTERPLAN.md sectie 4."""
     events = []
     ev = detect_emergency(track, ac)
     if ev:
         events.append(ev)
+    if skip_behavioral:
+        return events
     ev = detect_landed_wrong_airport(track, ac, airport_db, cfg, db_conn)
     if ev:
         events.append(ev)

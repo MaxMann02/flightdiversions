@@ -304,12 +304,455 @@ def check_course_deviation_holding_suppression() -> bool:
     return no_repeats and fired2
 
 
+def check_emergency_status_regressions() -> bool:
+    """Live production data (2026-08-06, see MASTERPLAN.md sectie 1c):
+    AUA96J squawked 1000 with the ADS-B emergency-status field set to
+    'reserved' — a DO-260B-unassigned value that can never represent a
+    real pilot action — and still reached BEVESTIGD/CONFIRMED on the
+    dashboard. Fixed in providers._normalize_aircraft (normalizes
+    'reserved' to 'none' at the source, so every downstream consumer sees
+    it consistently). Not a Case: this tests the normalization function
+    directly, same pattern as check_bad_route_regressions testing
+    route_plausible directly rather than going through a full Case."""
+    from providers import _normalize_aircraft
+
+    print("\n=== emergency-status normalization regression check ===")
+    normalized = _normalize_aircraft({"hex": "test", "emergency": "reserved", "squawk": "1000"})
+    ok = normalized["emergency"] == "none"
+    print(f"  emergency='reserved' normalized to 'none': {'OK' if ok else 'FAIL (still reserved!)'}")
+    return ok
+
+
+def check_corridor_deviation_bow_suppression() -> bool:
+    """Live production data (2026-08-06, see MASTERPLAN.md sectie 1b/8):
+    corridor_deviation fired on ordinary wind/airway-bowed routing with no
+    other corroborating signal (AAL168 KPDX->KCLT 503nm off, ASH4002
+    KIAH->KOKC 85nm off, NOZ1865 LIBD->ENGM 152nm off). The bow-tolerance
+    check — previously scoped only to routes crossing the Russia/Siberia
+    zone — now applies to every route: a bowed route whose CURRENT heading
+    still points broadly toward the filed destination is treated as
+    routine, non-diverting. Not a Case: a should-mostly-NOT-fire assertion
+    (bowed but still inbound) contrasted with a should-still-fire one
+    (bowed AND heading no longer toward the destination), same pattern as
+    check_course_deviation_holding_suppression."""
+    from detector import detect_route_corridor_deviation
+    from state import AircraftTrack, TrackPoint
+
+    print("\n=== corridor_deviation bow-tolerance suppression check ===")
+    cfg = CONFIG
+    origin = (30.0, -100.0)
+    dest = (30.0, -60.0)
+    # 8deg of latitude displacement from a same-latitude origin/dest pair —
+    # verified (not guessed) to clear the firing threshold: the great
+    # circle between two same-latitude points bows poleward, so at 4deg
+    # north the cross-track distance (~146nm) was still UNDER this route's
+    # ~207nm threshold; 8deg (~386nm) clears it with real margin.
+    lat, lon = 38.0, -80.0
+    bearing_to_dest = bearing_deg(lat, lon, dest[0], dest[1])
+
+    def make_track(bearing_offset_deg: float) -> AircraftTrack:
+        track = AircraftTrack(hex="bow_regression")
+        track.route = {
+            "origin_icao": "ORIG", "origin_lat": origin[0], "origin_lon": origin[1],
+            "destination_icao": "DEST", "destination_lat": dest[0], "destination_lon": dest[1],
+        }
+        heading = (bearing_to_dest + bearing_offset_deg) % 360
+        for i in range(cfg["corridor_deviation_min_samples"] + 1):
+            track.history.append(TrackPoint(ts=i * 60.0, lat=lat, lon=lon + i * 0.01, alt_baro=38000, track=heading, on_ground=False))
+        return track
+
+    ac = {"on_ground": False, "squawk": "1200"}
+
+    still_inbound = make_track(20.0)  # heading only 20deg off bearing-to-dest
+    fired_inbound = None
+    for _ in range(cfg["corridor_deviation_min_samples"] + 1):
+        fired_inbound = detect_route_corridor_deviation(still_inbound, ac, cfg, airport_db=None)
+    suppressed_ok = fired_inbound is None
+    print(f"  bowed route, heading still ~toward destination: {'OK (suppressed)' if suppressed_ok else 'FAIL (still fired)'}")
+
+    diverted = make_track(120.0)  # heading well off bearing-to-dest
+    fired_diverted = None
+    for _ in range(cfg["corridor_deviation_min_samples"] + 1):
+        fired_diverted = detect_route_corridor_deviation(diverted, ac, cfg, airport_db=None)
+    still_fires_ok = fired_diverted is not None
+    print(f"  bowed route, heading no longer toward destination: {'OK (still fires)' if still_fires_ok else 'FAIL (suppression too broad!)'}")
+
+    return suppressed_ok and still_fires_ok
+
+
+def check_classification_regressions() -> bool:
+    """classify.py's decision order (MASTERPLAN.md sectie 4), sanity-checked
+    against real live dbFlags/category values seen 2026-08-06 via
+    api.adsb.lol/v2/mil (an H60 and an AS65 helicopter and a C-17 transport,
+    all dbFlags=1, categories A7/A7/A5 respectively — confirms dbFlags
+    correctly wins over category) plus synthetic cases for the branches that
+    snapshot didn't happen to cover (a military feed only returns military
+    aircraft, so it can't exercise the non-military branches)."""
+    import classify
+
+    print("\n=== aircraft classification regression check ===")
+    cases = [
+        ("military dbFlags wins over rotorcraft category (live: AS65, cat A7, dbFlags=1)",
+         {"db_flags": 1, "category": "A7", "callsign": "", "type": "AS65"}, classify.MILITARY),
+        ("military dbFlags wins over heavy category (live: C-17, cat A5, dbFlags=1)",
+         {"db_flags": 1, "category": "A5", "callsign": "TIGER11", "type": "C17"}, classify.MILITARY),
+        ("civilian rotorcraft, no military flag",
+         {"db_flags": 0, "category": "A7", "callsign": "", "type": "EC35"}, classify.HELICOPTER),
+        ("UAV/drone category",
+         {"db_flags": 0, "category": "B6", "callsign": "", "type": ""}, classify.LIGHT_OTHER),
+        ("airline callsign + airliner-scale category -> AIRLINER",
+         {"db_flags": 0, "category": "A3", "callsign": "AAL168", "type": "B738"}, classify.AIRLINER),
+        ("light category, non-airline callsign -> GA_PRIVE",
+         {"db_flags": 0, "category": "A1", "callsign": "N12345", "type": "C172"}, classify.GA_PRIVATE),
+        ("large-category bizjet type, no airline callsign -> ZAKENJET via type fallback",
+         {"db_flags": 0, "category": "A3", "callsign": "", "type": "GLF6"}, classify.BUSINESS_JET),
+        ("nothing recognizable -> ONBEKEND (not suppressed)",
+         {"db_flags": 0, "category": "", "callsign": "", "type": ""}, classify.UNKNOWN),
+    ]
+    all_ok = True
+    for label, ac, expected in cases:
+        got = classify.classify(ac)
+        ok = got == expected
+        all_ok = all_ok and ok
+        print(f"  {label}: {'OK' if ok else f'FAIL (got {got}, expected {expected})'}")
+    return all_ok
+
+
+def check_route_widening_regressions() -> bool:
+    """Pure-logic checks for the phase-1 route-widening additions
+    (MASTERPLAN.md sectie 5) that don't need a live network call: hexdb.io
+    route-string parsing, and the adsbdb negative-retry timing logic. Live
+    network shape (hexdb.io's route/aircraft endpoints, adsbdb's response
+    shape) was smoke-tested manually against the real services while
+    writing this — see MASTERPLAN.md sectie 2.2 for the confirmed examples
+    — not re-verified here, same convention as providers.route_lookup_
+    pending_retry (BACKTEST_LOG.md ronde 5: 'verified with a standalone
+    async repro ... not backtested via backtest.py, since this is a
+    live-network provider concern')."""
+    import time as _time
+
+    import providers
+
+    print("\n=== route-widening (hexdb.io + negative-retry) regression check ===")
+    all_ok = True
+
+    # hexdb.io route string "EDLW-LROP" -> ("EDLW", "LROP") parsing,
+    # exercised via the same partition logic lookup_route_hexdb uses.
+    route_str = "EDLW-LROP"
+    origin, _, dest = route_str.partition("-")
+    parsed_ok = (origin, dest) == ("EDLW", "LROP")
+    all_ok = all_ok and parsed_ok
+    print(f"  hexdb.io route-string parsing ('EDLW-LROP' -> EDLW/LROP): {'OK' if parsed_ok else 'FAIL'}")
+
+    cfg = dict(CONFIG)
+    cfg["route_lookup_negative_retry_hours"] = 1 / 3600  # 1 second, for a fast test
+    callsign = "ROUTE_WIDENING_REGRESSION_TEST"  # already uppercase — route_lookup_negative_retry_due normalizes internally, so the test's direct cache writes must match
+    providers._route_cache.pop(callsign, None)
+    providers._route_cache_negative_at.pop(callsign, None)
+
+    not_yet_negative = not providers.route_lookup_negative_retry_due(callsign, cfg)
+    all_ok = all_ok and not_yet_negative
+    print(f"  never-looked-up callsign is not treated as a due negative: {'OK' if not_yet_negative else 'FAIL'}")
+
+    providers._route_cache[callsign] = None
+    providers._route_cache_negative_at[callsign] = _time.monotonic()
+    fresh_negative_not_due = not providers.route_lookup_negative_retry_due(callsign, cfg)
+    all_ok = all_ok and fresh_negative_not_due
+    print(f"  fresh negative result not yet due for retry: {'OK' if fresh_negative_not_due else 'FAIL'}")
+
+    providers._route_cache_negative_at[callsign] = _time.monotonic() - 5  # older than the 1s test window
+    aged_negative_due = providers.route_lookup_negative_retry_due(callsign, cfg)
+    all_ok = all_ok and aged_negative_due
+    print(f"  aged-out negative result is due for retry: {'OK' if aged_negative_due else 'FAIL'}")
+
+    providers._route_cache[callsign] = {"origin_icao": "TEST"}
+    real_route_never_due = not providers.route_lookup_negative_retry_due(callsign, cfg)
+    all_ok = all_ok and real_route_never_due
+    print(f"  a real cached route is never treated as a due negative: {'OK' if real_route_never_due else 'FAIL'}")
+
+    providers._route_cache.pop(callsign, None)
+    providers._route_cache_negative_at.pop(callsign, None)
+    return all_ok
+
+
+def check_incident_engine_regressions(airport_db: AirportDB) -> bool:
+    """Standalone smoke test for incidents.py (MASTERPLAN.md sectie 3),
+    wired into main.py's tier0_loop/tier1_loop as of BACKTEST_LOG.md ronde
+    10. Uses a throwaway in-memory sqlite db (db.connect(':memory:')) so it
+    never touches the real database. Exercises: first-hit vs repeat-hit
+    scoring, threshold crossings (BEWAKING invisible -> MOGELIJK ->
+    BEVESTIGD), notification gating (no duplicate escalation notices),
+    deviation-recovery, landing-based resolution, and score decay ->
+    auto-close as a false alarm."""
+    import classify
+    import db as db_module
+    import incidents as incidents_module
+    from detector import Event
+
+    print("\n=== incident engine regression check ===")
+    all_ok = True
+
+    conn = db_module.connect(":memory:")
+    cfg = dict(CONFIG)
+    mgr = incidents_module.IncidentManager(conn, cfg, airport_db)
+
+    # 1. First-hit corridor_deviation (weight 30) opens straight at
+    # MOGELIJK (>= threshold 25) without a notification — a detector Event
+    # has already survived its own internal filtering, so its first hit
+    # should be visible immediately, not buried in BEWAKING; MOGELIJK never
+    # notifies (MASTERPLAN.md sectie 3.6).
+    ev1 = Event(hex="inc_test_1", callsign="TST100", event_type="corridor_deviation",
+                confidence="MOGELIJK", message="test", origin_icao="EHAM", dest_icao="EGLL")
+    t1 = mgr.step("inc_test_1", "TST100", classify.AIRLINER, [ev1], {"squawk": "1200"}, 1000.0)
+    state1 = mgr._open["inc_test_1"]["state"]
+    ok = state1 == incidents_module.POSSIBLE and not t1
+    all_ok = all_ok and ok
+    print(f"  first corridor_deviation hit opens at MOGELIJK, no notification: {'OK' if ok else f'FAIL (state={state1}, transitions={t1})'}")
+
+    # 2. A repeat corridor_deviation hit adds a smaller top-up (+10, not
+    # +30) — expected score ~40, still under the LIKELY threshold (55).
+    ev2 = Event(hex="inc_test_1", callsign="TST100", event_type="corridor_deviation",
+                confidence="MOGELIJK", message="test2", origin_icao="EHAM", dest_icao="EGLL")
+    mgr.step("inc_test_1", "TST100", classify.AIRLINER, [ev2], {"squawk": "1200"}, 1060.0)
+    score2 = mgr._open["inc_test_1"]["score"]
+    ok = 35.0 <= score2 <= 45.0
+    all_ok = all_ok and ok
+    print(f"  repeat corridor_deviation hit adds a smaller top-up (score={score2:.0f}, expected ~40): {'OK' if ok else 'FAIL'}")
+
+    # 3. An emergency squawk escalates straight to BEVESTIGD with exactly
+    # one notification.
+    ev3 = Event(hex="inc_test_1", callsign="TST100", event_type="emergency",
+                confidence="BEVESTIGD", message="squawk 7700", squawk="7700")
+    t3 = mgr.step("inc_test_1", "TST100", classify.AIRLINER, [ev3], {"squawk": "7700"}, 1120.0)
+    state3 = mgr._open["inc_test_1"]["state"]
+    ok = (state3 == incidents_module.CONFIRMED and len(t3) == 1
+          and t3[0]["kind"] == "escalation" and t3[0]["new_state"] == incidents_module.CONFIRMED)
+    all_ok = all_ok and ok
+    print(f"  emergency squawk escalates straight to BEVESTIGD with one notification: {'OK' if ok else f'FAIL (state={state3}, transitions={t3})'}")
+
+    # 4. Re-stepping with no new events and an unchanged state doesn't
+    # re-notify (notified_state gate).
+    t4 = mgr.step("inc_test_1", "TST100", classify.AIRLINER, [], {"squawk": "7700"}, 1180.0)
+    ok = len(t4) == 0
+    all_ok = all_ok and ok
+    print(f"  no duplicate notification on unchanged state: {'OK' if ok else f'FAIL (transitions={t4})'}")
+
+    # 5. Deviation recovery: a fresh incident with ONLY a course_deviation
+    # (no emergency/wrong_airport reinforcing it) loses score when heading
+    # points back at the destination — the mechanism behind "if it turns
+    # out to be a false alert, it may disappear from the list again".
+    dest_ap = airport_db.get("EGLL")
+    ev5 = Event(hex="inc_test_2", callsign="TST200", event_type="course_deviation",
+                confidence="MOGELIJK", message="test", origin_icao="EHAM", dest_icao="EGLL")
+    mgr.step("inc_test_2", "TST200", classify.AIRLINER, [ev5], {"squawk": "1200"}, 2000.0)
+    score_before = mgr._open["inc_test_2"]["score"]
+    # Position due south of EGLL, heading due north -> bearing to EGLL ~0deg, matches heading.
+    recovery_ac = {"squawk": "1200", "lat": dest_ap["lat"] - 2.0, "lon": dest_ap["lon"], "track": 0.0}
+    mgr.step("inc_test_2", "TST200", classify.AIRLINER, [], recovery_ac, 2060.0)
+    still_open = "inc_test_2" in mgr._open
+    score_after = mgr._open["inc_test_2"]["score"] if still_open else 0.0
+    ok = (not still_open) or score_after < score_before
+    all_ok = all_ok and ok
+    print(f"  deviation-only incident recovers when heading points back at destination "
+          f"(before={score_before:.0f}, after={score_after:.0f}): {'OK' if ok else 'FAIL'}")
+
+    # 6. Landing at the expected destination closes the incident as
+    # GESLOTEN_NORMAAL.
+    ev6 = Event(hex="inc_test_3", callsign="TST300", event_type="premature_descent",
+                confidence="MOGELIJK", message="test", origin_icao="EHAM", dest_icao="EGLL")
+    mgr.step("inc_test_3", "TST300", classify.AIRLINER, [ev6], {"squawk": "1200"}, 3000.0)
+    landed_ac = {"squawk": "1200", "on_ground": True, "lat": dest_ap["lat"], "lon": dest_ap["lon"]}
+    mgr.step("inc_test_3", "TST300", classify.AIRLINER, [], landed_ac, 3060.0)
+    ok = "inc_test_3" not in mgr._open
+    all_ok = all_ok and ok
+    print(f"  landing at the expected destination closes the incident: {'OK' if ok else 'FAIL (still open)'}")
+
+    # 7. Idle decay -> auto-close as a false alarm past the idle floor
+    # (tiny floor/decay values so the test runs in a handful of iterations).
+    fast_cfg = dict(cfg)
+    fast_cfg["incident_score_decay_floor_minutes"] = 1
+    fast_cfg["incident_score_decay_factor_per_cycle"] = 0.5
+    mgr2 = incidents_module.IncidentManager(db_module.connect(":memory:"), fast_cfg, airport_db)
+    ev7 = Event(hex="inc_test_4", callsign="TST400", event_type="holding_pattern",
+                confidence="MOGELIJK", message="test", origin_icao="EHAM", dest_icao="EGLL", at_destination=False)
+    mgr2.step("inc_test_4", "TST400", classify.GA_PRIVATE, [ev7], {"squawk": "1200"}, 4000.0)
+    now_t = 4000.0
+    closed = False
+    for _ in range(10):
+        now_t += 300.0
+        mgr2.step("inc_test_4", "TST400", classify.GA_PRIVATE, [], {"squawk": "1200"}, now_t)
+        if "inc_test_4" not in mgr2._open:
+            closed = True
+            break
+    all_ok = all_ok and closed
+    print(f"  idle incident decays and auto-closes as a false alarm: {'OK' if closed else 'FAIL (never closed)'}")
+
+    # 8. wrong_airport evidence + landing somewhere other than the filed
+    # destination closes as GESLOTEN_GELAND (a confirmed diversion), not
+    # left open to eventually mislabel itself GESLOTEN_VALS_ALARM once it
+    # goes quiet. Found via self-review (BACKTEST_LOG.md ronde 15):
+    # CLOSED_LANDED was a defined state no code path ever actually reached.
+    other_ap = airport_db.get("EDDF")
+    ev8 = Event(hex="inc_test_5", callsign="TST500", event_type="wrong_airport",
+                confidence="BEVESTIGD", message="test", origin_icao="EHAM", dest_icao="EGLL")
+    mgr.step("inc_test_5", "TST500", classify.AIRLINER, [ev8], {"squawk": "1200"}, 5000.0)
+    landed_wrong_ac = {"squawk": "1200", "on_ground": True, "lat": other_ap["lat"], "lon": other_ap["lon"]}
+    t8 = mgr.step("inc_test_5", "TST500", classify.AIRLINER, [], landed_wrong_ac, 5060.0)
+    ok = ("inc_test_5" not in mgr._open and len(t8) == 1
+          and t8[0]["new_state"] == incidents_module.CLOSED_LANDED)
+    all_ok = all_ok and ok
+    print(f"  wrong_airport + landing elsewhere closes as GESLOTEN_GELAND, not left to decay: {'OK' if ok else f'FAIL (transitions={t8})'}")
+
+    # 9. An incident that reached BEVESTIGD (and was notified) closes as
+    # GESLOTEN_TIMEOUT if it later goes idle, not GESLOTEN_VALS_ALARM —
+    # the latter would misrepresent a real, once-confirmed incident as
+    # having turned out to be nothing. Same root cause / same round as #8.
+    fast_cfg2 = dict(cfg)
+    fast_cfg2["incident_score_decay_floor_minutes"] = 1
+    fast_cfg2["incident_score_decay_factor_per_cycle"] = 0.5
+    mgr3 = incidents_module.IncidentManager(db_module.connect(":memory:"), fast_cfg2, airport_db)
+    ev9 = Event(hex="inc_test_6", callsign="TST600", event_type="emergency",
+                confidence="BEVESTIGD", message="test", squawk="7700")
+    mgr3.step("inc_test_6", "TST600", classify.AIRLINER, [ev9], {"squawk": "7700"}, 6000.0)
+    now_t2, closed_state = 6000.0, None
+    for _ in range(15):
+        now_t2 += 300.0
+        # squawk back to 1200 for reassessment purposes: simulates the
+        # emergency clearing, which is what actually allows decay to run
+        # at all (an active emergency squawk is exempt from decay).
+        trans = mgr3.step("inc_test_6", "TST600", classify.AIRLINER, [], {"squawk": "1200"}, now_t2)
+        if "inc_test_6" not in mgr3._open:
+            closed_state = trans[0]["new_state"] if trans else None
+            break
+    ok = closed_state == incidents_module.CLOSED_TIMEOUT
+    all_ok = all_ok and ok
+    print(f"  previously-BEVESTIGD incident going idle closes as GESLOTEN_TIMEOUT, not a false alarm: {'OK' if ok else f'FAIL (closed_state={closed_state})'}")
+
+    # 10. Deviation-recovery must still work a SECOND time on the same
+    # incident (regression for the permanent-disable bug fixed this round
+    # in _check_deviation_recovered — see its docstring).
+    ev10a = Event(hex="inc_test_7", callsign="TST700", event_type="course_deviation",
+                  confidence="MOGELIJK", message="test", origin_icao="EHAM", dest_icao="EGLL")
+    mgr.step("inc_test_7", "TST700", classify.AIRLINER, [ev10a], {"squawk": "1200"}, 7000.0)
+    recovery_ac2 = {"squawk": "1200", "lat": dest_ap["lat"] - 2.0, "lon": dest_ap["lon"], "track": 0.0}
+    mgr.step("inc_test_7", "TST700", classify.AIRLINER, [], recovery_ac2, 7060.0)  # first recovery
+    ev10b = Event(hex="inc_test_7", callsign="TST700", event_type="course_deviation",
+                  confidence="MOGELIJK", message="test2", origin_icao="EHAM", dest_icao="EGLL")
+    mgr.step("inc_test_7", "TST700", classify.AIRLINER, [ev10b], {"squawk": "1200"}, 7120.0)  # diverges again
+    score_before_2nd_recovery = mgr._open["inc_test_7"]["score"]
+    mgr.step("inc_test_7", "TST700", classify.AIRLINER, [], recovery_ac2, 7180.0)  # second recovery attempt
+    score_after_2nd_recovery = mgr._open["inc_test_7"]["score"] if "inc_test_7" in mgr._open else 0.0
+    ok = score_after_2nd_recovery < score_before_2nd_recovery
+    all_ok = all_ok and ok
+    print(f"  deviation-recovery still works a second time on the same incident "
+          f"(before={score_before_2nd_recovery:.0f}, after={score_after_2nd_recovery:.0f}): {'OK' if ok else 'FAIL (permanently disabled after first recovery)'}")
+
+    return all_ok
+
+
+def check_airspace_regressions(airport_db: AirportDB) -> bool:
+    """Standalone smoke test for airspace.py (MASTERPLAN.md sectie 6.1) and
+    incidents.py's peer-consensus check (sectie 6.2), both new in
+    BACKTEST_LOG.md ronde 10. No network calls: point-in-polygon and
+    explain_position are tested directly against a hand-built square
+    polygon; peer-consensus is tested by seeding IncidentManager's
+    in-memory state directly rather than going through step()'s full
+    detector-Event path."""
+    import classify
+    import db as db_module
+    import incidents as incidents_module
+    from airspace import _parse_tfr_feature, _point_in_polygon, explain_position
+
+    print("\n=== airspace (weather + peer-consensus) regression check ===")
+    all_ok = True
+
+    # Real TFR GeoJSON feature, live-captured 2026-08-07 from
+    # tfr.faa.gov's public GeoServer WFS endpoint (1NM N Ouray, CO — see
+    # BACKTEST_LOG.md ronde 13) — not synthetic, an actual API response
+    # shape, same convention as check_bad_route_regressions using real
+    # coordinates.
+    tfr_feature = {
+        "type": "Feature", "id": "V_TFR_LOC.6/9802",
+        "geometry": {"type": "Polygon", "coordinates": [[
+            [-107.79166667, 38.25833333], [-107.74166667, 38.01666667],
+            [-107.26666667, 38.03333333], [-107.25833333, 38.225],
+            [-107.45, 38.34166667], [-107.65, 38.34166667], [-107.79166667, 38.25833333],
+        ]]},
+        "properties": {
+            "GID": 231054, "CNS_LOCATION_ID": "ZDV", "NOTAM_KEY": "6/9802-1-FDC-F",
+            "TITLE": "1NM N OURAY, CO, Wednesday, July 29, 2026 through Tuesday, August 11, 2026 UTC",
+            "STATE": "CO", "LEGAL": "HAZARDS",
+        },
+    }
+    parsed = _parse_tfr_feature(tfr_feature)
+    inside_ouray = parsed is not None and _point_in_polygon(38.15, -107.5, parsed["polygon"])
+    ok = parsed is not None and parsed["id"] == "6/9802-1-FDC-F" and inside_ouray
+    all_ok = all_ok and ok
+    print(f"  real TFR GeoJSON feature parses and its polygon contains a point near Ouray, CO: {'OK' if ok else 'FAIL'}")
+
+    non_polygon = _parse_tfr_feature({"type": "Feature", "geometry": {"type": "MultiPolygon", "coordinates": []}, "properties": {}})
+    ok = non_polygon is None
+    all_ok = all_ok and ok
+    print(f"  non-Polygon TFR geometry (e.g. MultiPolygon) skipped, not crashed: {'OK' if ok else 'FAIL'}")
+
+    # A simple square polygon: lat 10-11, lon 10-11.
+    square = [(10.0, 10.0), (10.0, 11.0), (11.0, 11.0), (11.0, 10.0), (10.0, 10.0)]
+    inside_ok = _point_in_polygon(10.5, 10.5, square) is True
+    outside_ok = _point_in_polygon(20.0, 20.0, square) is False
+    all_ok = all_ok and inside_ok and outside_ok
+    print(f"  point-in-polygon (inside/outside a hand-built square): {'OK' if inside_ok and outside_ok else 'FAIL'}")
+
+    hazard = {"hazard": "CONVECTIVE", "id": "TEST1", "alt_lo_ft": 10000, "alt_hi_ft": 40000, "polygon": square}
+    alt_match = explain_position(10.5, 10.5, 25000, [hazard]) is not None
+    alt_no_match = explain_position(10.5, 10.5, 45000, [hazard]) is None
+    pos_no_match = explain_position(20.0, 20.0, 25000, [hazard]) is None
+    ok = alt_match and alt_no_match and pos_no_match
+    all_ok = all_ok and ok
+    print(f"  explain_position altitude + position filtering: {'OK' if ok else 'FAIL'}")
+
+    # Peer-consensus: 3 incidents in the same coarse grid cell should
+    # trigger consensus for each other; a 4th far away should not.
+    conn = db_module.connect(":memory:")
+    cfg = dict(CONFIG)
+    mgr = incidents_module.IncidentManager(conn, cfg, airport_db)
+    from detector import Event
+    for i, (lat, lon) in enumerate([(50.01, 10.01), (50.05, 10.08), (50.09, 10.02)]):
+        ev = Event(hex=f"peer_test_{i}", callsign=f"PT{i}", event_type="corridor_deviation",
+                    confidence="MOGELIJK", message="test", lat=lat, lon=lon)
+        mgr.step(f"peer_test_{i}", f"PT{i}", classify.AIRLINER, [ev], {"squawk": "1200"}, 5000.0)
+    ev_far = Event(hex="peer_test_far", callsign="PTFAR", event_type="corridor_deviation",
+                    confidence="MOGELIJK", message="test", lat=-30.0, lon=140.0)
+    mgr.step("peer_test_far", "PTFAR", classify.AIRLINER, [ev_far], {"squawk": "1200"}, 5000.0)
+
+    clustered_count = mgr._peer_consensus_count(mgr._open["peer_test_0"])
+    far_count = mgr._peer_consensus_count(mgr._open["peer_test_far"])
+    ok = clustered_count == 2 and far_count == 0
+    all_ok = all_ok and ok
+    print(f"  peer-consensus grid clustering (clustered={clustered_count}, expected 2; far={far_count}, expected 0): {'OK' if ok else 'FAIL'}")
+
+    # Reassess should now apply peer_consensus evidence for a clustered
+    # incident (3 total in-cell >= peer_consensus_min_aircraft default 3).
+    mgr.reassess("peer_test_0", {"squawk": "1200"}, 5060.0)
+    evidence_sources = {e["source"] for e in db_module.get_incident_evidence(conn, mgr._open["peer_test_0"]["id"])}
+    ok = "peer_consensus" in evidence_sources
+    all_ok = all_ok and ok
+    print(f"  reassess() applies peer_consensus evidence for a clustered incident: {'OK' if ok else 'FAIL'}")
+
+    return all_ok
+
+
 def main():
     from backtest_cases import CASES
     airport_db = AirportDB()
     results = [report_case(c, airport_db) for c in CASES]
     bad_route_ok = check_bad_route_regressions()
     holding_suppression_ok = check_course_deviation_holding_suppression()
+    emergency_status_ok = check_emergency_status_regressions()
+    bow_suppression_ok = check_corridor_deviation_bow_suppression()
+    classification_ok = check_classification_regressions()
+    route_widening_ok = check_route_widening_regressions()
+    incident_engine_ok = check_incident_engine_regressions(airport_db)
+    airspace_ok = check_airspace_regressions(airport_db)
 
     print("\n=== summary ===")
     hits = sum(1 for r in results if r["detected"])
@@ -321,6 +764,12 @@ def main():
             print(f"  {r['case']}: MISSED")
     print(f"bad-route regression checks: {'all OK' if bad_route_ok else 'FAIL — see above'}")
     print(f"course_deviation holding-pattern suppression: {'OK' if holding_suppression_ok else 'FAIL — see above'}")
+    print(f"emergency-status normalization: {'OK' if emergency_status_ok else 'FAIL — see above'}")
+    print(f"corridor_deviation bow-tolerance suppression: {'OK' if bow_suppression_ok else 'FAIL — see above'}")
+    print(f"aircraft classification: {'OK' if classification_ok else 'FAIL — see above'}")
+    print(f"route widening (hexdb.io + negative-retry): {'OK' if route_widening_ok else 'FAIL — see above'}")
+    print(f"incident engine: {'OK' if incident_engine_ok else 'FAIL — see above'}")
+    print(f"airspace (weather + peer-consensus): {'OK' if airspace_ok else 'FAIL — see above'}")
 
 
 if __name__ == "__main__":

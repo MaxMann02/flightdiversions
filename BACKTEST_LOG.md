@@ -529,3 +529,607 @@ notably, the codebase's OWN cross-provider-corroboration pattern (built
 for `wrong_airport`) turned out to generalize cleanly to a completely
 different, unanticipated failure mode (the emergency status field) once
 one was actually found in production.
+
+## Round 8 — 2026-08-06 (same day) — MASTERPLAN.md phase 0
+
+Follow-up session: pulled `/api/events` from the live-deployed dashboard
+directly (not just re-reading round 7's findings) to re-diagnose "the
+dashboard is still mostly false positives" against fresh data, wrote
+`MASTERPLAN.md` (a full redesign toward a stateful incident/scoring system,
+phased for later sessions), then implemented that plan's phase 0 —
+the subset that needed no new external data source and no architecture
+change, just using data already being fetched plus generalizing an
+existing, already-validated heuristic.
+
+**Live re-diagnosis (fresh numbers, not a repeat of round 7):** of the last
+~200 dashboard events, 88% were MOGELIJK/POSSIBLE and even the
+BEVESTIGD/CONFIRMED bucket wasn't clean — AUA96J reached CONFIRMED on
+`emergency == "reserved"`, a DO-260B-unassigned value that can't represent
+a real pilot action. `corridor_deviation` fired repeatedly on ordinary
+wind/airway-bowed routing with zero corroboration (AAL168 KPDX->KCLT
+503nm off the great-circle line, ASH4002 KIAH->KOKC 85nm off, NOZ1865
+LIBD->ENGM 152nm off — the same "legitimate bow" pattern the existing
+Russia-zone exception already knew about, just not generalized). Several
+`course_deviation` events had no resolved route at all despite clearly
+airline-style callsigns (AAL1936, AAY2648) — an adsbdb coverage gap, not a
+detector problem. Full writeup with all examples: `MASTERPLAN.md` sectie 1.
+
+**Change 1: two free fields were sitting unused in every response.**
+`providers._normalize_aircraft` now extracts `category` (ADS-B emitter
+category — A7=rotorcraft, A1/A2=light/small GA, A3-A5=airliner-scale,
+B1-B7=glider/UAV/ultralight/etc, all per DO-260B) and `db_flags`
+(bit0=military) from the raw adsb.lol/airplanes.live payload — both were
+already being fetched every cycle, just never read. New `classify.py`
+uses these plus the existing `AIRLINE_CALLSIGN_RE` callsign pattern (and,
+for business jets without a light ADS-B category, a small hardcoded
+ICAO-type list) to sort every tracked aircraft into MILITAIR / HELIKOPTER
+/ OVERIG_LICHT / AIRLINER / GA_PRIVE / ZAKENJET / ONBEKEND, cached per
+track for `classification_cache_ttl_hours` (new config key, default 24h —
+aircraft type/operator can't change mid-flight).
+
+**Change 2: non-airliner classes skip the five behavioral detectors
+entirely.** New config key `classification_suppress_non_airliner`
+(default on). `detector.evaluate()` gained a `skip_behavioral` parameter;
+when the classifier puts a track in MILITAIR/HELIKOPTER/OVERIG_LICHT/
+GA_PRIVE/ZAKENJET, `main.py`'s `tier1_loop` skips straight to
+`detect_emergency` only — `course_deviation`, `corridor_deviation`,
+`holding_pattern`, `premature_descent`, `landed_wrong_airport`, and
+`signal_lost_near_airport` never even run, so no incident is opened for
+routine GA/military/helicopter/business-jet traffic on an "unknown route"
+that was never going to have one. `detect_emergency` (squawk-based) is
+deliberately NEVER gated by class — a real emergency squawk from a Cessna
+or an F-16 is exactly as real as from an airliner. Not backtested via
+`backtest.py`'s Case harness (that's geometry/timing, this is a
+classification lookup) — a new `check_classification_regressions()` tests
+`classify.classify()` directly instead, sanity-checked against real
+`dbFlags`/`category` values pulled live from `api.adsb.lol/v2/mil`
+(an H60 and an AS65 helicopter and a C-17, all correctly MILITAIR — dbFlags
+wins over the A7/A5 categories that would otherwise say HELIKOPTER/nothing
+special) plus synthetic cases for the branches a military-only feed can't
+exercise.
+
+**Change 3: `emergency == "reserved"` normalized to `"none"` at the
+source.** `providers._normalize_aircraft` now does this unconditionally,
+so `detect_emergency` and any future consumer see it consistently instead
+of each needing its own special case. `check_emergency_status_regressions()`
+added to `backtest.py`.
+
+**Change 4: conspicuity-squawk emergency-status capped, not
+cross-provider-corroborated.** `main.py`'s `enrich_and_dispatch`: an
+`emergency` event on squawk 1000/2000 (new `providers.CONSPICUITY_SQUAWKS`
+— 1000 is live-confirmed per round 7, 2000 follows the same international
+VFR-conspicuity convention but isn't separately live-verified, see
+`MASTERPLAN.md` sectie 14) now caps at WAARSCHIJNLIJK unconditionally,
+instead of asking `cross_provider_confirms_emergency` whether to downgrade
+from BEVESTIGD. Reasoning: AUA96J/AUA12K/CFG6UA (round 7's three live
+cases) all squawked 1000, and cross-provider agreement did NOT catch two
+of them — adsb.lol and airplanes.live have overlapping feeder coverage and
+decode this subfield the same way, so agreement here isn't independent
+confirmation the way it is for ground state. The corroboration call is
+still used, unchanged, for a real discrete-squawk emergency-status event.
+
+**Change 5: generalized the Russia-zone bow-tolerance check to every
+route** (`detector.py`, both `detect_route_corridor_deviation` and, newly,
+`detect_course_deviation`'s stage-2 confirmation). Previously this only
+suppressed a deviation whose current heading still points at the filed
+destination for routes crossing the Russia/Siberia zone
+(`crosses_russian_airspace_zone`) — see round-1-era comments. Live evidence
+this round (AAL168/ASH4002/NOZ1865 above) showed the identical pattern
+everywhere, not just that one geography, so the check now runs
+unconditionally, keyed only on the existing `corridor_deviation_bow_heading_deg`
+config value (unchanged, 60°). One deliberate behavior change from the
+original: a MISSING heading sample no longer suppresses (the original
+`p_latest.track is None -> suppress` fallback made sense only within the
+narrow Russia exception; applied globally it would risk silencing a real
+diversion during a brief heading-data gap) — now only suppresses on
+positive evidence heading still points at the destination.
+`crosses_russian_airspace_zone` has no remaining call site and was removed
+from `airports.py`, along with `great_circle_max_latitude` (already
+unused before this round, an apparent leftover from an earlier rejected
+approach — same file, same cleanup pass).
+
+New `check_corridor_deviation_bow_suppression()` added to `backtest.py`:
+a synthetic same-latitude origin/destination pair with a position bowed
+well off the great-circle line (cross-track distance verified with a
+throwaway script against this specific route's threshold before writing
+the case, not guessed — first attempt at 4° of latitude displacement
+undershot the threshold entirely and would have passed for the wrong
+reason). Confirms a bowed-but-still-inbound heading suppresses and a
+bowed-and-no-longer-inbound heading still fires.
+
+**Result:** 8/8 incident cases still detect their expected type (no
+detector-level regression from the bow-tolerance change),
+`check_classification_regressions` (new), `check_emergency_status_regressions`
+(new), `check_corridor_deviation_bow_suppression` (new), and both existing
+regression checks (`check_bad_route_regressions`,
+`check_course_deviation_holding_suppression`) all pass. Every file compiles
+cleanly. Not yet deployed to the live VM (no SSH access from this session —
+see `MASTERPLAN.md` sectie 14's open question on whether the VM has even
+picked up round 7's fixes yet). Phases 1-4 of `MASTERPLAN.md` (wider route
+resolution via hexdb.io, SIGMET/peer-consensus weather context, the full
+incident-lifecycle/scoring engine, NOTAM/TFR) remain to build.
+
+## Round 9 — 2026-08-06 (same day) — MASTERPLAN.md phase 1
+
+Continued straight on from round 8, autonomously (user stepped away,
+asked for phases 1+ to proceed without stopping to ask). hexdb.io
+(`providers.lookup_route_hexdb`/`lookup_aircraft_hexdb`, both smoke-tested
+live against the real service earlier this session — see `MASTERPLAN.md`
+sectie 2.2) wired in as: (1) a route fallback in `main.py`'s `tier1_loop`,
+tried only for callsigns adsbdb.com had nothing for that cycle, ICAO pair
+resolved to coordinates via the local `AirportDB`; (2) a
+`classify.refine_with_hexdb` second opinion for aircraft `classify()` left
+ONBEKEND, using `RegisteredOwners`/`OperatorFlagCode` — batched the same
+way as route lookups (`CLASS_LOOKUP_BATCH`, random-sampled if the backlog
+exceeds it, same starvation-avoidance reasoning as `ROUTE_LOOKUP_BATCH`
+from round 6). Also fixed adsbdb's own negative-route-cache from
+permanent to `route_lookup_negative_retry_hours` (new
+`providers.route_lookup_negative_retry_due`) — documented one accepted,
+narrower residual gap in a `main.py` comment: a track whose `route_checked`
+already latched True during an earlier "not yet due" window isn't
+proactively re-checked once the window opens, only a freshly-created track
+(e.g. a later flight, same callsign) benefits automatically. `/v2/mil` (a
+second, authoritative confirmation of the military dbFlags bit already
+used since round 8) was scoped for this phase but skipped as low marginal
+value for the added complexity — noted in `MASTERPLAN.md` as easy to add
+later.
+
+New `check_route_widening_regressions()`: pure-logic checks (hexdb.io
+route-string parsing, negative-retry timing across all four states —
+never-looked-up / fresh-negative / aged-negative / real-route-cached) that
+don't need a live call, mirroring how `providers.route_lookup_pending_retry`
+was verified in round 5 (a standalone repro, not added to the geometry-only
+harness). One bug caught by the check itself while writing it: the test
+first used a lowercase callsign key while
+`route_lookup_negative_retry_due` normalizes to uppercase internally,
+silently missing the cache on every lookup and reporting false negatives
+across the board — fixed by uppercasing the test's own callsign.
+
+**Result:** 8/8 + all 6 regression-check groups (2 pre-existing + 4 new
+across rounds 8-9) pass. Phase 2 (SIGMET/AIRMET/CWA weather context,
+peer-consensus airspace-avoidance clustering) and phase 3 (the full
+incident-lifecycle/scoring engine + dashboard rewrite) still to build;
+continuing autonomously into those next.
+
+## Round 10 — 2026-08-07 (continued autonomously overnight, user asleep)
+
+Built `MASTERPLAN.md` phase 3: the incident-lifecycle engine
+(`incidents.py`, new) that replaces the old "detector fires -> dispatch
+immediately, forget" model with persistent, continuously re-scored
+incidents. Fully wired into the live pipeline, not left as a standalone
+module — `main.py`'s `enrich_and_dispatch` split into `enrich_events`
+(the existing cross-provider/weather/FR24 enrichment, unchanged, minus the
+dispatch step) and a new per-aircraft `IncidentManager.step()` call in
+both `tier0_loop` and `tier1_loop` (and `serve_all.py`'s startup, which
+constructs the shared `IncidentManager`). `notifier.py` gained
+`notify_incident_transition` (fires only on first reaching WAARSCHIJNLIJK/
+BEVESTIGD, or a stand-down close from either) and lost the old
+per-Event `notify()`/`format_message()` — nothing called them anymore.
+`server.py` gained `/api/incidents` alongside the unchanged `/api/events`.
+Also added a structured `Event.at_destination` flag (`detector.py`, set by
+`detect_holding_pattern`) so `incidents.py`'s scoring doesn't need to
+pattern-match `ev.message` text to tell a destination-hold apart from a
+non-destination one.
+
+**Design note, not in the original `MASTERPLAN.md` sectie 3.3 table:** that
+table sketched a weak "+10, heading still ~toward destination" score tier
+for corridor/course-deviation, distinct from the strong "+30, heading no
+longer toward destination" tier. Once actually building `incidents.py`,
+realized this distinction is now moot — round 8's bow-tolerance
+generalization (sectie 8) already hard-suppresses the "still heading
+toward destination" case at the DETECTOR level (`detect_route_
+corridor_deviation`/`detect_course_deviation` simply never return an Event
+for it anymore). So every Event that reaches `incidents.py` for these two
+types is already the strong tier; the weak tier was implemented and
+immediately dead code, so it was never added. Documented as a deliberate
+simplification in `MASTERPLAN.md`, not silently dropped.
+
+**Testing, two layers:**
+1. `backtest.py`'s new `check_incident_engine_regressions()` — an
+   in-memory-sqlite (`db.connect(':memory:')`, new optional param on
+   `db.connect`) standalone harness exercising 7 scenarios without any
+   network call: first-hit vs. repeat-hit scoring, WAARSCHIJNLIJK/BEVESTIGD
+   threshold crossings, notification-gating (no duplicate escalation
+   notice on an unchanged state), deviation-recovery (a deviation-only
+   incident loses score once heading points back at the filed destination
+   — computed via a real `AirportDB.get()` lookup, not a hardcoded
+   coordinate), landing-at-expected-destination auto-close, and idle-decay
+   auto-close as a false alarm. All 7 pass; 8/8 real incident cases and
+   all prior regression-check groups (rounds 1-9) still pass too — no
+   regression from threading `Event.at_destination` through or from
+   removing the old `alert_cooldown_seconds`-gated dispatch path detector
+   logic never depended on.
+2. A genuine LIVE smoke test, not just synthetic data — `serve_all.py` run
+   locally (this machine, not the deployed VM — no SSH access from this
+   session either way) against the real adsb.lol/airplanes.live feeds,
+   `TELEGRAM_BOT_TOKEN=""` so nothing could reach the real production
+   Telegram chat. Two bounded runs (~2.5min, then a short one for an API
+   check). Zero exceptions/tracebacks across several tier0 (15s) and tier1
+   (60s) cycles against ~8800-8900 real tracked aircraft per cycle. Caught
+   a real, currently-active emergency in the wild: N65440, squawk 7600
+   (NORDO) over Colorado — correctly detected, opened straight at
+   BEVESTIGD, notified exactly once despite the same emergency
+   re-detecting every 15s for the rest of the run (confirms the
+   `notified_state` gate works against real repeated detector hits, not
+   just the synthetic single-shot test in check_incident_engine_
+   regressions), and correctly reloaded from the local sqlite db as still
+   open after a full process restart between the two runs. `/api/incidents`
+   and `/api/events` both manually curled against the running local
+   server and both returned well-formed, expected JSON.
+
+**Found via the live test, not backtest.py (a real gap the synthetic
+harness wouldn't surface):** a long-lived BEVESTIGD incident whose
+triggering condition keeps re-firing every cycle (exactly what a real,
+ongoing NORDO situation does) accumulates score without any cap — the
+N65440 test incident reached score ~857 after a few minutes of repeated
++100 emergency-squawk evidence. Not a functional bug (state correctly
+stays BEVESTIGD, `notified_state` correctly prevents re-notifying), but
+untidy in the evidence timeline/raw score display. Left as a known,
+low-priority follow-up (a per-source cap, or skip re-adding identical-
+source evidence within some short window) rather than fixed under time
+pressure — noted in `MASTERPLAN.md` sectie 3 (fase 3 status) instead of
+guessed at.
+
+**Explicitly not done this round, and why:**
+- Dashboard HTML redesign (`Flight Diversions Dashboard.dc.html` — the
+  incident-cards-with-timeline UI `MASTERPLAN.md` sectie 10 describes).
+  The one remaining fase-3 piece that genuinely benefits from a live
+  browser to catch visual/interaction bugs, which this session can't do
+  safely unsupervised — left for a session that can verify it renders
+  correctly rather than shipping an unverified rewrite of the user-facing
+  page while they're away.
+- Deploying anything to the live VM. No SSH credentials available to this
+  session; also a materially riskier action (touches the actually-running
+  production service) than local changes, so left for the user or a
+  session with deploy access rather than attempted opportunistically.
+- Phase 2 (SIGMET/AIRMET/CWA, peer-consensus) and phase 4 (NOTAM/TFR,
+  blocked on FAA API registration regardless) — next up, continuing
+  autonomously per the user's explicit instruction not to stop and wait.
+
+**Continued same round, still 2026-08-07 — phase 2 built too.** New
+`airspace.py`: fetches+caches `aviationweather.gov`'s SIGMET (US + `isigmet`
+international) and CWA products (verified live — CWA's `coords` are
+STRING lat/lon, unlike SIGMET's numeric ones, a real type gotcha caught by
+actually curling the endpoint rather than assuming both matched), hand-
+rolled ray-casting point-in-polygon (no new dependency, matches
+`airports.py`'s own convention of hand-rolling haversine/bearing/
+cross-track-distance instead of pulling in a geo library). Wired into
+`incidents.py`'s `reassess()` as a `-50` "weather_explains" evidence
+source, applied at most once per incident. `main.py`'s `tier1_loop` fetches
+the hazard list once per cycle (SIGMET/CWA don't change nearly as fast as
+aircraft positions) and passes it into every `IncidentManager.step()` call
+that cycle, synchronously — kept the fetch in `main.py` specifically so
+`incidents.py` itself stays free of any network dependency, consistent
+with how it was designed and tested in round 9.
+
+Peer-consensus (`incidents.py`, no new file needed) turned out simpler than
+`MASTERPLAN.md` sectie 6.2 originally sketched: rather than a separate
+per-aircraft lateral-deviation sample tracker, it grid-buckets the
+`last_lat`/`last_lon` of currently-OPEN incidents (already tracked
+in-memory by `IncidentManager`) and applies `-55` once >= 3 (config:
+`peer_consensus_min_aircraft`) land in the same coarse cell
+(`peer_consensus_radius_deg`, default 2°). Cheaper, and ties naturally into
+the same data structure the rest of the engine already maintains — a
+deliberate simplification from the original design, not a shortcut that
+drops capability (it still answers the same question: are multiple
+independent aircraft reacting to something in the same place at the same
+time).
+
+New `check_airspace_regressions()` in `backtest.py`: point-in-polygon
+inside/outside on a hand-built square, altitude-band filtering, grid
+clustering count, and a full `reassess()` call confirming the
+`peer_consensus` evidence actually gets applied — all pass, 8/8 +
+everything from rounds 1-9 still pass too.
+
+Re-ran the same bounded live smoke test (local `serve_all.py`,
+`TELEGRAM_BOT_TOKEN=""`) with phase 2 wired in: no exceptions across
+multiple tier1 cycles, confirming the real SIGMET/CWA fetch integrates
+cleanly with the live loop and not just in isolation. N65440's
+still-ongoing NORDO emergency (see above) continued to be tracked
+correctly across yet another process restart, still notifying exactly
+once.
+
+**Found via that same live run, fixed same round:** the BEVESTIGD score-
+accumulation issue flagged as a known low-priority follow-up earlier this
+round — fixed properly instead of left open, since it was cheap and
+already diagnosed. New `incident_score_max` config key (150, comfortable
+headroom above the 85 CONFIRMED threshold); `incidents.py`'s `_apply_delta`
+clamps to it on every score increase (both the fresh-incident and
+existing-incident paths). No behavior change to state/notification logic
+(both were already correct) — purely bounds the raw score number shown in
+the evidence timeline. All regression checks re-run and still pass after
+this change.
+
+## Round 11 — 2026-08-07 — dashboard, deferred code cleanup, /loop set up
+
+User went to sleep mid-round-10, explicitly asked this session to keep
+going indefinitely without stopping for input, and to set up `/loop` once
+out of self-directed ideas rather than ever just stopping. Two more real
+pieces of work landed before reaching for `/loop`:
+
+**Dead-code cleanup found while grepping for dangling references (not
+optional — this would have crashed on next start).** Removing the old
+per-Event cooldown gate in round 10 left `TrackStore.should_alert`/
+`mark_alerted`/`cooldowns` and `db.load_cooldowns`/`save_cooldown` as dead
+code (verified via grep: zero remaining call sites) — removed, matching
+this project's own standard from round 5 ("every other key in `_DEFAULTS`
+is referenced at least once elsewhere; this was the only one at zero").
+`alert_cooldown_seconds` dropped from `config.py`/`config.json.example`
+too. **Caught a real bug this way**: `main.py` and `serve_all.py` both
+still logged `len(store.cooldowns)` at startup — an `AttributeError` on
+the very next process start, invisible to `python -m py_compile` (valid
+syntax, just a runtime-missing attribute) and not exercised by
+`backtest.py` (which never starts `main()`/`serve_all()`). Only caught by
+actually re-running the live smoke test after the cleanup — reinforces
+why this round kept doing bounded live runs after every change, not just
+`backtest.py`. `alert_cooldowns` the SQL table itself was left in place
+(not dropped) — no code reads/writes it anymore, but dropping a table is
+a real schema migration concern for whatever's on the deployed VM, and
+leaving an inert `CREATE TABLE IF NOT EXISTS` costs nothing.
+
+**Dashboard HTML — the one piece round 10 explicitly deferred, done
+here instead.** Round 10 held this back reasoning "needs a live browser to
+verify, this session doesn't have one" — turned out this session DOES have
+Browser tools, so re-evaluated and did it rather than deferring further.
+Added a new "Active incidents" section to
+`Flight Diversions Dashboard.dc.html`, additive alongside the existing
+`/api/events`-sourced feed (not a replacement — lower risk, and the raw
+per-detector history stays useful on its own). New `fetchIncidents()` +
+5s poll timer (separate from the existing events timer, deliberately not
+merged, to avoid touching working code), a Dutch-state-to-existing-palette
+mapping (`incidentStateMeta()`, reuses the CONFIRMED/LIKELY/POSSIBLE
+colors already defined for the event feed rather than inventing a second
+palette), and an expandable per-incident evidence timeline.
+
+Verified live, not just written and assumed correct: ran `serve_all.py`
+locally (`TELEGRAM_BOT_TOKEN=""`), opened it in the Browser pane, read the
+rendered page text (screenshot unavailable in this headless setup —
+`get_page_text`/`read_page` used instead throughout), and exercised the
+expand/collapse interaction. That took an extra troubleshooting pass: a
+generic `document.querySelectorAll('div')` + text-content filter kept
+matching the wrong (outer, non-clickable) nested div, and a
+`style*="cursor:pointer"` attribute selector missed because the rendered
+DOM has `cursor: pointer;` (a space after the colon) — resolved by reading
+the actual rendered `outerHTML` first to get the exact `data-dc-tpl` id,
+then targeting that directly. Confirmed: incident data loads, the toggle
+correctly expands/collapses, the evidence timeline renders each
+`incident_evidence` row, and the round-10 score cap + decay are visibly
+working (108 → 92 across roughly a minute of real time on the still-open
+N65440 incident). Checked the browser console for anything related to the
+new code — none. Did find a **pre-existing, unrelated** console error in
+the map section (`gridV`/`gridH`/`markers` SVG `<line>`/`<circle>`
+elements — "Expected length" on their `{{ }}`-templated x1/y1/x2/y2/cx/cy
+attributes) — not touched by this change, not investigated further
+(a full map-rendering bug hunt is its own task, and this round's actual
+addition doesn't depend on the map working). Logged for a future round
+rather than either silently ignored or fixed blind under time pressure.
+
+`python backtest.py` re-run clean (8/8 + all regression-check groups)
+after both the cleanup and the dashboard change.
+
+**Set up `/loop` (dynamic/self-paced mode) as explicitly instructed**, so
+this project keeps getting worked on across turns without the user needing
+to be present — pointed at `MASTERPLAN.md`/`BACKTEST_LOG.md` for context
+continuity, phase 4 (NOTAM/TFR) and further live-data-driven false-positive
+hunting as the next concrete directions, with hard rules carried into every
+future iteration: never deploy to the live VM (no SSH access, and too
+risky to attempt unsupervised regardless), never use real Telegram
+credentials in local testing, and always re-run `backtest.py` (plus a
+bounded live smoke test for anything touching the live loops) after a
+functional change before calling it done.
+
+## Round 12 — 2026-08-07 (`/loop` iteration) — map console errors ruled out
+
+First `/loop` wake-up. Picked up item 2 from the queued list: investigate
+the map SVG console errors flagged (but not chased) at the end of round 11.
+
+Reproduced live: started `serve_all.py` locally (`TELEGRAM_BOT_TOKEN=""`),
+opened it in the Browser pane, read the console. Same errors as round 11
+("Expected length" on `<line>`/`<circle>` x1/y1/x2/y2/cx/cy). Key test:
+waited past two 5s poll cycles (12s) and re-read the console — the error
+count did NOT grow (still exactly 10 lines, the same batch from initial
+load). If this were a real per-render bug, every `setState`-triggered
+re-render (every 5s, from `fetchEvents`/`fetchIncidents`) would emit a
+fresh batch. It doesn't. Then checked the ACTUAL rendered DOM directly
+(`document.querySelectorAll('circle'/'line')`, read their `cx`/`cy`/
+`x1`/`y1`/`x2`/`y2` attributes post-hydration): all numeric, all correct
+(e.g. a grid line at `x1="166.7"`, matching the `(lon+180)/360*2000`
+formula in `renderVals()`).
+
+**Conclusion: not a bug.** `Flight Diversions Dashboard.dc.html` is served
+as a static file (`server.py`'s `web.FileResponse`) containing the raw,
+un-rendered template markup (literal `{{ g.x }}` etc. as attribute text)
+inside `<x-dc>`. The browser's native HTML/SVG parser starts parsing that
+raw markup — including validating `x1`/`cx`/etc. as SVG `<length>`
+attributes — the instant it streams in, before `support.js` finishes
+loading and its `boot()` function replaces `<x-dc>` with the real,
+JS-rendered `#dc-root` tree. That one-time parse of literal placeholder
+text as an SVG length is what Chrome logs the "Expected length" warning
+for. Once `boot()` swaps in the hydrated tree (milliseconds later), every
+subsequent render goes through React's virtual DOM with real resolved
+numbers — no parser ever sees the placeholder text again, which is
+exactly the "10 errors at load, 0 more after" pattern observed. This is a
+property of the `{{ }}`-in-raw-SVG-markup pattern this whole `dc-runtime`
+template system uses everywhere (not specific to the map, and not
+introduced by round 11's incident-panel work) — genuinely nothing to fix
+in `Flight Diversions Dashboard.dc.html` itself; the "root cause" is the
+framework's static-markup-then-hydrate architecture, `dc-runtime`
+(`support.js`) is explicitly marked GENERATED/do-not-edit, and the effect
+is cosmetic console noise only, not a visible or functional defect (the
+"LIVE MAP · N ACTIVE" label, the confirmed-aircraft sidebar list, and now
+the directly-inspected DOM attributes all confirmed correct in both round
+11 and this round). Closed out in `MASTERPLAN.md` sectie 10 — no longer an
+open item.
+
+`python backtest.py` unaffected (no Python changed this round) — re-run
+anyway per this session's own stated discipline, still 8/8 + all
+regression-check groups green.
+
+Next: phase 4 (NOTAM/TFR, community-scraper route) or new backtest-case
+research, continuing autonomously.
+
+## Round 13 — 2026-08-07 (`/loop` iteration) — phase 4 (NOTAM/TFR), no registration needed after all
+
+`MASTERPLAN.md` sectie 2.4 assumed TFRs would need either FAA API
+registration (manual approval, can't be done from an unattended session)
+or an unofficial community scraper. Neither turned out necessary — found
+by actually loading `https://tfr.faa.gov/tfr3/` in the Browser pane and
+reading its real network requests (`read_network_requests`) instead of
+guessing endpoint URLs the way the earlier `curl` probes against
+`/tfr3/api/exportTFRJson` etc. had (all 404 — the site is a Nuxt SPA,
+static-URL-guessing was never going to find its actual API). The real
+site calls `https://tfr.faa.gov/geoserver/TFR/ows` (a standard GeoServer
+WFS endpoint, `typeName=TFR:V_TFR_LOC`) — public, unauthenticated,
+returns current TFR polygons as GeoJSON. Verified via plain `curl` (no
+special headers, default user-agent) that this specific endpoint isn't
+behind the Akamai bot-protection visible elsewhere on the site (`/akam/...`
+requests in the network log) — HTTP 200, real data, both for the
+geometry endpoint and `tfrapi/getTfrList` (a companion text/metadata
+endpoint, not currently used but noted). Requesting
+`srsname=EPSG:4326` gets WGS84 lat/lon directly instead of the UI's
+native Web Mercator (EPSG:3857) — confirmed by cross-checking one
+feature's coordinates against Ouray, CO's real location.
+
+Implemented in `airspace.py`: `_parse_tfr_feature` (Polygon-only —
+MultiPolygon/other rare shapes skipped, not crashed, matching this
+project's established "start simple" pattern) + `_fetch_tfrs`, combined
+with SIGMET/CWA in `get_active_hazards` behind a new `notam_tfr_enabled`
+config flag (on by default). Known, accepted limitation: TFR altitude
+bounds and exact validity windows are free text in the NOTAM title
+("Wednesday, July 29, 2026 through Tuesday, August 11, 2026 UTC" — format
+varies, UTC vs Local, no fixed grammar) rather than structured fields —
+not parsed (a real project on its own, not a quick regex); treated as
+always-valid/no-altitude-bound instead, trusting that the GeoServer view
+itself already only returns currently-active TFRs (same as what the
+public tfr.faa.gov map shows).
+
+`check_airspace_regressions` extended with a real, live-captured TFR
+GeoJSON feature (1NM N Ouray, CO, captured this round) — parses correctly,
+its polygon actually contains a real point near Ouray (verified via a
+throwaway computation before writing the test, not assumed), and a
+MultiPolygon geometry is skipped without crashing. `python backtest.py`:
+8/8 + all regression-check groups still pass. Bounded live smoke test
+(`serve_all.py`, `TELEGRAM_BOT_TOKEN=""`, ~75s) with TFR fetching enabled:
+no exceptions, tier1 cycles complete normally.
+
+All four phases of `MASTERPLAN.md` are now built (fase 4 turned out not
+to need the deferred, registration-gated path after all). Remaining open
+items across the whole plan: new backtest-case research (real, sourceable
+diversion incidents beyond the current 8), continued live-data false-
+positive hunting, and general tuning of the score weights/thresholds in
+`incidents.py` against real observed behavior over time (flagged
+throughout `MASTERPLAN.md` as a starting point, not a measured constant).
+Continuing autonomously into those next.
+
+## Round 14 — 2026-08-07 (`/loop` iteration) — new backtest case, TK17
+
+Researched a new, real, sourceable diversion not already in the suite
+(`WebSearch`, evaluated a few 2026 candidates, same discipline as round
+4 — rejected weaker fits before picking one). Chose Turkish Airlines TK17
+(Istanbul->Toronto, 2026-07-29, technical fault ~4h into the transatlantic
+leg, diverted to Manchester) over an also-considered Alaska Airlines
+AS181 case (Rome return, squawk 7700) specifically because AS181 would
+have been a second data point for a shape already well-covered (squawk
+7700 + return-to-origin, see AF9) — TK17 is a genuinely different shape:
+Istanbul->Toronto's great circle already bows north across Europe/the UK,
+so being over the North Sea 4h in is plausibly close to the FILED route,
+not a large corridor deviation the way AI850/EK225 are. Deliberately
+chosen to test whether `detect_landed_wrong_airport` still cleanly catches
+a genuine diversion via the landing itself when the in-flight geometry
+detectors (corridor_deviation, premature_descent) have comparatively
+little to grab onto — a different angle than "does a large deviation get
+caught," more "does the landing-based backstop hold up on its own."
+
+New `_tk17()` in `backtest_cases.py`, `expected_type="wrong_airport"`.
+**Fires correctly, first try** — same pattern as rounds 3/4's "individual
+detector logic is solid" observation, now extending to a fourth real
+case for `wrong_airport` specifically (UA2078, TO3510, and now TK17, plus
+the synthetic ATL-MCO-FLL mechanism test). Source only gives altitudes and
+a landing time, no track — position/timing between waypoints approximated
+and called out in `notes`, same convention as every other case.
+
+**9/9 cases now detect their expected type.** `python backtest.py`
+re-run clean (all regression-check groups too).
+
+## Round 15 — 2026-08-07 (`/loop` iteration) — self-review of this session's own code
+
+Deliberately did what the queued instructions suggested but hadn't been
+done yet: read back through `incidents.py` (this session's own, newest,
+least-battle-tested module) like a reviewer looking for bugs, rather than
+writing more features. Found two real, meaningful gaps — both about
+`incidents.py`'s terminal states, both the same root cause class, neither
+caught by rounds 8-14's testing because the existing tests never checked
+whether a defined *state* was actually *reachable*, only that scoring/
+transitions behaved correctly given the states that DID get hit in
+testing.
+
+**Bug 1: `CLOSED_LANDED` was dead — a confirmed diversion could mislabel
+itself as a false alarm.** `grep -n "CLOSED_LANDED\|CLOSED_TIMEOUT"
+incidents.py` (the same technique that caught round 11's `store.cooldowns`
+crash) showed both states only appearing in their own definitions and the
+`CLOSED_STATES` tuple/`_maybe_notify`'s kind logic — no `_resolve()` call
+anywhere ever actually used them. Consequence: `detect_landed_wrong_
+airport`'s Event (+90, the strongest ground-truth signal this system has)
+pushes an incident to BEVESTIGD and notifies — correct — but then NOTHING
+ever closes that incident once the aircraft goes quiet on the wrong
+ground (no more emergency squawk, no more evidence). It would just keep
+being reassessed like any other open incident, decay like anything else,
+and eventually cross the GESLOTEN_VALS_ALARM ("false alarm") auto-close
+path — silently relabeling an ALREADY-CONFIRMED real diversion as having
+turned out to be nothing. Fixed: `_check_landed` (renamed from
+`_check_landed_at_destination`, since it now does two things) closes as
+GESLOTEN_GELAND when the aircraft lands anywhere else while the incident
+already carries `wrong_airport` evidence, before decay ever gets a chance
+to mislabel it.
+
+**Bug 2, same class: any BEVESTIGD/WAARSCHIJNLIJK incident that simply
+goes idle (not just wrong_airport ones) had the identical mislabeling
+risk**, via the SAME decay-to-`GESLOTEN_VALS_ALARM` path — e.g. a track
+that goes stale/pruned after escalating, with no landing ever observed
+either. Fixed by branching on `notified_state`: an incident that was
+serious enough to have been notified about (WAARSCHIJNLIJK/BEVESTIGD at
+some point) now closes as GESLOTEN_TIMEOUT instead — an honest "we lost
+the signal, we don't actually know this was fake" label — while an
+incident that never escalated past MOGELIJK still correctly closes as
+GESLOTEN_VALS_ALARM (that label IS accurate there). This also means
+`GESLOTEN_TIMEOUT` is now reachable for the first time too.
+
+**Bug 3, found while writing the regression test for the fixes above (not
+independently spotted by inspection — worth noting the review process
+itself surfaced it, not just re-reading the code):** `_check_deviation_
+recovered`'s eligibility test (`evidence_types <= set(DEVIATION_EVENT_
+TYPES)`, a strict subset check) permanently disabled itself the FIRST time
+it ever fired — the very evidence row it adds on a successful recovery
+(`"deviation_resolved"`) joins `evidence_types`, and since that source
+isn't itself a deviation type, every LATER subset check fails forever,
+even for a track that diverges again after recovering and would
+legitimately need to recover a second time. Same failure mode for
+`weather_explains`/`peer_consensus` (also self-added, also not "stronger"
+evidence, also would have permanently blocked recovery once either fired
+once). Fixed with a new `_NON_REINFORCING_SOURCES` set excluded from the
+eligibility check, so only genuinely stronger evidence (emergency,
+wrong_airport, holding, premature_descent, signal_lost) blocks recovery —
+not the mechanism's own bookkeeping.
+
+Three new regression tests added to `check_incident_engine_regressions`
+(now 10 scenarios total): wrong_airport-then-landed-elsewhere closes
+GESLOTEN_GELAND; a previously-BEVESTIGD incident going idle closes
+GESLOTEN_TIMEOUT (not a false alarm); recovery fires correctly a second
+time after an incident diverges again post-recovery. All three fail
+against the pre-fix code (verified by reasoning through the exact
+mechanism above, matching this session's established practice of
+understanding WHY a test would have caught something, not just that it
+now passes) and pass after. `python backtest.py`: 9/9 + all regression-
+check groups green. Bounded live smoke test (`serve_all.py`,
+`TELEGRAM_BOT_TOKEN=""`, ~65s): no exceptions.
+
+**Takeaway for future rounds**, worth stating explicitly: "every defined
+constant should be grep-reachable from real code" is now a two-part check
+for this specific system — reachable from *some* code path (round 11's
+`store.cooldowns` class of bug), AND reachable *at runtime given the
+actual state machine's transition logic* (this round's class of bug,
+which `grep` alone can't catch — `CLOSED_LANDED` WAS referenced in
+`CLOSED_STATES`/`_maybe_notify`, just never actually assigned by any
+`_resolve()` call). The second kind needs either a dedicated regression
+test per terminal state (now done, 10/10 scenarios covering it) or a
+runtime assertion that every state ever gets exercised.

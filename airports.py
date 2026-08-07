@@ -210,29 +210,6 @@ def _intermediate_point(lat1, lon1, lat2, lon2, fraction):
     return (math.degrees(math.atan2(z, math.sqrt(x * x + y * y))), math.degrees(math.atan2(y, x)))
 
 
-def great_circle_max_latitude(lat1, lon1, lat2, lon2) -> float:
-    """Highest latitude the direct great-circle path between two points
-    reaches."""
-    fractions = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
-    lats = [lat1, lat2] + [_intermediate_point(lat1, lon1, lat2, lon2, f)[0] for f in fractions]
-    return max(lats)
-
-
-def crosses_russian_airspace_zone(lat1, lon1, lat2, lon2, min_lat=55.0, lon_min=20.0, lon_max=170.0) -> bool:
-    """Whether the direct great-circle path passes through the high-latitude
-    Russia/Siberia longitude band, where real-world routing has legitimately
-    bowed 1500-2000nm+ off the direct line since 2022 (Western carriers can't
-    overfly Russia). This replaced a plain 'max latitude' check: live-tested,
-    that blunter version also excluded Salt Lake City->Amsterdam (peaks 64N
-    but stays entirely over Canada/Greenland, longitude -99 to -16 — nowhere
-    near Russia) from a route that had a real, large, legitimate-to-flag
-    454nm diversion. Checking latitude AND longitude together targets the
-    actual physical cause instead of 'any route that goes far north'."""
-    fractions = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
-    points = [(lat1, lon1), (lat2, lon2)] + [_intermediate_point(lat1, lon1, lat2, lon2, f) for f in fractions]
-    return any(lat >= min_lat and lon_min <= lon <= lon_max for lat, lon in points)
-
-
 def cross_track_distance_nm(start_lat, start_lon, end_lat, end_lon, point_lat, point_lon) -> float:
     """Perpendicular distance (nm) of `point` from the great-circle path
     start->end. Standard aviation cross-track-distance formula (see e.g. Ed

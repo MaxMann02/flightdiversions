@@ -28,16 +28,29 @@ de commentaren daar leggen uit welke aannames op basis van live testen zijn
 bijgesteld (bijv. waarom "koersafwijking t.o.v. rechte lijn naar bestemming"
 niet werkt, en waarom een enkele plotselinge bocht niet genoeg is).
 
-## Betrouwbaarheid van de signalen
+## Van losse melding naar levend incident
 
-- **BEVESTIGD** (noodsquawk, of landing op onverwachte luchthaven): hoge
-  betrouwbaarheid, stuur je zo.
-- **MOGELIJK** (aanhoudende koerswijziging): een "misschien, kijk even mee"
-  signaal. Dit heeft een inherente basisruis, omdat normale luchtvaartroutes
-  (airways) net als een uitwijking soms een scherpe bocht bij een waypoint
-  maken. Er is geen gratis bron voor het echte ingediende vliegplan om dat
-  verschil hard te maken — vertrouw dus vooral op BEVESTIGD-meldingen, en zie
-  MOGELIJK als een vroege hint.
+Een detector-hit is geen directe Telegram-melding meer. `incidents.py`
+houdt per vliegtuig een **incident** bij dat over meerdere cycli heen
+opnieuw beoordeeld wordt: het opent stil (niet zichtbaar) bij het eerste
+signaal, wordt pas **MOGELIJK** zodra er genoeg bewijs is, kan verder
+escaleren naar **WAARSCHIJNLIJK** of **BEVESTIGD** als extra signalen
+(een tweede detector, aanhoudend gedrag, geen weer-verklaring) dat
+bevestigen — of juist vanzelf weer verdwijnen als het toestel terugkeert
+naar zijn koers, blijkt te landen waar verwacht, of het bewijs verjaart
+zonder herbevestiging. Telegram meldt alleen nog bij het bereiken van
+WAARSCHIJNLIJK/BEVESTIGD en bij het intrekken daarvan als vals alarm — niet
+meer bij elke ruwe detector-hit. Vliegtuigen die duidelijk militair, GA/
+prive, een helikopter of een zakenjet zijn (afgeleid uit gratis ADS-B-
+velden, zie `classify.py`) worden voor de gedrags-detectoren helemaal
+overgeslagen — een noodsquawk blijft voor iedereen actief. Zie
+`MASTERPLAN.md` voor het volledige ontwerp (dit was oorspronkelijk een
+eenmalig-dispatch-systeem; de sectie-1-diagnose daar legt met echte
+productiedata uit waarom dat niet volstond).
+
+`/api/incidents` (naast het bestaande `/api/events`) geeft deze levende
+incidenten inclusief tijdlijn van bewijs — nog niet in
+`Flight Diversions Dashboard.dc.html` verwerkt, wel volledig werkend.
 
 Bekende beperking: adsbdb's route-database is betrouwbaar voor
 lijnvluchten (één callsign = één vaste bestemming), maar niet voor kleine
@@ -45,6 +58,9 @@ regionale/pendel-operators die dezelfde callsign meerdere keren per dag voor
 verschillende trajecten gebruiken (bijv. Alaska bush-vluchten) — daarvoor is
 een specifieke uitzondering ingebouwd (landing terug op het eigen
 vertrekpunt wordt genegeerd), maar niet elke variant daarvan is te vangen.
+Sinds `MASTERPLAN.md` fase 1 is `hexdb.io` een tweede, gratis routebron
+naast adsbdb — vult een deel van adsbdb's dekkingsgaten aan, lost dit niet
+volledig op.
 
 ## Installatie
 
@@ -81,8 +97,14 @@ versturen — handig om eerst te testen.
 |---|---|
 | `tier0_interval_seconds` | Hoe vaak de noodsquawk-sweep draait (standaard 15s) |
 | `tier1_interval_seconds` | Hoe vaak de wereldwijde positie-sweep draait (standaard 60s) |
-| `alert_cooldown_seconds` | Minimale tijd tussen twee meldingen voor hetzelfde toestel + type (standaard 1800s) |
 | `course_deviation_deg` | Hoeveel graden een bocht moet zijn om als "plotseling" te tellen (standaard 90) |
+| `classification_suppress_non_airliner` | Militair/GA/prive/helikopter/zakenjet overslaan voor de gedrags-detectoren (standaard aan) |
+| `incident_score_possible_threshold` / `_likely_threshold` / `_confirmed_threshold` | Score-drempels voor MOGELIJK/WAARSCHIJNLIJK/BEVESTIGD |
+| `weather_sigmet_enabled` | Actief SIGMET/CWA-weer meewegen als mogelijke verklaring voor een afwijking |
+| `peer_consensus_enabled` | Meerdere gelijktijdig uitwijkende toestellen in hetzelfde gebied als signaal meewegen |
+
+Zie `config.py` voor de volledige, becommentarieerde lijst — elke sleutel
+legt inline uit waarom de standaardwaarde is zoals hij is.
 
 ## Dashboard
 

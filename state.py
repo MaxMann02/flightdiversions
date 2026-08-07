@@ -68,6 +68,17 @@ class AircraftTrack:
     # detect_holding_pattern for why this is tracked separately from the
     # immediate non-destination case.
     holding_streak: int = 0
+    # Cached result of classify.classify() and when it was computed —
+    # aircraft type/operator doesn't change mid-flight, so this is
+    # refreshed only every classification_cache_ttl_hours rather than every
+    # cycle. None until first classified. See MASTERPLAN.md sectie 4.
+    aircraft_class: str | None = None
+    aircraft_class_ts: float | None = None
+    # Whether classify.refine_with_hexdb has already been attempted for
+    # this track (only fires for aircraft_class == UNKNOWN — see main.py's
+    # tier1_loop). Reset to False whenever aircraft_class is recomputed
+    # from scratch after the TTL, so a stale UNKNOWN gets one more chance.
+    hexdb_aircraft_checked: bool = False
 
     def add_point(self, ac: dict, ts: float):
         if ac.get("callsign"):
@@ -88,7 +99,6 @@ class TrackStore:
     def __init__(self, db_conn=None):
         self.tracks: dict[str, AircraftTrack] = {}
         self.db = db_conn
-        self.cooldowns: dict = db_module.load_cooldowns(db_conn) if db_conn else {}
 
     def get_or_create(self, hex_id: str) -> AircraftTrack:
         t = self.tracks.get(hex_id)
@@ -108,17 +118,6 @@ class TrackStore:
         stale = [h for h, t in self.tracks.items() if now - t.last_seen > STALE_AFTER_SECONDS]
         for h in stale:
             del self.tracks[h]
-
-    def should_alert(self, hex_id: str, event_type: str, cooldown_seconds: int, now: float | None = None) -> bool:
-        now = now or time.time()
-        last = self.cooldowns.get((hex_id, event_type))
-        return last is None or (now - last) >= cooldown_seconds
-
-    def mark_alerted(self, hex_id: str, event_type: str, now: float | None = None):
-        now = now or time.time()
-        self.cooldowns[(hex_id, event_type)] = now
-        if self.db:
-            db_module.save_cooldown(self.db, hex_id, event_type, now)
 
     def record_takeoff(self, track: AircraftTrack, airport: dict | None, ts: float | None = None):
         track.pending_origin = airport
