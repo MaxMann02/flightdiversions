@@ -76,6 +76,41 @@ REPEATABLE_EVENT_TYPES = DEVIATION_EVENT_TYPES + ("holding_pattern", "premature_
 # life. See that method's docstring / BACKTEST_LOG.md ronde 15.
 _NON_REINFORCING_SOURCES = {"deviation_resolved", "weather_explains", "peer_consensus"}
 
+# BEVESTIGD ('CONFIRMED') should mean something close to certain — but
+# REPEATABLE_EVENT_TYPES lets a single provisional signal keep re-scoring
+# for as long as the underlying condition persists, and _state_for_score is
+# purely a score-vs-threshold check with no notion of WHERE that score came
+# from. For course_deviation/corridor_deviation specifically, that's a real
+# gap: a real, live report (2026-08-07) showed an incident reach BEVESTIGD
+# from repeated premature_descent hits alone, off a filed destination that
+# turned out to be wrong (see main.py's enrich_events geometry cross-check,
+# which now suppresses THAT specific failure mode) — and the same math
+# applies just as easily to a sustained course/corridor deviation: the
+# bow-tolerance check only asks "does the CURRENT heading still point at
+# the destination", not "is there an ordinary explanation for pointing away
+# this long" — and a long, deliberate reroute around contested/restricted
+# airspace or adverse weather is exactly such an explanation, at ANY
+# duration, purely at cruise altitude with no descent or other corroborating
+# sign. So: course_deviation/corridor_deviation evidence ALONE, no matter
+# how many times it repeats, cannot carry an incident to BEVESTIGD — it
+# needs corroboration from some OTHER kind of evidence (a concurrent
+# descent, a hold, a landing, an emergency squawk — anything genuinely
+# independent), which is a real qualitative difference, not just "it kept
+# happening longer".
+#
+# Deliberately NOT extended to holding_pattern or premature_descent: unlike
+# a deviation that can persist indefinitely for entirely routine reasons,
+# both already gate their FIRST event behind a precondition that is itself
+# already extreme — holding_pattern_destination_min_streak's 20+-cycle
+# sustained tight loiter, and (as of this round) premature_descent's own
+# geometry cross-check against a second route source. See the real AI850
+# case (BACKTEST_LOG.md, check_incident_engine_real_case_escalation): a
+# genuine 1hr+ abnormal hold escalating to BEVESTIGD on holding_pattern
+# evidence alone is the correct, desired outcome there, not the failure
+# mode this guards against — a blanket "no provisional type may ever reach
+# BEVESTIGD alone" rule would have broken that already-validated real case.
+_DEVIATION_ONLY_SOURCES = set(DEVIATION_EVENT_TYPES)
+
 
 def _state_for_score(score: float, cfg: dict) -> str:
     if score >= cfg["incident_score_confirmed_threshold"]:
@@ -174,6 +209,30 @@ class IncidentManager:
         mismatch caused a real bug, see apply_events below)."""
         return {row["source"] for row in db_module.get_incident_evidence(self.db, incident_id)}
 
+    def _confirmed_bar_met(self, incident_id: int | None, current_source: str | None = None) -> bool:
+        """False when every piece of reinforcing evidence this incident has
+        (including current_source, about to be recorded but not yet
+        persisted — same not-yet-persisted timing as is_repeat's lookup in
+        apply_events) is a course_deviation/corridor_deviation hit — see
+        _DEVIATION_ONLY_SOURCES' docstring above for why that specific
+        combination isn't trusted to reach BEVESTIGD by repetition alone."""
+        sources = self._evidence_sources_seen(incident_id) if incident_id is not None else set()
+        if current_source is not None:
+            sources = sources | {current_source}
+        reinforcing = sources - _NON_REINFORCING_SOURCES
+        return not reinforcing or not reinforcing.issubset(_DEVIATION_ONLY_SOURCES)
+
+    def _resolve_state(self, incident_id: int | None, score: float, current_source: str | None = None) -> str:
+        """_state_for_score's raw threshold state, capped at WAARSCHIJNLIJK
+        when it would otherwise read BEVESTIGD but _confirmed_bar_met says
+        the evidence behind that score doesn't actually earn it yet. Score/
+        decay/notification bookkeeping elsewhere is untouched — only what
+        state gets exposed and notified changes."""
+        state = _state_for_score(score, self.cfg)
+        if state == CONFIRMED and not self._confirmed_bar_met(incident_id, current_source):
+            return LIKELY
+        return state
+
     def _apply_delta(self, hex_id: str, now: float, delta: float, source: str, description: str,
                       detector_confidence: str | None, callsign: str = "", aircraft_class: str | None = None,
                       origin_icao: str | None = None, dest_icao: str | None = None,
@@ -187,7 +246,7 @@ class IncidentManager:
         old_state = None
         if inc is None:
             initial_score = max(0.0, min(self.cfg.get("incident_score_max", 150), delta))
-            state = _state_for_score(initial_score, self.cfg)
+            state = self._resolve_state(None, initial_score, current_source=source)
             incident_id = db_module.create_incident(self.db, hex_id, callsign, state, initial_score, now, aircraft_class)
             inc = {
                 "id": incident_id, "hex": hex_id, "callsign": callsign, "state": state,
@@ -203,7 +262,7 @@ class IncidentManager:
             inc["score"] = max(0.0, min(self.cfg.get("incident_score_max", 150), inc["score"] + delta))
             inc["peak_score"] = max(inc["peak_score"], inc["score"])
             inc["last_evidence_ts"] = now
-            inc["state"] = _state_for_score(inc["score"], self.cfg)
+            inc["state"] = self._resolve_state(inc["id"], inc["score"], current_source=source)
 
         inc["callsign"] = callsign or inc.get("callsign")
         if origin_icao:
@@ -459,7 +518,7 @@ class IncidentManager:
         if inc["score"] == old_score:
             return None
         old_state = inc["state"]
-        inc["state"] = _state_for_score(inc["score"], self.cfg)
+        inc["state"] = self._resolve_state(inc["id"], inc["score"])
         db_module.update_incident(self.db, inc["id"], score=inc["score"], state=inc["state"])
 
         minutes_idle = (now - inc["last_evidence_ts"]) / 60.0

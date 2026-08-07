@@ -14,7 +14,7 @@ import db as db_module
 import incidents
 import providers
 import weather
-from airports import AirportDB, ROUTE_REVALIDATION_WINDOW_S, route_plausible
+from airports import AirportDB, ROUTE_REVALIDATION_WINDOW_S, haversine_nm, route_plausible
 from config import CONFIG
 from detector import detect_emergency, detect_signal_lost_near_airport, evaluate
 from incidents import IncidentManager
@@ -34,7 +34,7 @@ ROUTE_LOOKUP_BATCH = 20
 CLASS_LOOKUP_BATCH = 20
 
 
-async def enrich_events(session, cfg: dict, events: list) -> list:
+async def enrich_events(session, cfg: dict, events: list, airport_db=None) -> list:
     """Enriches each fresh detector.Event in place (cross-provider
     corroboration, weather context, optional FR24 confirmation). No longer
     dispatches directly to Telegram/DB — MASTERPLAN.md sectie 3 replaced
@@ -150,13 +150,53 @@ async def enrich_events(session, cfg: dict, events: list) -> list:
                 and cfg.get("route_secondary_source_enabled") and ev.callsign):
             hexdb_pair = await providers.lookup_route_hexdb(session, ev.callsign)
             if hexdb_pair is not None and hexdb_pair[1] != ev.dest_icao:
-                ev.route_source_disputed = True
-                ev.message += (
-                    f" (tweede routebron (hexdb.io) noemt {hexdb_pair[1]} als bestemming i.p.v. "
-                    f"{ev.dest_icao} — mogelijk verouderde/foute scheduledata bij de eerste bron)"
-                )
-                log.warning("%s voor %s: hexdb.io route disagreement (%s vs adsbdb's %s), evidence-gewicht verlaagd",
-                            ev.event_type, ev.callsign, hexdb_pair[1], ev.dest_icao)
+                # Live cross-check (2026-08-07): hexdb.io isn't uniformly
+                # more trustworthy than adsbdb — sampled live, hexdb.io's
+                # own route for UAL1601 was 8 YEARS stale (2018 data) while
+                # adsbdb had the correct, current route, the opposite of the
+                # pattern that motivated route_source_disputed above. So
+                # "hexdb.io names something different" alone isn't enough to
+                # suppress — but for premature_descent specifically we can
+                # go further than a flag: reuse detect_premature_descent's
+                # own top-of-descent physics against hexdb's ALTERNATE
+                # destination. If the observed descent is a completely
+                # normal, textbook approach to THAT airport, the primary
+                # source's filed destination is what's wrong, not the
+                # observation — a real, verifiable explanation, not just a
+                # second opinion. Deliberately NOT extended to
+                # signal_lost_near_airport: BACKTEST_LOG.md ronde 21's
+                # reverted same-metro-exclusion attempt is the direct
+                # cautionary precedent for that detector (a single
+                # last-known-position snapshot with no safety net — UA2078's
+                # real diversion landed only ~15nm from its filed
+                # destination), and this geometry check needs a live
+                # position+altitude sample mid-descent that a last-known-
+                # position-only event doesn't reliably have anyway.
+                alt_dest = airport_db.get(hexdb_pair[1]) if airport_db else None
+                geometry_confirms_alt_dest = False
+                if (ev.event_type == "premature_descent" and alt_dest
+                        and ev.lat is not None and ev.lon is not None and ev.alt is not None):
+                    dist_to_alt_dest = haversine_nm(ev.lat, ev.lon, alt_dest["lat"], alt_dest["lon"])
+                    expected_tod_nm = (ev.alt / 1000.0) * 3.0 * cfg["premature_descent_multiplier"]
+                    geometry_confirms_alt_dest = dist_to_alt_dest < expected_tod_nm
+
+                if geometry_confirms_alt_dest:
+                    ev.suppressed = True
+                    log.info(
+                        "premature_descent voor %s onderdrukt: normale nadering voor hexdb.io's "
+                        "%s (nog %.0fnm te gaan, normale daling begint rond %.0fnm) i.p.v. "
+                        "gerapporteerde bestemming %s — vals alarm door foute/verouderde eerste bron",
+                        ev.callsign, hexdb_pair[1], dist_to_alt_dest,
+                        expected_tod_nm / cfg["premature_descent_multiplier"], ev.dest_icao,
+                    )
+                else:
+                    ev.route_source_disputed = True
+                    ev.message += (
+                        f" (tweede routebron (hexdb.io) noemt {hexdb_pair[1]} als bestemming i.p.v. "
+                        f"{ev.dest_icao} — mogelijk verouderde/foute scheduledata bij de eerste bron)"
+                    )
+                    log.warning("%s voor %s: hexdb.io route disagreement (%s vs adsbdb's %s), evidence-gewicht verlaagd",
+                                ev.event_type, ev.callsign, hexdb_pair[1], ev.dest_icao)
 
         # The 'emergency status' ADS-B subfield (nordo/lifeguard/minfuel/...)
         # is a separate, much less reliable signal than the 7700/7600/7500
@@ -183,6 +223,9 @@ async def enrich_events(session, cfg: dict, events: list) -> list:
                     ev.confidence = "WAARSCHIJNLIJK"
                     ev.message += " (niet bevestigd door tweede bron — mogelijk onjuiste data)"
                     log.warning("emergency-status niet bevestigd door tweede provider voor %s, gedegradeerd", ev.callsign or ev.hex)
+
+        if ev.suppressed:
+            continue  # already logged and explained above; skip further enrichment/the EVIDENCE log
 
         if cfg["weather_enrichment_enabled"] and ev.weather_icao:
             metar = await weather.get_metar(session, ev.weather_icao)
@@ -289,8 +332,31 @@ async def tier1_loop(session, store: TrackStore, airport_db: AirportDB, incident
             # in that order, rather than just delaying them. Sampling means
             # every pending callsign eventually gets a turn regardless of
             # how stable the snapshot's ordering actually is.
-            to_lookup = (random.sample(pending_lookup, ROUTE_LOOKUP_BATCH)
-                         if len(pending_lookup) > ROUTE_LOOKUP_BATCH else pending_lookup)
+            # Aircraft with an already-open incident (e.g. a live emergency
+            # squawk) jump the random-sampling queue entirely, rather than
+            # competing for one of ROUTE_LOOKUP_BATCH slots against every
+            # other route-less callsign worldwide. Found via a real case
+            # (UAL1601, a genuine 7700 emergency): adsbdb had its route
+            # (KEWR->KBOS) available the whole time, but the incident sat on
+            # the dashboard as "route unknown" because nothing prioritized
+            # resolving it over ordinary worldwide backlog — a real, already-
+            # flagged incident shouldn't have to wait on random luck for
+            # basic route context. Small in practice (only a handful of
+            # aircraft are ever in an open incident at once), so this can
+            # exceed ROUTE_LOOKUP_BATCH slightly without materially
+            # increasing request volume.
+            priority_callsigns = []
+            for hex_id in incident_mgr.open_hexes():
+                t = store.tracks.get(hex_id)
+                if t and not t.route_checked and t.callsign and AIRLINE_CALLSIGN_RE.match(t.callsign):
+                    priority_callsigns.append(t.callsign)
+
+            sample_pool = [cs for cs in pending_lookup if cs not in priority_callsigns]
+            remaining_budget = max(0, ROUTE_LOOKUP_BATCH - len(priority_callsigns))
+            to_lookup = priority_callsigns + (
+                random.sample(sample_pool, remaining_budget)
+                if len(sample_pool) > remaining_budget else sample_pool
+            )
 
             if to_lookup:
                 routes = await asyncio.gather(*(lookup_route(session, cs, cfg) for cs in to_lookup))
@@ -435,10 +501,23 @@ async def tier1_loop(session, store: TrackStore, airport_db: AirportDB, incident
 
                 # Build our own learned-route ground truth from directly
                 # observed takeoff->landing pairs, independent of adsbdb.
-                if just_took_off and ac.get("lat") is not None:
+                # Gated behind the same skip_behavioral suppression as the
+                # behavioral detectors above: GA/military/business-jet
+                # traffic doesn't fly fixed "routes" the way scheduled
+                # airliners do, and was previously recorded here completely
+                # unfiltered, unlike every other consumer of aircraft_class.
+                # That noise (a charter jet's incidental day-trip pairs, a
+                # regional airport's touch-and-goes matched to the nearest
+                # field, etc.) could reach learned_route_min_times_seen and
+                # then get treated as trusted ground truth by detect_landed_
+                # wrong_airport, silently masking a real future diversion for
+                # that callsign. Found while investigating a live report of
+                # bad-looking learned routes; the database itself has since
+                # been reset, this prevents it recurring.
+                if not skip_behavioral and just_took_off and ac.get("lat") is not None:
                     airport, _ = airport_db.nearest(ac["lat"], ac["lon"], max_km=15.0)
                     store.record_takeoff(track, airport, now)
-                elif just_landed and ac.get("lat") is not None:
+                elif not skip_behavioral and just_landed and ac.get("lat") is not None:
                     airport, _ = airport_db.nearest(ac["lat"], ac["lon"], max_km=15.0)
                     if airport:
                         store.record_landing_observation(track, airport)
@@ -464,7 +543,16 @@ async def tier1_loop(session, store: TrackStore, airport_db: AirportDB, incident
                             events_by_hex.setdefault(hex_id, []).append(ev)
 
             all_events = [ev for evs in events_by_hex.values() for ev in evs]
-            await enrich_events(session, cfg, all_events)
+            await enrich_events(session, cfg, all_events, airport_db)
+            # Drop events enrich_events geometrically confirmed as false
+            # positives (see its premature_descent/hexdb.io cross-check) —
+            # never saved, never fed to the incident engine, same as if the
+            # detector itself had never fired.
+            all_events = [ev for ev in all_events if not ev.suppressed]
+            for hex_id in list(events_by_hex.keys()):
+                events_by_hex[hex_id] = [ev for ev in events_by_hex[hex_id] if not ev.suppressed]
+                if not events_by_hex[hex_id]:
+                    del events_by_hex[hex_id]
             for ev in all_events:
                 if db_conn is not None:
                     db_module.save_event(db_conn, ev)

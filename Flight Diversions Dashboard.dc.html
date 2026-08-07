@@ -54,7 +54,7 @@
     <div style="background:#0f151e;border:1px solid #1f2a38;border-radius:11px;padding:14px 16px;position:relative;overflow:hidden;">
       <div style="position:absolute;top:0;left:0;width:3px;height:100%;background:#ff5b5b;"></div>
       <div style="font-family:ui-monospace,Menlo,monospace;font-size:10px;letter-spacing:1.5px;color:#6b7686;text-transform:uppercase;">Confirmed active</div>
-      <div style="font-size:28px;font-weight:700;color:#ff6b6b;margin-top:6px;line-height:1;">{{ stats.confirmed }}</div>
+      <div style="font-size:28px;font-weight:700;color:#ff6b6b;margin-top:6px;line-height:1;">{{ incidentStats.confirmed }}</div>
       <div style="font-size:11px;color:#6b7686;margin-top:5px;">emergency &amp; unexpected landing</div>
     </div>
     <div style="background:#0f151e;border:1px solid #1f2a38;border-radius:11px;padding:14px 16px;">
@@ -278,7 +278,7 @@
 <script type="text/x-dc" data-dc-script data-props="{&quot;showMap&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Layout&quot;},&quot;showLearnedRoutes&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Layout&quot;},&quot;live&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Behavior&quot;}}">
 class Component extends DCLogic {
   state = { now: Date.now(), confFilter: { CONFIRMED: true, LIKELY: true, POSSIBLE: true }, typeFilter: null, selectedId: null,
-    events: [], learnedRoutes: [], serverStats: { confirmed: 0, events24: 0, tracked: null, lastSweepSecondsAgo: null },
+    events: [], learnedRoutes: [], serverStats: { events24: 0, tracked: null, lastSweepSecondsAgo: null },
     incidents: [], incidentStats: {}, expandedIncidentId: null };
 
   componentDidMount() {
@@ -489,21 +489,28 @@ class Component extends DCLogic {
       liveLabel: liveOn ? 'LIVE' : 'PAUSED', liveColor: liveOn ? '#35c46a' : '#6b7686',
       liveDotStyle: 'width:9px;height:9px;border-radius:50%;background:' + (liveOn ? '#35c46a' : '#6b7686') + ';box-shadow:0 0 8px ' + (liveOn ? '#35c46a' : 'transparent') + ';' + (liveOn ? 'animation:pulseDot 1.6s ease-in-out infinite;' : ''),
       clock,
-      // confirmed/events24 come from serverStats (the server's true SQL
-      // COUNT(*) over the full 24h window, see server.py's handle_api_events
-      // comment), NOT confCount.CONFIRMED/all.length — those are derived
-      // from the capped (limit=200) `events` array and would silently
-      // undercount on a busy day (BACKTEST_LOG.md ronde 6 fixed this exact
-      // undercounting bug server-side; this front-end never actually
-      // consumed the fix — found and fixed ronde 22). confCount itself is
-      // still used below for the filter-chip counts, where "count within
-      // the currently loaded feed" is the correct, intentional meaning.
-      stats: { confirmed: ss.confirmed, events24: ss.events24, tracked: trackedLabel, lastSweep: lastSweepLabel, active: filtered.length, shown: filtered.length },
+      // events24 comes from serverStats (the server's true SQL COUNT(*)
+      // over the full 24h window, see server.py's handle_api_events
+      // comment), NOT confCount/all.length — those are derived from the
+      // capped (limit=200) `events` array and would silently undercount on
+      // a busy day (BACKTEST_LOG.md ronde 6 fixed this exact undercounting
+      // bug server-side; this front-end never actually consumed the fix —
+      // found and fixed ronde 22). confCount itself is still used below
+      // for the filter-chip counts, where "count within the currently
+      // loaded feed" is the correct, intentional meaning.
+      //
+      // The header's "Confirmed active" tile deliberately does NOT use a
+      // count of /api/events rows (ss.confirmed): that's a raw, un-deduped
+      // detector-hit log — a single ongoing emergency squawk re-fires every
+      // tier0 cycle and inflated this to e.g. 8 for one real aircraft.
+      // incidentStats.confirmed (below) is /api/incidents' activeConfirmed,
+      // a true count of DISTINCT open incidents in state BEVESTIGD.
+      stats: { events24: ss.events24, tracked: trackedLabel, lastSweep: lastSweepLabel, active: filtered.length, shown: filtered.length },
       feedRows, markers, gridV, gridH, confChips, typeChips, confirmedList,
       learnedRoutes: s.learnedRoutes || [],
       hasSelected: !!sel, sel, closePanel: () => this.close(),
       incidentRows, hasIncidents: incidentRows.length > 0,
-      incidentStats: { active: incidentRows.length, precision: precisionLabel },
+      incidentStats: { active: incidentRows.length, confirmed: ist.activeConfirmed || 0, precision: precisionLabel },
     };
   }
 }
