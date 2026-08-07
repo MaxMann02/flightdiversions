@@ -47,6 +47,14 @@ class Event:
     # instead, to give a disputed hit reduced evidence weight rather than
     # relabeling confidence.
     route_source_disputed: bool = False
+    # Set by main.py's enrich_events when a second route source's
+    # alternate destination doesn't just disagree but actually explains
+    # the observation geometrically (e.g. the observed descent is a
+    # textbook-normal approach to THAT destination) — strong enough to
+    # treat this Event as a false positive caused by bad reference data
+    # rather than a real diversion, dropped before it ever reaches
+    # db_module.save_event/IncidentManager rather than merely scored low.
+    suppressed: bool = False
 
 
 def _probable_destination_note(airport_db, lat: float, lon: float, heading: float) -> str:

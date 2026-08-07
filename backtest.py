@@ -748,7 +748,7 @@ def check_wrong_airport_route_crosscheck() -> bool:
     return all_ok
 
 
-def check_premature_descent_signal_lost_route_crosscheck() -> bool:
+def check_premature_descent_signal_lost_route_crosscheck(airport_db: AirportDB) -> bool:
     """Live data (2026-08-07, BACKTEST_LOG.md ronde 24): pulled a fresh
     /api/events snapshot and hexdb.io-queried 8 of the sampled
     signal_lost_near_airport callsigns directly. 6/8 hexdb.io lookups named
@@ -783,7 +783,24 @@ def check_premature_descent_signal_lost_route_crosscheck() -> bool:
     check_wrong_airport_route_crosscheck: this is main.py's async
     enrichment layer (live-network provider concern), not detector.py
     geometry — standalone async repro with a mocked
-    providers.lookup_route_hexdb instead."""
+    providers.lookup_route_hexdb instead.
+
+    Extended 2026-08-07 with a real live case: KLM81J, filed EHAM->LEBL,
+    reported "vroegtijdige daling: nog 261nm te gaan naar LEBL op 15800ft"
+    — but hexdb.io's own route for KLM81J is EHAM->LFBD (Bordeaux), and the
+    aircraft's actual position was a completely normal approach to LFBD,
+    not a diversion at all. Unlike the ronde-24 cases above (which only
+    downgrade evidence weight on disagreement), premature_descent can be
+    verified further: main.py's enrich_events now reuses the exact
+    top-of-descent physics detect_premature_descent itself uses against
+    hexdb's ALTERNATE destination, and hard-suppresses (Event.suppressed)
+    when that geometry actually fits — not just "hexdb names something
+    else". Live counter-evidence for why this isn't extended to
+    signal_lost_near_airport, or made an unconditional distrust of adsbdb:
+    hexdb.io's own route for UAL1601 (a genuine, unrelated live emergency
+    the same day) was 8 YEARS stale (2018 data, KMCO->KEWR) while adsbdb
+    had the correct, current route — the opposite pattern. Geometry
+    verification, not source preference, is what makes this safe."""
     import asyncio
 
     import main as main_module
@@ -885,6 +902,41 @@ def check_premature_descent_signal_lost_route_crosscheck() -> bool:
         ok6 = ev6.confidence == "MOGELIJK" and not ev6.route_source_disputed
         all_ok = all_ok and ok6
         print(f"  premature_descent: hexdb.io has no data -> not disputed, not penalized: {'OK' if ok6 else f'FAIL (disputed={ev6.route_source_disputed})'}")
+
+        # premature_descent: hexdb.io disagrees AND the observed position is
+        # a geometrically normal approach to hexdb's alternate destination
+        # (real KLM81J shape: filed EHAM->LEBL, hexdb says EHAM->LFBD,
+        # aircraft actually right on top of LFBD) -> hard-suppressed as a
+        # false positive, not just disputed. Position pinned exactly at
+        # LFBD's own coordinates so the distance-to-alt-dest is ~0nm,
+        # trivially inside any positive top-of-descent window, without
+        # needing to hand-compute haversine distances for this test.
+        providers.lookup_route_hexdb = mock_hexdb(("EHAM", "LFBD"))
+        lfbd = airport_db.get("LFBD")
+        ev7 = Event(hex="t7", callsign="KLM81J", event_type="premature_descent", confidence="MOGELIJK",
+                    message="test", origin_icao="EHAM", dest_icao="LEBL",
+                    lat=lfbd["lat"], lon=lfbd["lon"], alt=15800.0)
+        await main_module.enrich_events(None, cfg, [ev7], airport_db)
+        ok7 = ev7.suppressed and not ev7.route_source_disputed
+        all_ok = all_ok and ok7
+        print(f"  premature_descent: hexdb.io disagrees AND geometry confirms its destination (live KLM81J) -> suppressed: {'OK' if ok7 else f'FAIL (suppressed={ev7.suppressed}, disputed={ev7.route_source_disputed})'}")
+
+        # premature_descent: hexdb.io disagrees, but the aircraft's position
+        # ALSO doesn't fit hexdb's alternate destination (still right at
+        # EHAM, hexdb's LFBD is ~480nm away — well beyond the ~315nm
+        # top-of-descent window for 35,000ft) -> falls back to the ronde-24
+        # disputed-weight path, NOT suppressed. Proves the geometry check
+        # actually verifies the alternate destination rather than
+        # suppressing on disagreement alone.
+        providers.lookup_route_hexdb = mock_hexdb(("EHAM", "LFBD"))
+        eham = airport_db.get("EHAM")
+        ev8 = Event(hex="t8", callsign="KLM82J", event_type="premature_descent", confidence="MOGELIJK",
+                    message="test", origin_icao="EHAM", dest_icao="LEBL",
+                    lat=eham["lat"], lon=eham["lon"], alt=35000.0)
+        await main_module.enrich_events(None, cfg, [ev8], airport_db)
+        ok8 = ev8.route_source_disputed and not ev8.suppressed
+        all_ok = all_ok and ok8
+        print(f"  premature_descent: hexdb.io disagrees but geometry does NOT fit its destination -> stays disputed, not suppressed: {'OK' if ok8 else f'FAIL (suppressed={ev8.suppressed}, disputed={ev8.route_source_disputed})'}")
 
     try:
         asyncio.run(run())
@@ -1065,6 +1117,41 @@ def check_incident_engine_regressions(airport_db: AirportDB) -> bool:
     all_ok = all_ok and ok
     print(f"  deviation-recovery still works a second time on the same incident "
           f"(before={score_before_2nd_recovery:.0f}, after={score_after_2nd_recovery:.0f}): {'OK' if ok else 'FAIL (permanently disabled after first recovery)'}")
+
+    # 11. A sustained course_deviation, repeated many times with ZERO
+    # corroboration from any other kind of evidence, must NOT reach
+    # BEVESTIGD purely by accumulating repeat top-ups — even though its
+    # score alone comfortably crosses the threshold. Real motivation: a
+    # long, entirely routine reroute around contested/restricted airspace
+    # or weather can keep a heading pointed away from the filed destination
+    # for a long time at stable cruise without ever looking like anything
+    # but a deviation — see incidents.py's _DEVIATION_ONLY_SOURCES.
+    now_t3 = 8000.0
+    for i in range(9):
+        ev11 = Event(hex="inc_test_8", callsign="TST800", event_type="course_deviation",
+                     confidence="MOGELIJK", message=f"test{i}", origin_icao="EHAM", dest_icao="EGLL")
+        mgr.step("inc_test_8", "TST800", classify.AIRLINER, [ev11], {"squawk": "1200"}, now_t3)
+        now_t3 += 60.0
+    score11 = mgr._open["inc_test_8"]["score"]
+    state11 = mgr._open["inc_test_8"]["state"]
+    ok = score11 >= cfg["incident_score_confirmed_threshold"] and state11 == incidents_module.LIKELY
+    all_ok = all_ok and ok
+    print(f"  sustained course_deviation ALONE caps at WAARSCHIJNLIJK even once its score crosses "
+          f"BEVESTIGD's threshold (score={score11:.0f}, state={state11}): {'OK' if ok else 'FAIL'}")
+
+    # 12. The SAME incident, once genuinely different evidence corroborates
+    # it (here: premature_descent — the aircraft is now ALSO descending,
+    # not just pointed off-course at cruise), is allowed through to
+    # BEVESTIGD — proving the cap above is about corroboration, not a
+    # blanket ceiling on every course_deviation incident.
+    ev12 = Event(hex="inc_test_8", callsign="TST800", event_type="premature_descent",
+                 confidence="MOGELIJK", message="also descending now", origin_icao="EHAM", dest_icao="EGLL")
+    mgr.step("inc_test_8", "TST800", classify.AIRLINER, [ev12], {"squawk": "1200"}, now_t3)
+    state12 = mgr._open["inc_test_8"]["state"]
+    ok = state12 == incidents_module.CONFIRMED
+    all_ok = all_ok and ok
+    print(f"  same incident reaches BEVESTIGD once genuinely different evidence (premature_descent) "
+          f"corroborates it: {'OK' if ok else f'FAIL (state={state12})'}")
 
     return all_ok
 
@@ -1388,7 +1475,7 @@ def main():
     classification_ok = check_classification_regressions()
     route_widening_ok = check_route_widening_regressions()
     wrong_airport_crosscheck_ok = check_wrong_airport_route_crosscheck()
-    pd_sl_crosscheck_ok = check_premature_descent_signal_lost_route_crosscheck()
+    pd_sl_crosscheck_ok = check_premature_descent_signal_lost_route_crosscheck(airport_db)
     incident_engine_ok = check_incident_engine_regressions(airport_db)
     incident_engine_real_case_ok = check_incident_engine_real_case_escalation(airport_db)
     incident_engine_recovery_ok = check_incident_engine_real_case_recovery(airport_db)
