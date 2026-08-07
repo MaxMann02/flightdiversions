@@ -33,6 +33,20 @@ class Event:
     # detect_holding_pattern (holding AT the planned destination is weaker
     # evidence than holding somewhere else — see its docstring).
     at_destination: bool = False
+    # Same "structured flag, not message-text pattern-matching" convention
+    # as at_destination above. Set by main.py's enrich_events for
+    # premature_descent/signal_lost_near_airport when a second, independent
+    # route source (hexdb.io) names a DIFFERENT destination than the one
+    # this Event's dest_icao/message were built from (adsbdb's filed
+    # route) — see BACKTEST_LOG.md ronde 24 and the comment in enrich_events
+    # for the live-data justification. Both detectors already fire at the
+    # lowest confidence tier (MOGELIJK) by design, so unlike wrong_airport
+    # (which falls from BEVESTIGD to WAARSCHIJNLIJK on the same
+    # disagreement) there is no lower confidence label to downgrade INTO —
+    # this flag is the mechanism incidents.py's score_for_event uses
+    # instead, to give a disputed hit reduced evidence weight rather than
+    # relabeling confidence.
+    route_source_disputed: bool = False
 
 
 def _probable_destination_note(airport_db, lat: float, lon: float, heading: float) -> str:

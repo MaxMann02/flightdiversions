@@ -108,6 +108,17 @@ def score_for_event(ev, is_repeat_type: bool) -> tuple[float, str, str]:
     if et == "wrong_airport":
         return 90.0, "wrong_airport", "geland op onverwachte luchthaven"
     if et == "signal_lost_near_airport":
+        if ev.route_source_disputed:
+            # main.py's enrich_events found a second, independent route
+            # source (hexdb.io) naming a DIFFERENT destination than adsbdb's
+            # filed one for this callsign — see the comment there
+            # (BACKTEST_LOG.md ronde 24) for the live-data justification.
+            # ~1/3 of the normal weight, the same damping ratio already
+            # established for REPEATABLE_EVENT_TYPES's repeat hits (25->8,
+            # 35->12, 30->10) — a lone disputed hit alone then stays below
+            # the dashboard-visibility threshold (25), while genuine
+            # corroboration from any OTHER detector still surfaces it.
+            return 13.0, "signal_lost_disputed", "signaal verloren nabij niet-bestemming, laag (tweede routebron betwist de bestemming)"
         return 40.0, "signal_lost", "signaal verloren nabij niet-bestemming, laag"
     if et == "holding_pattern":
         if ev.at_destination:
@@ -116,6 +127,15 @@ def score_for_event(ev, is_repeat_type: bool) -> tuple[float, str, str]:
     if et in DEVIATION_EVENT_TYPES:
         return (10.0 if is_repeat_type else 30.0), et, f"{et} (koers wijst niet meer naar bestemming)"
     if et == "premature_descent":
+        if ev.route_source_disputed:
+            # Same route_source_disputed reasoning as signal_lost_near_
+            # airport above — see that branch's comment and main.py's
+            # enrich_events. Repeat dampening still applies on top (a
+            # sustained disputed descent shouldn't climb unboundedly either,
+            # same class of bug BACKTEST_LOG.md ronde 16 fixed for the
+            # non-disputed case) — ~1/3 of the disputed first-hit weight,
+            # same ratio as the non-disputed repeat tier (25->8).
+            return (3.0 if is_repeat_type else 8.0), "premature_descent_disputed", "vroegtijdige daling (tweede routebron betwist de bestemming)"
         return (8.0 if is_repeat_type else 25.0), "premature_descent", "vroegtijdige daling"
     return 10.0, et, ev.message  # fallback for any future detector type
 

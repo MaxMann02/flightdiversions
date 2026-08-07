@@ -87,6 +87,77 @@ async def enrich_events(session, cfg: dict, events: list) -> list:
                 log.warning("wrong_airport voor %s: hexdb.io route disagreement (%s vs adsbdb's %s), gedegradeerd",
                             ev.callsign, hexdb_pair[1], ev.dest_icao)
 
+        # Same second-opinion-on-the-REFERENCE-DATA idea as the wrong_airport
+        # check above, extended to the other two detectors that depend on
+        # track.route["destination_icao"] the same way (BACKTEST_LOG.md
+        # ronde 24). premature_descent and signal_lost_near_airport both only
+        # fire because the observed altitude/position looks wrong relative
+        # to adsbdb's FILED destination — if that destination is itself
+        # stale/wrong, the underlying observation can be completely routine.
+        # Live data pulled this round (2026-08-07,
+        # http://35.227.51.25:8787/api/events) showed the exact same
+        # adsbdb-route-mismatch shape rounds 16-18 already found for
+        # wrong_airport, often even more starkly for signal_lost_near_
+        # airport: RYR49MG (adsbdb filed LROP->EGGD, signal lost near LIRA)
+        # — hexdb.io's own route is EYVI->LIRA, i.e. hexdb's DESTINATION is
+        # exactly the airport this event flagged as "not the destination".
+        # Same shape for SAS80M (filed ENGM->EHAM, lost near ENGM; hexdb
+        # says EHAM->ENGM), MEA307 (filed OLBA->EDDF, lost near OLBA; hexdb
+        # says HECA->OLBA), NSZ8FI, EIN860, TAP1863 — 6 of 8 sampled hexdb.io
+        # lookups this round independently named a DIFFERENT destination
+        # than adsbdb's filed one, and in every one of those 6 that
+        # destination was exactly the "unexpected" airport the event fired
+        # on. premature_descent's live noise (round 16: 44/200 events, 22%)
+        # was already established as plausibly the same root cause there,
+        # though round 16 deliberately fixed it via a duration/threshold
+        # tune instead (premature_descent_samples/min_drop_ft) — a
+        # genuinely DIFFERENT, complementary mechanism (that fix separates a
+        # brief step-down from a sustained descent; this one separates a
+        # trustworthy filed destination from an untrustworthy one), so both
+        # coexist without redundancy.
+        #
+        # UNLIKE wrong_airport, neither detector ever starts above MOGELIJK
+        # (see their docstrings in detector.py — both are deliberately the
+        # WEAKEST, most-provisional tier: an inferred/unconfirmed signal,
+        # not physical proof like a landing). There is therefore no lower
+        # confidence label to downgrade INTO, and incidents.py's
+        # score_for_event doesn't even consult ev.confidence for these two
+        # event types (confirmed by reading it — only `emergency` does), so
+        # relabeling confidence here would be purely cosmetic — worse,
+        # setting it to WAARSCHIJNLIJK would read as MORE trusted than the
+        # plain MOGELIJK case, the opposite of the intent. Instead: the
+        # dedicated Event.route_source_disputed flag (see detector.py),
+        # which incidents.py's score_for_event uses to give a disputed hit
+        # reduced evidence weight instead of the normal one — a single
+        # doubted hit alone then stays below the dashboard-visibility
+        # threshold, while genuine corroboration from ANY other detector can
+        # still surface it. Deliberately never a hard suppression (no early
+        # return / dropped event): BACKTEST_LOG.md ronde 21's reverted
+        # same-metro-exclusion attempt for signal_lost_near_airport is the
+        # direct cautionary precedent — that detector is a single
+        # last-known-position snapshot with no safety net (UA2078's real
+        # diversion landed only ~15nm from its filed destination; an
+        # unconditional exclusion there would have silently and permanently
+        # lost it). A soft weight reduction preserves detection even if
+        # hexdb.io's own data happens to also be wrong/stale, at the cost of
+        # somewhat less certainty when hexdb.io is right — same
+        # "disagreement downgrades, silence doesn't" philosophy as the
+        # wrong_airport check above, just landing on a weight instead of a
+        # confidence label. Deliberately the SAME route_secondary_source_
+        # enabled gate as wrong_airport's check — both are the identical
+        # "trust a second route source over the first" concern.
+        if (ev.event_type in ("premature_descent", "signal_lost_near_airport")
+                and cfg.get("route_secondary_source_enabled") and ev.callsign):
+            hexdb_pair = await providers.lookup_route_hexdb(session, ev.callsign)
+            if hexdb_pair is not None and hexdb_pair[1] != ev.dest_icao:
+                ev.route_source_disputed = True
+                ev.message += (
+                    f" (tweede routebron (hexdb.io) noemt {hexdb_pair[1]} als bestemming i.p.v. "
+                    f"{ev.dest_icao} — mogelijk verouderde/foute scheduledata bij de eerste bron)"
+                )
+                log.warning("%s voor %s: hexdb.io route disagreement (%s vs adsbdb's %s), evidence-gewicht verlaagd",
+                            ev.event_type, ev.callsign, hexdb_pair[1], ev.dest_icao)
+
         # The 'emergency status' ADS-B subfield (nordo/lifeguard/minfuel/...)
         # is a separate, much less reliable signal than the 7700/7600/7500
         # squawk codes — see providers.cross_provider_confirms_emergency's

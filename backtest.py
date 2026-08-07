@@ -748,6 +748,152 @@ def check_wrong_airport_route_crosscheck() -> bool:
     return all_ok
 
 
+def check_premature_descent_signal_lost_route_crosscheck() -> bool:
+    """Live data (2026-08-07, BACKTEST_LOG.md ronde 24): pulled a fresh
+    /api/events snapshot and hexdb.io-queried 8 of the sampled
+    signal_lost_near_airport callsigns directly. 6/8 hexdb.io lookups named
+    a DIFFERENT destination than adsbdb's filed one, and in every one of
+    those 6, hexdb.io's destination was EXACTLY the "unexpected" airport the
+    event fired on (e.g. RYR49MG: adsbdb filed LROP->EGGD, signal lost near
+    LIRA; hexdb.io's own route is EYVI->LIRA — hexdb's destination IS the
+    airport this event flagged as "not the destination"). Same
+    adsbdb-route-mismatch root cause rounds 16-18 already found for
+    premature_descent (round 16, noise) and wrong_airport (round 18, fixed).
+
+    Extends round 18's wrong_airport hexdb.io cross-check
+    (check_wrong_airport_route_crosscheck above) to these two detectors —
+    but NOT identically: both already fire at the lowest confidence tier
+    (MOGELIJK) by design, unlike wrong_airport (BEVESTIGD), so there is no
+    lower confidence label to downgrade INTO, and incidents.py's
+    score_for_event doesn't consult ev.confidence for these two event types
+    at all (confirmed by reading it). main.py's enrich_events therefore
+    leaves ev.confidence UNCHANGED for these two (asserted explicitly below
+    — this is the key structural difference from wrong_airport, not an
+    oversight) and instead sets the new Event.route_source_disputed flag,
+    which score_for_event uses to give a disputed hit reduced evidence
+    weight (~1/3, the same damping ratio already established for
+    REPEATABLE_EVENT_TYPES's repeat hits) instead of a hard suppression —
+    see BACKTEST_LOG.md ronde 21's reverted same-metro-exclusion attempt for
+    signal_lost_near_airport for why an unconditional exclusion is unsafe
+    for that specific detector (single last-known-position snapshot, no
+    safety net; UA2078's real diversion landed only ~15nm from its filed
+    destination).
+
+    Not testable via backtest.py's Case harness for the same reason as
+    check_wrong_airport_route_crosscheck: this is main.py's async
+    enrichment layer (live-network provider concern), not detector.py
+    geometry — standalone async repro with a mocked
+    providers.lookup_route_hexdb instead."""
+    import asyncio
+
+    import main as main_module
+    import providers
+    from detector import Event
+    from incidents import score_for_event
+
+    print("\n=== premature_descent/signal_lost_near_airport route-source cross-check (mocked hexdb.io) ===")
+    cfg = dict(CONFIG)
+    # Isolate: only exercise the new hexdb.io check, not the other
+    # (already-tested) enrich_events branches.
+    cfg["cross_provider_consensus_enabled"] = False
+    cfg["weather_enrichment_enabled"] = False
+    cfg["fr24_confirm_enabled"] = False
+    cfg["route_secondary_source_enabled"] = True
+
+    def mock_hexdb(result):
+        async def _mock(session, callsign):
+            return result
+        return _mock
+
+    original = providers.lookup_route_hexdb
+    all_ok = True
+
+    async def run():
+        nonlocal all_ok
+
+        # signal_lost_near_airport: hexdb.io disagrees (mirrors the live
+        # RYR49MG finding above) -> NOT suppressed/silenced, confidence
+        # UNCHANGED (no lower tier to fall to), but flagged disputed and
+        # message annotated.
+        providers.lookup_route_hexdb = mock_hexdb(("EYVI", "LIRA"))
+        ev1 = Event(hex="t1", callsign="RYR49MG", event_type="signal_lost_near_airport", confidence="MOGELIJK",
+                    message="test", origin_icao="LROP", dest_icao="EGGD")
+        await main_module.enrich_events(None, cfg, [ev1])
+        ok1 = ev1.confidence == "MOGELIJK" and ev1.route_source_disputed and "hexdb.io" in ev1.message
+        all_ok = all_ok and ok1
+        print(f"  signal_lost: hexdb.io disagrees -> disputed flag set, confidence stays MOGELIJK: {'OK' if ok1 else f'FAIL (confidence={ev1.confidence}, disputed={ev1.route_source_disputed})'}")
+        delta1, source1, _ = score_for_event(ev1, False)
+        ok1b = delta1 == 13.0 and source1 == "signal_lost_disputed"
+        all_ok = all_ok and ok1b
+        print(f"  signal_lost: disputed hit scores reduced weight (13.0 vs normal 40.0): {'OK' if ok1b else f'FAIL (delta={delta1}, source={source1})'}")
+
+        # signal_lost_near_airport: hexdb.io agrees -> unaffected, full weight.
+        providers.lookup_route_hexdb = mock_hexdb(("KIAH", "KPHX"))
+        ev2 = Event(hex="t2", callsign="UAL2078", event_type="signal_lost_near_airport", confidence="MOGELIJK",
+                    message="test", origin_icao="KIAH", dest_icao="KPHX")
+        await main_module.enrich_events(None, cfg, [ev2])
+        ok2 = ev2.confidence == "MOGELIJK" and not ev2.route_source_disputed
+        all_ok = all_ok and ok2
+        print(f"  signal_lost: hexdb.io agrees -> undisputed, unaffected: {'OK' if ok2 else f'FAIL (disputed={ev2.route_source_disputed})'}")
+        delta2, source2, _ = score_for_event(ev2, False)
+        ok2b = delta2 == 40.0 and source2 == "signal_lost"
+        all_ok = all_ok and ok2b
+        print(f"  signal_lost: undisputed hit scores full weight (40.0): {'OK' if ok2b else f'FAIL (delta={delta2}, source={source2})'}")
+
+        # signal_lost_near_airport: hexdb.io has no data -> unconfirmed, not penalized.
+        providers.lookup_route_hexdb = mock_hexdb(None)
+        ev3 = Event(hex="t3", callsign="AAL710", event_type="signal_lost_near_airport", confidence="MOGELIJK",
+                    message="test", origin_icao="KALB", dest_icao="KCLT")
+        await main_module.enrich_events(None, cfg, [ev3])
+        ok3 = ev3.confidence == "MOGELIJK" and not ev3.route_source_disputed
+        all_ok = all_ok and ok3
+        print(f"  signal_lost: hexdb.io has no data -> not disputed, not penalized: {'OK' if ok3 else f'FAIL (disputed={ev3.route_source_disputed})'}")
+
+        # premature_descent: hexdb.io disagrees -> disputed, confidence
+        # unchanged, first-hit AND repeat-hit both damped further.
+        providers.lookup_route_hexdb = mock_hexdb(("EHAM", "ENGM"))
+        ev4 = Event(hex="t4", callsign="SAS80M", event_type="premature_descent", confidence="MOGELIJK",
+                    message="test", origin_icao="ENGM", dest_icao="EHAM")
+        await main_module.enrich_events(None, cfg, [ev4])
+        ok4 = ev4.confidence == "MOGELIJK" and ev4.route_source_disputed and "hexdb.io" in ev4.message
+        all_ok = all_ok and ok4
+        print(f"  premature_descent: hexdb.io disagrees -> disputed flag set, confidence stays MOGELIJK: {'OK' if ok4 else f'FAIL (confidence={ev4.confidence}, disputed={ev4.route_source_disputed})'}")
+        delta4_first, source4, _ = score_for_event(ev4, False)
+        delta4_repeat, _, _ = score_for_event(ev4, True)
+        ok4b = delta4_first == 8.0 and delta4_repeat == 3.0 and source4 == "premature_descent_disputed" and delta4_repeat < delta4_first
+        all_ok = all_ok and ok4b
+        print(f"  premature_descent: disputed first-hit 8.0, repeat further damped to 3.0: {'OK' if ok4b else f'FAIL (first={delta4_first}, repeat={delta4_repeat}, source={source4})'}")
+
+        # premature_descent: hexdb.io agrees -> unaffected, normal weights.
+        providers.lookup_route_hexdb = mock_hexdb(("OMDB", "KSFO"))
+        ev5 = Event(hex="t5", callsign="UAE225", event_type="premature_descent", confidence="MOGELIJK",
+                    message="test", origin_icao="OMDB", dest_icao="KSFO")
+        await main_module.enrich_events(None, cfg, [ev5])
+        ok5 = ev5.confidence == "MOGELIJK" and not ev5.route_source_disputed
+        all_ok = all_ok and ok5
+        print(f"  premature_descent: hexdb.io agrees -> undisputed, unaffected: {'OK' if ok5 else f'FAIL (disputed={ev5.route_source_disputed})'}")
+        delta5_first, source5, _ = score_for_event(ev5, False)
+        ok5b = delta5_first == 25.0 and source5 == "premature_descent"
+        all_ok = all_ok and ok5b
+        print(f"  premature_descent: undisputed first-hit scores normal weight (25.0): {'OK' if ok5b else f'FAIL (delta={delta5_first}, source={source5})'}")
+
+        # premature_descent: hexdb.io has no data -> unconfirmed, not penalized.
+        providers.lookup_route_hexdb = mock_hexdb(None)
+        ev6 = Event(hex="t6", callsign="EDV5329", event_type="premature_descent", confidence="MOGELIJK",
+                    message="test", origin_icao="KSTL", dest_icao="KLGA")
+        await main_module.enrich_events(None, cfg, [ev6])
+        ok6 = ev6.confidence == "MOGELIJK" and not ev6.route_source_disputed
+        all_ok = all_ok and ok6
+        print(f"  premature_descent: hexdb.io has no data -> not disputed, not penalized: {'OK' if ok6 else f'FAIL (disputed={ev6.route_source_disputed})'}")
+
+    try:
+        asyncio.run(run())
+    finally:
+        providers.lookup_route_hexdb = original
+
+    return all_ok
+
+
 def check_incident_engine_regressions(airport_db: AirportDB) -> bool:
     """Standalone smoke test for incidents.py (MASTERPLAN.md sectie 3),
     wired into main.py's tier0_loop/tier1_loop as of BACKTEST_LOG.md ronde
@@ -1242,6 +1388,7 @@ def main():
     classification_ok = check_classification_regressions()
     route_widening_ok = check_route_widening_regressions()
     wrong_airport_crosscheck_ok = check_wrong_airport_route_crosscheck()
+    pd_sl_crosscheck_ok = check_premature_descent_signal_lost_route_crosscheck()
     incident_engine_ok = check_incident_engine_regressions(airport_db)
     incident_engine_real_case_ok = check_incident_engine_real_case_escalation(airport_db)
     incident_engine_recovery_ok = check_incident_engine_real_case_recovery(airport_db)
@@ -1265,6 +1412,7 @@ def main():
     print(f"aircraft classification: {'OK' if classification_ok else 'FAIL — see above'}")
     print(f"route widening (hexdb.io + negative-retry): {'OK' if route_widening_ok else 'FAIL — see above'}")
     print(f"wrong_airport route-source cross-check: {'OK' if wrong_airport_crosscheck_ok else 'FAIL — see above'}")
+    print(f"premature_descent/signal_lost route-source cross-check: {'OK' if pd_sl_crosscheck_ok else 'FAIL — see above'}")
     print(f"incident engine: {'OK' if incident_engine_ok else 'FAIL — see above'}")
     print(f"incident engine (real-case escalation, AI850): {'OK' if incident_engine_real_case_ok else 'FAIL — see above'}")
     print(f"incident engine (real-case recovery, DAL2778): {'OK' if incident_engine_recovery_ok else 'FAIL — see above'}")

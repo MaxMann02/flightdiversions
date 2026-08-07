@@ -2080,3 +2080,86 @@ never propagated to the README's own independent description:
 
 No functional code changed — documentation only, no `backtest.py` re-run
 or smoke test needed.
+
+## Round 25 — 2026-08-07 (parallel agent) — hexdb.io route-source cross-check extended to premature_descent/signal_lost_near_airport
+
+A second parallel background agent (launched during round 23, scoped to
+extend round 18's `wrong_airport` hexdb.io cross-check to the other two
+route-dependent detectors flagged in round 17/20 as sharing the same
+likely root cause) reported back. Reviewed its full diff directly before
+committing, same discipline as round 22's parallel-agent work.
+
+**Live data re-confirmed the pattern independently.** Pulled a fresh
+`/api/events` snapshot and hexdb.io-queried 8 sampled
+`signal_lost_near_airport` callsigns directly: 6/8 disagreed with adsbdb's
+filed destination, and in every one of those 6, hexdb.io's own destination
+was EXACTLY the "unexpected" airport the event had fired on — e.g. RYR49MG
+(adsbdb filed LROP->EGGD, signal lost near LIRA; hexdb.io's own route is
+EYVI->LIRA, i.e. hexdb's destination IS the flagged airport). Same shape
+for SAS80M, MEA307, NSZ8FI, EIN860, TAP1863.
+
+**Correctly recognized a literal copy of the wrong_airport fix wouldn't
+work, and adapted rather than forcing it.** `wrong_airport` starts at
+BEVESTIGD and downgrades to WAARSCHIJNLIJK on hexdb.io disagreement.
+`premature_descent`/`signal_lost_near_airport` both already fire at the
+LOWEST confidence tier (MOGELIJK) by design — no lower label exists to
+downgrade into. Verified by reading `incidents.py`'s `score_for_event`
+directly that it doesn't even consult `ev.confidence` for these two event
+types (only `emergency` does), so relabeling would have been purely
+cosmetic, or actively backwards if set to WAARSCHIJNLIJK (reads as MORE
+trusted than plain MOGELIJK, the opposite of intent).
+
+**Built a new mechanism instead of forcing the old one: a structured
+`Event.route_source_disputed` flag** (`detector.py`, same convention as
+the existing `at_destination` flag), set by a new `main.py` `enrich_events`
+block mirroring `wrong_airport`'s exact shape (same `route_secondary_
+source_enabled` gate — deliberately NOT nested under `cross_provider_
+consensus_enabled`, learning round 18's own caught-before-commit mistake;
+same "disagreement downgrades, silence doesn't" logic). `incidents.py`'s
+`score_for_event` consumes the flag to give a disputed hit ~1/3 weight
+(the same damping ratio already established for `REPEATABLE_EVENT_TYPES`'s
+repeat hits): `signal_lost_near_airport` 40.0->13.0,
+`premature_descent` 25.0->8.0 first-hit / 8.0->3.0 repeat (repeat
+dampening still stacks on top — a sustained disputed descent shouldn't
+climb unboundedly either, same class of fix as round 16's repeat-scoring
+bug). A single disputed hit alone now stays below the dashboard-visibility
+threshold (25); genuine corroboration from any OTHER detector still
+surfaces it.
+
+**Deliberately a soft weight reduction, never a hard suppression** — the
+agent correctly cited round 21's reverted same-metro-exclusion attempt for
+`signal_lost_near_airport` as the direct cautionary precedent: that
+detector is a single last-known-position snapshot with no sustained-
+evidence safety net (UA2078's real diversion landed only ~15nm from its
+filed destination), so an unconditional exclusion there would have
+silently and permanently lost real detections whenever hexdb.io's own data
+also happened to be wrong/stale. A soft weight reduction avoids that
+failure mode entirely while still meaningfully damping the noise this
+round's live data confirmed.
+
+New `check_premature_descent_signal_lost_route_crosscheck()` in
+`backtest.py`: 6 sub-checks (disagree/agree/no-data x 2 detectors),
+asserting confidence stays MOGELIJK throughout (the key structural
+difference from `wrong_airport`, asserted explicitly rather than assumed)
+and the disputed flag/score weights behave as designed, including repeat
+dampening stacking correctly on the disputed weight for `premature_
+descent`. Confirmed zero effect on the `Case`/geometry harness (EK225's
+premature-descent variant and UA2078's signal-lost variant both unchanged
+at -7m00s/-12m00s respectively) — expected, since `run_case` never calls
+`main.enrich_events`.
+
+Independently re-verified everything before committing (not just trusting
+the agent's own report): `python -m py_compile main.py detector.py
+incidents.py backtest.py` clean; `python backtest.py` **10/10 cases** + all
+**16** regression-check groups (15 prior + this new one) green; grepped
+`route_source_disputed` across the whole codebase to confirm consistent
+wiring; ran an independent bounded live smoke test (`serve_all.py`,
+`TELEGRAM_BOT_TOKEN=""`/`TELEGRAM_CHAT_ID=""`, ~70s): no exceptions — two
+persisted incidents from earlier local test sessions (QXE2399, SRR6373)
+correctly resolved `GESLOTEN_GELAND` on landing, confirming the whole
+pipeline remains healthy end to end alongside the new code path. No live
+`premature_descent`/`signal_lost_near_airport` event happened to fire in
+either smoke-test window to exercise the new path against the real
+hexdb.io API end-to-end — acceptable per round 18's established precedent,
+given the mocked test covers the logic directly and `lookup_route_hexdb`
+itself was already live-verified in round 9.
