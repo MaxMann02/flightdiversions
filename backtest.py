@@ -439,6 +439,78 @@ def check_signal_lost_origin_suppression(airport_db: AirportDB) -> bool:
     return suppressed_ok and still_fires_ok
 
 
+def check_holding_pattern_origin_gating(airport_db: AirportDB) -> bool:
+    """Live data (2026-08-07, BACKTEST_LOG.md ronde 19): ~24% (5/21
+    sampled) of live holding_pattern hits were sustained circling near the
+    aircraft's OWN filed origin — the immediate, ungated 'non-destination'
+    scoring tier fired on every one, despite the same class of explanation
+    (adsbdb route-mismatch/regional-multi-leg-reuse) already fixed for
+    signal_lost_near_airport's equivalent case in round 17. Unlike that
+    fix (unconditional suppression, since signal_lost has no sustained-
+    evidence mechanism), holding_pattern already tracks a streak — so this
+    reuses the SAME long-streak patience already applied to destination
+    holds instead of suppressing outright, so a genuine early-return-then-
+    hold still has a chance to surface. Not a Case: a should-not-fire-
+    immediately/should-eventually-fire assertion (gated), contrasted with
+    an unrelated third airport (should still fire immediately, unaffected)
+    — same pattern as check_signal_lost_origin_suppression above."""
+    import math
+
+    from detector import detect_holding_pattern
+    from state import AircraftTrack, TrackPoint
+
+    print("\n=== holding_pattern origin-streak gating check ===")
+    cfg = CONFIG
+    origin = airport_db.get("KIAH")
+    dest = airport_db.get("KPHX")
+    third = airport_db.get("KDFW")
+    ac = {"on_ground": False}
+
+    def make_track() -> AircraftTrack:
+        track = AircraftTrack(hex="holding_origin_regression")
+        track.route = {
+            "origin_icao": "KIAH", "origin_lat": origin["lat"], "origin_lon": origin["lon"],
+            "destination_icao": "KPHX", "destination_lat": dest["lat"], "destination_lon": dest["lon"],
+        }
+        return track
+
+    def circle_sample(track: AircraftTrack, i: int, center: dict, lap_samples: int = 4, radius_nm: float = 4.0):
+        deg_per_sample = 360.0 / lap_samples
+        ang = math.radians((i * deg_per_sample) % 360)
+        dlat = (radius_nm / 60.0) * math.cos(ang)
+        dlon = (radius_nm / 60.0) * math.sin(ang) / math.cos(math.radians(center["lat"]))
+        trk = (i * deg_per_sample + 90) % 360
+        track.history.append(TrackPoint(ts=i * 60.0, lat=center["lat"] + dlat, lon=center["lon"] + dlon,
+                                         alt_baro=8000, track=trk, on_ground=False))
+
+    track1 = make_track()
+    fired_early = None
+    for i in range(cfg["holding_pattern_samples"] + 1):
+        circle_sample(track1, i, origin)
+        fired_early = detect_holding_pattern(track1, ac, airport_db, cfg)
+    gated_ok = fired_early is None
+    print(f"  circling near own origin, short streak: {'OK (gated)' if gated_ok else 'FAIL (fired immediately)'}")
+
+    fired_late = None
+    for i in range(cfg["holding_pattern_samples"] + 1, cfg["holding_pattern_samples"] + cfg["holding_pattern_destination_min_streak"] + 2):
+        circle_sample(track1, i, origin)
+        fired_late = detect_holding_pattern(track1, ac, airport_db, cfg)
+    eventually_fires_ok = fired_late is not None and fired_late.at_destination is False
+    print(f"  circling near own origin, sustained past the long streak: "
+          f"{'OK (fires, stronger tier)' if eventually_fires_ok else f'FAIL (fired_late={fired_late})'}")
+
+    track2 = make_track()
+    fired_third = None
+    for i in range(cfg["holding_pattern_samples"] + 1):
+        circle_sample(track2, i, third)
+        fired_third = detect_holding_pattern(track2, ac, airport_db, cfg)
+    unrelated_fires_ok = fired_third is not None
+    print(f"  circling near an unrelated third airport, short streak: "
+          f"{'OK (still fires immediately)' if unrelated_fires_ok else 'FAIL (suppression too broad!)'}")
+
+    return gated_ok and eventually_fires_ok and unrelated_fires_ok
+
+
 def check_classification_regressions() -> bool:
     """classify.py's decision order (MASTERPLAN.md sectie 4), sanity-checked
     against real live dbFlags/category values seen 2026-08-06 via
@@ -1026,6 +1098,7 @@ def main():
     emergency_status_ok = check_emergency_status_regressions()
     bow_suppression_ok = check_corridor_deviation_bow_suppression()
     signal_lost_origin_ok = check_signal_lost_origin_suppression(airport_db)
+    holding_origin_gating_ok = check_holding_pattern_origin_gating(airport_db)
     classification_ok = check_classification_regressions()
     route_widening_ok = check_route_widening_regressions()
     wrong_airport_crosscheck_ok = check_wrong_airport_route_crosscheck()
@@ -1046,6 +1119,7 @@ def main():
     print(f"emergency-status normalization: {'OK' if emergency_status_ok else 'FAIL — see above'}")
     print(f"corridor_deviation bow-tolerance suppression: {'OK' if bow_suppression_ok else 'FAIL — see above'}")
     print(f"signal_lost_near_airport origin-suppression: {'OK' if signal_lost_origin_ok else 'FAIL — see above'}")
+    print(f"holding_pattern origin-streak gating: {'OK' if holding_origin_gating_ok else 'FAIL — see above'}")
     print(f"aircraft classification: {'OK' if classification_ok else 'FAIL — see above'}")
     print(f"route widening (hexdb.io + negative-retry): {'OK' if route_widening_ok else 'FAIL — see above'}")
     print(f"wrong_airport route-source cross-check: {'OK' if wrong_airport_crosscheck_ok else 'FAIL — see above'}")

@@ -1644,3 +1644,69 @@ non-destination branch specifically (the same architecture already exists
 in `main.py`'s `enrich_events`, this would be a third, analogous
 application of the identical pattern — should be quick once the live
 evidence justifies it).
+
+## Round 20 — 2026-08-07 (`/loop` iteration) — holding_pattern's origin blind spot
+
+Followed through on round 19's flagged next step: pulled one more live
+snapshot and combined it with all 5 pulls collected so far this session
+(deduplicated by event `id`) to get a bigger `holding_pattern` sample —
+21 unique events, big enough to act on with the same confidence as round
+18's 25-sample `wrong_airport` finding.
+
+**Confirmed the exact same origin blind spot round 17 already fixed for
+`signal_lost_near_airport`, never applied to `holding_pattern`.** 5/21
+(~24%) of the sampled hits — EJU96EM, LOT2163, EXS94BN, BAW705, SWR9YH —
+show `nearest == origin_icao`, e.g. LOT2163 (LOT Polish Airlines) filed
+EPKK(Kraków)->LIRF(Rome), reported holding at EPKK itself. `detect_
+holding_pattern` only ever excluded the DESTINATION match, never origin —
+identical gap, different detector.
+
+**Also spotted, but deliberately NOT fixed this round: a third pattern.**
+Several holds land near a DIFFERENT airport in the SAME metro area as the
+filed destination/origin — EJU58QD (LIMC->LICC, held at LIML — Milan
+Malpensa vs. Linate), TAM4732 (held at SBGR, São Paulo's other airport),
+RYR4W (held at EGGW/Luton vs. filed EGSS/Stansted, both London), VTE3692
+(held at KDAL/Love Field vs. filed KDFW, both Dallas). Plausibly the same
+adsbdb-route-mismatch root cause (rounds 16-18) manifesting as "actually
+scheduled to the SISTER airport, not the filed one" rather than a fully
+wrong city. Real, but needs a "same metro area" concept this codebase
+doesn't have yet (`detect_holding_pattern`'s destination check is exact-
+ICAO-match only) — flagged as a distinct, well-scoped follow-up rather
+than folded into this round's fix.
+
+**Chose a different fix shape than round 17's origin exclusion,
+deliberately.** `signal_lost_near_airport` has no sustained-evidence
+mechanism (a single last-known-position snapshot), so unconditional
+suppression was the safe choice there. `holding_pattern` already tracks a
+streak and reserves a long, deliberately patient gate
+(`holding_pattern_destination_min_streak`, 20 samples) for the
+DESTINATION case specifically so a genuine early precursor (AI850) isn't
+lost to a blanket exclusion — the same reasoning applies to origin: an
+unconditional suppression would risk hiding a genuine early-return-then-
+hold (technical issue shortly after departure, circling near home before
+a landing decision), which is exactly the kind of precursor pattern this
+detector exists to catch. Fix (`detector.py`): reuse the SAME long-streak
+gate for the origin case as already exists for destination — fires only
+once sustained far longer than any routine explanation (regional/multi-
+leg callsign reuse, stale route data) would predict, rather than
+immediately. Kept `at_destination=False` (the stronger scoring tier) for
+a hold that survives the gate at origin — unlike an arrival-sequencing
+hold at destination, there's no ordinary reason to sustain a tight hold at
+one's own departure airport that long, so a validated origin-hold is still
+more informative than a validated destination-hold, not less.
+
+New `check_holding_pattern_origin_gating()` in `backtest.py`: circling
+near the aircraft's own origin does NOT fire on the first qualifying
+window (gated), but DOES fire once sustained past the long streak
+(stronger tier); circling near an unrelated third airport is unaffected,
+still fires immediately — same pattern as round 17's suppression-check
+style. Verified AI850's real case (which specifically exercises the
+DESTINATION-hold streak gate) is unaffected — its hold is at VIDP, the
+filed destination, never near origin (VAPO), so this change never
+executes for that case at all. `python backtest.py`: 9/9 cases (all
+unchanged) + all 12 regression-check groups (11 prior + this new one)
+green. Bounded live smoke test (`serve_all.py`, `TELEGRAM_BOT_TOKEN=""`/
+`TELEGRAM_CHAT_ID=""`, ~80s): no exceptions; a different real, live
+emergency this run (N4620D, squawk 7700) correctly detected, opened
+straight at BEVESTIGD, notified exactly once across several repeated
+tier0 hits.

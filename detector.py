@@ -540,6 +540,35 @@ def detect_holding_pattern(track: AircraftTrack, ac: dict, airport_db, cfg: dict
             return None
         route_note = f" (dit IS de geplande bestemming {track.route['destination_icao']}, maar het wachten duurt ongewoon lang)"
         at_destination = True
+    elif nearest["icao"] == track.route["origin_icao"]:
+        # Same reasoning as the destination case, added after live data
+        # (BACKTEST_LOG.md ronde 19): ~24% (5/21 sampled) of live
+        # holding_pattern hits were sustained circling near the aircraft's
+        # OWN filed ORIGIN — the immediate, ungated "non-destination" tier
+        # below fired on every one, despite this having at least two
+        # common, non-diversion explanations: adsbdb's known regional/
+        # multi-leg callsign-reuse issue (see detect_landed_wrong_airport's
+        # own origin comment — the same static schedule mapping problem,
+        # here making a return-leg flight's TRUE origin look like a
+        # "diversion back to origin"), or route data that's simply stale/
+        # swapped for this callsign (rounds 16-18's recurring root cause).
+        # Unlike signal_lost_near_airport's equivalent fix (which suppresses
+        # unconditionally, since that detector has no sustained-evidence
+        # mechanism at all), holding_pattern already tracks a streak — so
+        # instead of suppressing origin-holds outright and risking missing
+        # a genuine early-return-then-hold, this reuses the EXACT same
+        # patience already applied to destination holds: fire only once
+        # sustained far longer than any routine explanation would predict.
+        # Kept at_destination=False (the stronger scoring tier) rather than
+        # reusing True — unlike a destination arrival, there's no common,
+        # ordinary reason to sustain a tight hold at one's own departure
+        # airport for this long, so a hold that survives this gate is still
+        # more informative than a validated destination hold, not less.
+        track.holding_streak += 1
+        if track.holding_streak < cfg["holding_pattern_destination_min_streak"]:
+            return None
+        route_note = f" (dit IS het vertrekpunt {track.route['origin_icao']}, maar het wachten duurt ongewoon lang — mogelijk een terugkeer)"
+        at_destination = False
     else:
         track.holding_streak = 0
         route_note = f" (geplande bestemming was {track.route['destination_icao']})"
