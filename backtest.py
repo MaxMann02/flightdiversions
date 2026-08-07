@@ -534,6 +534,80 @@ def check_route_widening_regressions() -> bool:
     return all_ok
 
 
+def check_wrong_airport_route_crosscheck() -> bool:
+    """Live data (2026-08-07, BACKTEST_LOG.md ronde 18): 24/25 sampled live
+    wrong_airport/BEVESTIGD hits had zero corroborating evidence from any
+    other detector, and several (e.g. DLH8NK: adsbdb filed EDDF->LEMG,
+    actually landed EDDM — an extremely common, routine Lufthansa shuttle
+    hop) look like adsbdb schedule-data errors, not real diversions. Fixed
+    in main.py's enrich_events: a second, independent route source
+    (hexdb.io) is queried specifically for wrong_airport events, downgrading
+    confidence to WAARSCHIJNLIJK on disagreement rather than trusting
+    adsbdb's filed destination unconditionally. Not testable via
+    backtest.py's Case harness (that's detector.py geometry; this is
+    main.py's async enrichment layer, a live-network provider concern) —
+    standalone async repro with a mocked providers.lookup_route_hexdb
+    instead, same convention as round 5's route_lookup_pending_retry
+    verification (BACKTEST_LOG.md: 'not backtested via backtest.py, since
+    this is a live-network provider concern the synthetic geometry harness
+    doesn't model')."""
+    import asyncio
+
+    import main as main_module
+    import providers
+    from detector import Event
+
+    print("\n=== wrong_airport route-source cross-check (mocked hexdb.io) ===")
+    cfg = dict(CONFIG)
+    # Isolate: only exercise the new hexdb.io check, not the other
+    # (already-tested) enrich_events branches.
+    cfg["cross_provider_consensus_enabled"] = False
+    cfg["weather_enrichment_enabled"] = False
+    cfg["fr24_confirm_enabled"] = False
+    cfg["route_secondary_source_enabled"] = True
+
+    def mock_hexdb(result):
+        async def _mock(session, callsign):
+            return result
+        return _mock
+
+    original = providers.lookup_route_hexdb
+    all_ok = True
+
+    async def run():
+        nonlocal all_ok
+        providers.lookup_route_hexdb = mock_hexdb(("EDDF", "EDDM"))
+        ev1 = Event(hex="t1", callsign="DLH8NK", event_type="wrong_airport", confidence="BEVESTIGD",
+                    message="test", origin_icao="EDDF", dest_icao="LEMG")
+        await main_module.enrich_events(None, cfg, [ev1])
+        ok1 = ev1.confidence == "WAARSCHIJNLIJK" and "hexdb.io" in ev1.message
+        all_ok = all_ok and ok1
+        print(f"  hexdb.io disagrees with adsbdb's filed destination -> downgraded: {'OK' if ok1 else f'FAIL (confidence={ev1.confidence})'}")
+
+        providers.lookup_route_hexdb = mock_hexdb(("KIAH", "KPHX"))
+        ev2 = Event(hex="t2", callsign="UAL2078", event_type="wrong_airport", confidence="BEVESTIGD",
+                    message="test", origin_icao="KIAH", dest_icao="KPHX")
+        await main_module.enrich_events(None, cfg, [ev2])
+        ok2 = ev2.confidence == "BEVESTIGD"
+        all_ok = all_ok and ok2
+        print(f"  hexdb.io agrees with adsbdb's filed destination -> stays BEVESTIGD: {'OK' if ok2 else f'FAIL (confidence={ev2.confidence})'}")
+
+        providers.lookup_route_hexdb = mock_hexdb(None)
+        ev3 = Event(hex="t3", callsign="TVF3510", event_type="wrong_airport", confidence="BEVESTIGD",
+                    message="test", origin_icao="LFPO", dest_icao="LGMK")
+        await main_module.enrich_events(None, cfg, [ev3])
+        ok3 = ev3.confidence == "BEVESTIGD"
+        all_ok = all_ok and ok3
+        print(f"  hexdb.io has no data -> unconfirmed, not penalized: {'OK' if ok3 else f'FAIL (confidence={ev3.confidence})'}")
+
+    try:
+        asyncio.run(run())
+    finally:
+        providers.lookup_route_hexdb = original
+
+    return all_ok
+
+
 def check_incident_engine_regressions(airport_db: AirportDB) -> bool:
     """Standalone smoke test for incidents.py (MASTERPLAN.md sectie 3),
     wired into main.py's tier0_loop/tier1_loop as of BACKTEST_LOG.md ronde
@@ -954,6 +1028,7 @@ def main():
     signal_lost_origin_ok = check_signal_lost_origin_suppression(airport_db)
     classification_ok = check_classification_regressions()
     route_widening_ok = check_route_widening_regressions()
+    wrong_airport_crosscheck_ok = check_wrong_airport_route_crosscheck()
     incident_engine_ok = check_incident_engine_regressions(airport_db)
     incident_engine_real_case_ok = check_incident_engine_real_case_escalation(airport_db)
     airspace_ok = check_airspace_regressions(airport_db)
@@ -973,6 +1048,7 @@ def main():
     print(f"signal_lost_near_airport origin-suppression: {'OK' if signal_lost_origin_ok else 'FAIL — see above'}")
     print(f"aircraft classification: {'OK' if classification_ok else 'FAIL — see above'}")
     print(f"route widening (hexdb.io + negative-retry): {'OK' if route_widening_ok else 'FAIL — see above'}")
+    print(f"wrong_airport route-source cross-check: {'OK' if wrong_airport_crosscheck_ok else 'FAIL — see above'}")
     print(f"incident engine: {'OK' if incident_engine_ok else 'FAIL — see above'}")
     print(f"incident engine (real-case escalation, AI850): {'OK' if incident_engine_real_case_ok else 'FAIL — see above'}")
     print(f"airspace (weather + peer-consensus): {'OK' if airspace_ok else 'FAIL — see above'}")

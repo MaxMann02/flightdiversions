@@ -50,6 +50,43 @@ async def enrich_events(session, cfg: dict, events: list) -> list:
                 ev.message += " (grondstatus niet bevestigd door tweede bron)"
                 log.warning("cross-provider disagreement on %s, downgraded", ev.callsign or ev.hex)
 
+        # Live data (2026-08-07, BACKTEST_LOG.md ronde 18): 24/25 sampled
+        # live wrong_airport/BEVESTIGD hits had ZERO corroborating evidence
+        # from any other detector — a real diversion almost always leaves
+        # SOME other trace (emergency, a deviation, a hold); a plane that
+        # flew a completely normal profile and simply landed somewhere
+        # "unexpected" per adsbdb's filed route is far more likely a stale/
+        # wrong SCHEDULE match (e.g. DLH8NK: adsbdb said EDDF->LEMG
+        # (Malaga), landed EDDM (Munich) — an extremely common, routine
+        # Lufthansa shuttle hop, not a dramatic unreported diversion).
+        # Unlike the ground-state check above (which validates the
+        # OBSERVATION — is this aircraft really on the ground here), this
+        # validates the REFERENCE DATA the whole detector is built on: is
+        # the FILED destination itself trustworthy? hexdb.io is a second,
+        # independent route source (already used as main.py's tier1_loop
+        # resolution-time fallback, MASTERPLAN.md sectie 5) — if it names a
+        # DIFFERENT destination for this exact callsign, that's real doubt
+        # on the reference adsbdb data, not on the landing observation
+        # itself. Deliberately its own flag/block, NOT nested under
+        # cross_provider_consensus_enabled above — that flag is about ADS-B
+        # PROVIDER consensus (adsb.lol vs airplanes.live), an unrelated
+        # concern from ROUTE-SOURCE consensus (adsbdb vs hexdb.io); nesting
+        # it there would have silently disabled this check whenever a user
+        # turns off provider consensus for an unrelated reason. Only
+        # downgrades on an active DISAGREEMENT, same pattern as
+        # cross_provider_agrees above — no hexdb.io data at all leaves
+        # confidence unchanged (unconfirmed, not penalized).
+        if ev.event_type == "wrong_airport" and cfg.get("route_secondary_source_enabled") and ev.callsign:
+            hexdb_pair = await providers.lookup_route_hexdb(session, ev.callsign)
+            if hexdb_pair is not None and hexdb_pair[1] != ev.dest_icao:
+                ev.confidence = "WAARSCHIJNLIJK"
+                ev.message += (
+                    f" (tweede routebron (hexdb.io) noemt {hexdb_pair[1]} als bestemming i.p.v. "
+                    f"{ev.dest_icao} — mogelijk verouderde/foute scheduledata bij de eerste bron)"
+                )
+                log.warning("wrong_airport voor %s: hexdb.io route disagreement (%s vs adsbdb's %s), gedegradeerd",
+                            ev.callsign, hexdb_pair[1], ev.dest_icao)
+
         # The 'emergency status' ADS-B subfield (nordo/lifeguard/minfuel/...)
         # is a separate, much less reliable signal than the 7700/7600/7500
         # squawk codes — see providers.cross_provider_confirms_emergency's

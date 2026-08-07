@@ -1460,3 +1460,127 @@ No code changes from this pass — a clean result is still worth recording:
 confirms these two modules hold up under direct scrutiny rather than just
 having gone unexamined. `python backtest.py` unaffected (no code changed
 this part of the round).
+
+## Round 18 — 2026-08-07 (`/loop` iteration) — wrong_airport route-mismatch investigation, real fix
+
+Followed the queued instruction to investigate the deeper adsbdb-route-
+mismatch pattern flagged in round 17 before touching anything, starting
+with `route_plausible`'s existing design rather than guessing.
+
+**First result: ruled out tightening `route_plausible`'s ongoing cross-
+track bound — with real numbers, not just reasoning.** The ongoing recheck
+(`check_progress=False`, used after a route's `ROUTE_REVALIDATION_WINDOW_S`
+grace period) only rejects when cross-track distance exceeds the FULL
+route length — very loose by design (round 5's finding: a real diversion
+that overflies its destination has an unboundedly growing along-track
+overrun, so the along-track check has to be dropped for the ongoing case;
+cross-track was kept as the remaining guard). Computed the actual cross-
+track ratio for round 17's suspected-bad-route-data examples (JBU163
+KATL->KBOS with last position near KSRQ: 0.41x of route length; SKW5593
+KBGR->KORD near KMEM: 0.43x; SWA2591 KDEN->KCLE near KBNA: 0.31x; RPA5783
+KBOS->KJAX near KBNA: 0.44x) against a case that looks like a REAL
+diversion in the same batch (UAL426 KBOS->KIAH, landed KORD — confirmed by
+BOTH `signal_lost_near_airport` AND a follow-up `wrong_airport` for the
+same callsign, unlike every other sample which showed only one detector
+firing with no corroboration): **UAL426's own ratio is 0.26x — LOWER than
+every suspected-fake case.** There is no cross-track threshold that
+separates real diversions from bad route data; tightening this bound would
+have rejected a genuine diversion while barely touching the noise. Round
+5's own conclusion ("no single number can do that job forever") extends to
+this specific idea too — confirmed with numbers, not just re-asserted.
+
+**Second, much bigger result: the SAME investigation surfaced a more severe
+problem than premature_descent/signal_lost — `wrong_airport` itself.**
+Checked whether any of the 25 live `wrong_airport`/BEVESTIGD hits (the
+highest-trust detector — immediate confirmed, immediate Telegram dispatch
+on the currently-deployed pre-incident-engine pipeline) had ANY
+corroborating evidence from another detector for the same callsign in the
+same window: **only 1/25 did** (UAL426, above). The other 24 are single,
+isolated `wrong_airport` hits with zero other signal — no emergency, no
+deviation, no hold, nothing. A real diversion almost always leaves some
+other trace; 24 simultaneous, silent, uncorroborated "confirmed diversions"
+in one ~20min window is far more consistent with a systematic data problem
+than 24 real incidents. Spot-checked several for plausibility: DLH8NK
+(Lufthansa) filed EDDF->LEMG (Frankfurt-Malaga) but landed EDDM (Munich) —
+Frankfurt-Munich is an extremely common, high-frequency Lufthansa shuttle
+route, while a silent, unreported EDDF->LEMG diversion all the way to
+Munich with zero corroborating evidence is not a plausible reading of the
+same data. Same shape for TAR542 (EBBR->DTTA filed, landed EDDM), DLH6YM
+(EDDF->LFMN filed, landed EDDN/Nuremberg — another routine German
+domestic hop), TAR648 (DTTJ->EDDM filed, landed EDDF). Read as: adsbdb's
+static, crowdsourced schedule-to-callsign mapping is stale/wrong for these
+specific flight numbers on this specific day, and the aircraft flew a
+completely normal flight to its ACTUAL scheduled destination.
+
+**Why `route_plausible` structurally can't catch this class of error,
+explaining why it slipped through both the strict resolution-time check
+and the (already-shown-unfixable) ongoing recheck:** `route_plausible`'s
+strict check only runs early, soon after a route is first resolved, when
+`dist_from_origin` is still small — at that point ANY vaguely-plausible-
+direction destination passes trivially (a plane that just took off from
+EDDF looks identical whether truly bound for Munich or Malaga; both are
+"south-ish"). The mismatch only becomes geometrically obvious much LATER,
+exactly at the point the aircraft is about to land at its REAL destination
+— which is the exact moment `detect_landed_wrong_airport` fires. This
+isn't a threshold-tuning problem at all; it needs an independent second
+opinion on the reference data itself, not a better geometric test.
+
+**Fix: a second, independent route source specifically for `wrong_airport`
+events** (`main.py`'s `enrich_events`, mirroring the already-established
+`cross_provider_agrees`/`cross_provider_confirms_emergency` pattern for
+post-detection enrichment). When a `wrong_airport` Event fires, look up
+this exact callsign's route via hexdb.io (already used as `main.py`'s
+resolution-time fallback for callsigns adsbdb has nothing for, MASTERPLAN.md
+sectie 5) — if hexdb.io names a DIFFERENT destination than adsbdb's filed
+`dest_icao`, downgrade confidence to WAARSCHIJNLIJK with an explanatory
+note, rather than trusting the unconfirmed reference data as BEVESTIGD. No
+hexdb.io data at all leaves confidence unchanged (unconfirmed, not
+penalized) — same "disagreement downgrades, silence doesn't" pattern as
+the existing ground-state cross-provider check right above it in the same
+function. Deliberately its own gate (`route_secondary_source_enabled`),
+NOT nested inside the existing `cross_provider_consensus_enabled` block —
+caught and fixed a real placement bug while writing this: the first draft
+nested it there, which would have silently disabled the new route
+cross-check any time a user disables ADS-B PROVIDER consensus (adsb.lol vs
+airplanes.live) for an unrelated reason, an entirely different concern
+from ROUTE-SOURCE consensus (adsbdb vs hexdb.io).
+
+**Confirmed the one real hard part doesn't apply here — unlike the
+cross-track-ratio finding above, this fix has NO false-negative risk for
+genuine diversions with a matching hexdb.io route**, since it only ever
+downgrades on active disagreement between two independent sources, never
+on agreement or silence; a real diversion where hexdb.io's data happens to
+also be stale would simply not get this extra protection (an acceptable,
+pre-existing residual gap, not a regression).
+
+New `check_wrong_airport_route_crosscheck()` in `backtest.py`: a standalone
+async repro with a mocked `providers.lookup_route_hexdb` (same convention
+as round 5's `route_lookup_pending_retry` verification — this is
+`main.py`'s async enrichment layer, a live-network provider concern the
+synthetic `Case`/`detector.py` geometry harness doesn't model, so not
+addable as a `Case`). Three scenarios: hexdb.io disagrees -> downgraded
+with an explanatory note; hexdb.io agrees -> stays BEVESTIGD; hexdb.io has
+no data -> stays BEVESTIGD (unconfirmed, not penalized). All three
+isolated from the function's OTHER enrichment branches (cross-provider
+consensus, weather, FR24 all disabled in the test config) so only the new
+code path is exercised.
+
+**This change lives entirely in `main.py`'s async enrichment layer, never
+touched by `backtest.py`'s `Case`/`run_case` harness** — confirmed none of
+the 9 real cases (including the 4 that specifically exercise
+`detect_landed_wrong_airport`: UA2078, TO3510, ATL-MCO-FLL, TK17) could
+possibly be affected by this change, since `run_case` calls
+`detect_emergency`/`evaluate()` directly and never goes through
+`main.enrich_events`. `python backtest.py`: 9/9 cases (all unchanged,
+confirming the above) + all 11 regression-check groups (10 prior + this
+new one) green. Bounded live smoke test (`serve_all.py`,
+`TELEGRAM_BOT_TOKEN=""`/`TELEGRAM_CHAT_ID=""`, ~100s, 2 tier1 cycles,
+~13000-13300 aircraft tracked): no exceptions; a real, live emergency
+(GBODB, squawk 7600/NORDO) was correctly detected, opened straight at
+BEVESTIGD, and notified exactly once across several repeated 15-18s tier0
+hits — confirms the unrelated parts of the live loop are unaffected. No
+live `wrong_airport` event happened to fire during this specific short
+window to exercise the new code path end-to-end against the real hexdb.io
+API — acceptable given the mocked test covers the logic directly and the
+function it calls (`providers.lookup_route_hexdb`) was already live-
+verified in round 9.
