@@ -14,10 +14,17 @@ _DASHBOARD_PATH = os.path.join(_HERE, "Flight Diversions Dashboard.dc.html")
 _SUPPORT_JS_PATH = os.path.join(_HERE, "support.js")
 
 # How far back the event feed and the events24/confirmed stats look.
-# Individual events are already de-duped at the source: main.py only ever
-# persists one per (hex, event_type) per alert_cooldown_seconds window (see
-# enrich_and_dispatch), so this window just bounds how long a past event
-# stays visible on the dashboard, not how often it can recur.
+# Individual events are NOT de-duped at the source: main.py's tier0_loop/
+# tier1_loop save every raw detector.Event unconditionally (see their
+# db_module.save_event calls) — `events` is a raw, append-only log of every
+# detector hit, same convention as backtest.py's run_case (see its
+# docstring). De-duplication/escalation now happens entirely in the
+# incident engine (incidents.py's notified_state gate), not here — this
+# comment previously described an alert_cooldown_seconds-gated
+# enrich_and_dispatch mechanism that was removed in BACKTEST_LOG.md ronde
+# 10-11 (renamed/split into enrich_events + IncidentManager.step()); found
+# stale while reviewing this file (ronde 16). This window just bounds how
+# long a past event stays visible on the dashboard.
 FEED_WINDOW_SECONDS = 24 * 3600
 
 CONFIDENCE_NL_TO_EN = {

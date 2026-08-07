@@ -272,11 +272,14 @@ def check_course_deviation_holding_suppression() -> bool:
     apart from a real turn before it's actually repeated at least once).
     What the fix guarantees is that it does NOT keep re-firing on every
     subsequent turn of the same ongoing hold: each turn is its own
-    detector hit (course_deviation has no memory of "already alerted on
-    this hold" the way alert_cooldown_seconds gates repeat DISPATCHES of
-    an identical event_type — a hold with turns spaced further apart than
-    the cooldown window would previously have kept clearing it and firing
-    again, turn after turn, for as long as the hold lasted). See
+    detector hit, and course_deviation itself has no memory of "already
+    alerted on this hold" (that's a detector-level concern this fix
+    addresses directly — the old alert_cooldown_seconds-gated dispatch,
+    since removed in BACKTEST_LOG.md ronde 11, would have masked the
+    SYMPTOM at the notification layer for holds with turns closer together
+    than the cooldown window, but a hold with turns spaced further apart
+    than that window would still have kept clearing it and firing again,
+    turn after turn, for as long as the hold lasted). See
     BACKTEST_LOG.md round 7."""
     import math
     from detector import detect_course_deviation
