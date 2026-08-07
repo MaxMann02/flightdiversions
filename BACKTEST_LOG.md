@@ -1422,3 +1422,41 @@ filed route, not just "not origin/dest," then decide whether the fix
 belongs in `route_plausible`'s resolution-time check, a secondary source
 cross-check, or the detector itself) — left for a dedicated future round
 rather than a second rushed pattern-match fix in the same session.
+
+**Continued same round — self-review pass on `airspace.py`/`classify.py`**
+(item 5 of the queued instructions), specifically checking assumptions
+that hadn't been independently verified against live data before, not
+just re-reading the code:
+
+- **`get_active_hazards` compares `validTimeFrom`/`validTimeTo` directly
+  against `time.time()`** — worth checking because if aviationweather.gov
+  ever returned these as ISO8601 strings instead of numeric epoch
+  timestamps, every call would crash (`str <= float` raises `TypeError`)
+  inside `main.py`'s tier1 loop. Pulled a live SIGMET+CWA sample directly
+  (`aviationweather.gov/api/data/airsigmet`+`/cwa`) and confirmed both are
+  plain Python `int` epoch seconds, not strings — no bug, but now verified
+  rather than assumed.
+- Same live pull also confirmed `altitudeLow1`/`altitudeHi1` are real
+  numeric feet values (or `None`), matching `_parse_hazard`'s comparison
+  logic, and that `coords` matches the module's own documented SIGMET-vs-
+  CWA lat/lon type difference (numeric vs string) exactly.
+- **`classify.py`'s branch order**, probed directly with three edge cases
+  not covered by `check_classification_regressions`'s existing synthetic
+  cases: an airline-callsign aircraft with a LIGHT (A1) category → `ONBEKEND`
+  (correctly falls through both the AIRLINER and GA_PRIVE branches rather
+  than being misclassified either way — safe, not suppressed, matches the
+  documented "prefer a false negative on suppression over silently missing
+  a real airliner" design intent); an airline-callsign aircraft with NO
+  category data at all → `ONBEKEND` (same safe fallback, relies on
+  `refine_with_hexdb`); a business-jet ICAO type reported with a LIGHT
+  category → `GA_PRIVE` instead of `ZAKENJET` (the light-category-and-
+  non-airline-callsign branch is checked before the business-jet-type
+  fallback) — a real labeling imprecision, but functionally harmless since
+  both classes are in `SUPPRESSED_CLASSES` with identical behavior; not
+  worth a code change, recorded as verified-and-understood rather than
+  silently unexamined.
+
+No code changes from this pass — a clean result is still worth recording:
+confirms these two modules hold up under direct scrutiny rather than just
+having gone unexamined. `python backtest.py` unaffected (no code changed
+this part of the round).
