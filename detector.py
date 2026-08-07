@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 
 import db as db_module
-from airports import angle_diff_deg, bearing_deg, cross_track_distance_nm, crosses_russian_airspace_zone, haversine_nm
+from airports import airports_same_metro, angle_diff_deg, bearing_deg, cross_track_distance_nm, haversine_nm
 from providers import EMERGENCY_SQUAWKS
 from state import AircraftTrack
 
@@ -28,6 +28,25 @@ class Event:
     alt: float | None = None
     origin_icao: str | None = None
     dest_icao: str | None = None
+    # Structured flag so callers (incidents.py's scoring) don't need to
+    # pattern-match ev.message text. Currently only set by
+    # detect_holding_pattern (holding AT the planned destination is weaker
+    # evidence than holding somewhere else — see its docstring).
+    at_destination: bool = False
+    # Same "structured flag, not message-text pattern-matching" convention
+    # as at_destination above. Set by main.py's enrich_events for
+    # premature_descent/signal_lost_near_airport when a second, independent
+    # route source (hexdb.io) names a DIFFERENT destination than the one
+    # this Event's dest_icao/message were built from (adsbdb's filed
+    # route) — see BACKTEST_LOG.md ronde 24 and the comment in enrich_events
+    # for the live-data justification. Both detectors already fire at the
+    # lowest confidence tier (MOGELIJK) by design, so unlike wrong_airport
+    # (which falls from BEVESTIGD to WAARSCHIJNLIJK on the same
+    # disagreement) there is no lower confidence label to downgrade INTO —
+    # this flag is the mechanism incidents.py's score_for_event uses
+    # instead, to give a disputed hit reduced evidence weight rather than
+    # relabeling confidence.
+    route_source_disputed: bool = False
 
 
 def _probable_destination_note(airport_db, lat: float, lon: float, heading: float) -> str:
@@ -125,12 +144,30 @@ PENDING_HOLD_TOLERANCE_DEG = 35
 
 
 def _deviation_context(track: AircraftTrack, p_latest) -> str:
+    """Only ever called from detect_course_deviation, AFTER its own
+    bow-tolerance suppression check has already passed (see that call
+    site) — which, whenever track.route is set, already guarantees the
+    current heading is more than corridor_deviation_bow_heading_deg away
+    from the bearing to the filed destination (otherwise the event would
+    have been suppressed before ever reaching here). So there's no "but
+    the new heading still points toward the destination" case left to
+    describe by the time this runs.
+
+    Found via live review (BACKTEST_LOG.md ronde 19): the live dashboard
+    showed a course_deviation event with the message "nieuwe koers wijst
+    nu wél richting X" — impossible from the CURRENT code (solid proof the
+    deployed VM predates round 8's bow-tolerance fix for course_deviation,
+    not a bug in this repo), but this function used its OWN separate,
+    inconsistent, hardcoded 30-degree threshold instead of the real check's
+    cfg-driven corridor_deviation_bow_heading_deg (60 by default) — a
+    dead/unreachable branch (any angle < 30 is also <= 60, so the caller's
+    suppression check would already have returned None first) that made
+    the live symptom look, on a first read, like it could still happen
+    from this code. Simplified to just describe what's now unconditionally
+    true instead of re-deriving a check that already ran."""
     if not track.route:
         return ""
     dest = track.route["destination_icao"]
-    new_bearing_to_dest = bearing_deg(p_latest.lat, p_latest.lon, track.route["destination_lat"], track.route["destination_lon"])
-    if angle_diff_deg(p_latest.track, new_bearing_to_dest) < 30:
-        return f" (nieuwe koers wijst nu wél richting {dest})"
     return f" (nieuwe koers wijst niet richting oorspronkelijke bestemming {dest})"
 
 
@@ -217,6 +254,18 @@ def detect_course_deviation(track: AircraftTrack, ac: dict, cfg: dict, airport_d
                     and recent_radius <= cfg["holding_pattern_max_radius_nm"]):
                 return None
 
+        # Bow-tolerance check (MASTERPLAN.md sectie 8), same rationale as
+        # detect_route_corridor_deviation: a held turn that still points
+        # broadly toward the filed destination is more likely a real
+        # airway/STAR turn than a diversion. Only applicable when a route
+        # is known — course_deviation is deliberately route-independent
+        # otherwise (see this function's docstring), so this can't run
+        # universally the way it does in detect_route_corridor_deviation.
+        if track.route:
+            bearing_to_dest = bearing_deg(p_latest.lat, p_latest.lon, track.route["destination_lat"], track.route["destination_lon"])
+            if angle_diff_deg(p_latest.track, bearing_to_dest) <= cfg["corridor_deviation_bow_heading_deg"]:
+                return None
+
         note = _probable_destination_note(airport_db, p_latest.lat, p_latest.lon, p_latest.track) if airport_db else ""
         return Event(
             hex=track.hex, callsign=track.callsign, event_type="course_deviation",
@@ -286,23 +335,25 @@ def detect_route_corridor_deviation(track: AircraftTrack, ac: dict, cfg: dict, a
 
     route = track.route
     route_len = haversine_nm(route["origin_lat"], route["origin_lon"], route["destination_lat"], route["destination_lon"])
-    if crosses_russian_airspace_zone(route["origin_lat"], route["origin_lon"], route["destination_lat"], route["destination_lon"]):
-        # This skip is for the LEGITIMATE case: routes that can't fly the
-        # direct line at all post-2022 and so bow far off it as normal,
-        # non-diverted routing. But it used to be unconditional, keyed only
-        # off the FILED origin/destination — so it stayed in effect for the
-        # rest of the flight even after a genuine diversion had turned the
-        # aircraft fully away from that bow and toward a different
-        # continent. Backtested against Emirates EK225 (DXB->SFO A380
-        # medical-emergency turnback to LHR, 29 Jul 2026 — the same route
-        # the threshold_nm capping above was tuned against): the blanket
-        # skip made this detector permanently blind to that diversion, even
-        # hours after the turn. A real Russia-avoidance bow still makes
-        # broad progress toward the filed destination throughout; a real
-        # diversion's heading stops pointing there at all — so only skip
-        # while the current heading still roughly does.
+    # Bow-tolerance check (MASTERPLAN.md sectie 8): a route that bows off
+    # the great-circle line but whose CURRENT heading still points broadly
+    # toward the filed destination is very likely legitimate airway/wind-
+    # optimized routing, not a diversion — a genuine diversion's heading
+    # stops pointing there at all. Originally this only ran for routes
+    # crossing the Russia/Siberia zone (crosses_russian_airspace_zone);
+    # live production data (2026-08-06) showed the identical false-positive
+    # pattern well outside that zone with no other corroborating signal
+    # (AAL168 KPDX->KCLT 503nm off, ASH4002 KIAH->KOKC 85nm off, NOZ1865
+    # LIBD->ENGM 152nm off), so this now runs for every route. Unlike the
+    # original Russia-only version, a MISSING heading sample does NOT
+    # suppress here — that fallback made sense only within the narrow
+    # Russia exception; applied globally it would risk silencing a genuine
+    # diversion during a brief heading-data gap, so we only suppress on
+    # positive evidence the aircraft is still heading toward the
+    # destination.
+    if p_latest.track is not None:
         bearing_to_dest = bearing_deg(p_latest.lat, p_latest.lon, route["destination_lat"], route["destination_lon"])
-        if p_latest.track is None or angle_diff_deg(p_latest.track, bearing_to_dest) <= cfg["corridor_deviation_bow_heading_deg"]:
+        if angle_diff_deg(p_latest.track, bearing_to_dest) <= cfg["corridor_deviation_bow_heading_deg"]:
             track.corridor_deviation_streak = 0
             return None
     buffer_nm = max(30.0, min(150.0, route_len * 0.05))
@@ -419,8 +470,47 @@ def detect_signal_lost_near_airport(track: AircraftTrack, airport_db, cfg: dict)
     nearest, _dist = airport_db.nearest(last.lat, last.lon, max_km=cfg["signal_lost_search_km"])
     if not nearest:
         return None
-    if nearest["icao"] == track.route["destination_icao"]:
+    route = track.route
+    # Deliberately NOT extended with airports_same_metro the way holding_
+    # pattern's equivalent exclusions were in the same round (BACKTEST_LOG.md
+    # ronde 21) — tried it first, and it broke this detector's own real,
+    # sourced case: UA2078 diverted from its filed KPHX to Luke AFB, only
+    # ~15nm away (well inside AIRPORT_SAME_METRO_RADIUS_NM) — because
+    # diverting to the NEAREST suitable alternate is exactly the realistic
+    # pattern this detector exists to catch, not noise to filter. Unlike
+    # holding_pattern (which still requires its own long streak even for a
+    # same-metro match, so a genuine emergency hold near a metro-sister
+    # airport would still eventually surface), this detector is a single
+    # last-known-position snapshot with no such safety net — silently
+    # suppressing "nearby but not exact" here would have permanently
+    # blinded it to real diversions-to-the-closest-alternate, not just
+    # filtered stale schedule data. Caught by python backtest.py (the
+    # UA2078 signal-lost variant went from passing to MISSED) before this
+    # was ever committed.
+    if nearest["icao"] == route["destination_icao"]:
         return None  # signal loss near the actual destination is routine — low-altitude coverage gaps happen there too, not just at diversion targets
+    if nearest["icao"] == route["origin_icao"]:
+        # Live data (2026-08-07, BACKTEST_LOG.md ronde 17): ~21% of live
+        # signal_lost_near_airport hits (6/29 sampled) were last seen near
+        # their OWN filed origin, not some unrelated airport — a freshly-
+        # departed aircraft still climbing out below signal_lost_max_
+        # altitude_ft, whose ADS-B coverage briefly drops (common near
+        # smaller/regional fields during initial climb) before it ever
+        # gets far enough to look like anything unusual. Unlike detect_
+        # landed_wrong_airport's origin handling (which uses last_takeoff_ts
+        # to allow a genuine early-return diversion through, because a
+        # landing is unambiguous ground truth), that same time-window trick
+        # doesn't help here: "still climbing out on departure" and "already
+        # turned back and inbound" both fall in the identical early-post-
+        # takeoff window, and this detector only has a last-known AIRBORNE
+        # position, not a confirmed touchdown — there's no reliable way to
+        # tell those two apart from this signal alone. A genuine early
+        # return that actually LANDS is still caught by detect_landed_
+        # wrong_airport's own, already-correct early-return logic (round 5);
+        # this exclusion only suppresses the weaker, unconfirmed "vanished
+        # near home" case, same reasoning as the destination exclusion
+        # directly above.
+        return None
 
     return Event(
         hex=track.hex, callsign=track.callsign, event_type="signal_lost_near_airport",
@@ -469,7 +559,21 @@ def detect_holding_pattern(track: AircraftTrack, ac: dict, airport_db, cfg: dict
         track.holding_streak = 0
         return None  # holding somewhere with no major airport nearby — not actionable
 
-    if nearest["icao"] == track.route["destination_icao"]:
+    route = track.route
+    # Same-metro-area check (BACKTEST_LOG.md ronde 21), added alongside the
+    # exact-ICAO match below: live data showed ~33% (7/21 sampled) of
+    # holding_pattern hits were near a DIFFERENT airport serving the SAME
+    # city as the filed destination/origin (e.g. Milan Malpensa vs. Linate,
+    # Dallas DFW vs. Love Field) — adsbdb's schedule data naming one member
+    # of a metro pair while the aircraft is actually headed to/from the
+    # other. See airports.airports_same_metro's docstring for the
+    # calibration behind the 35nm radius.
+    near_dest = (nearest["icao"] == route["destination_icao"]
+                 or airports_same_metro(nearest["lat"], nearest["lon"], route["destination_lat"], route["destination_lon"]))
+    near_origin = (nearest["icao"] == route["origin_icao"]
+                   or airports_same_metro(nearest["lat"], nearest["lon"], route["origin_lat"], route["origin_lon"]))
+
+    if near_dest:
         # Holding near the actual destination is normal for a while (arrival
         # sequencing). Backtested against a real case (AI850 Pune->Delhi:
         # held near Delhi 1hr+ before a fuel-emergency diversion to Gwalior)
@@ -479,10 +583,49 @@ def detect_holding_pattern(track: AircraftTrack, ac: dict, airport_db, cfg: dict
         track.holding_streak += 1
         if track.holding_streak < cfg["holding_pattern_destination_min_streak"]:
             return None
-        route_note = f" (dit IS de geplande bestemming {track.route['destination_icao']}, maar het wachten duurt ongewoon lang)"
+        if nearest["icao"] == route["destination_icao"]:
+            route_note = f" (dit IS de geplande bestemming {route['destination_icao']}, maar het wachten duurt ongewoon lang)"
+        else:
+            route_note = f" (dit is vlakbij de geplande bestemming {route['destination_icao']}, maar het wachten duurt ongewoon lang)"
+        at_destination = True
+    elif near_origin:
+        # Same reasoning as the destination case, added after live data
+        # (BACKTEST_LOG.md ronde 19): ~24% (5/21 sampled) of live
+        # holding_pattern hits were sustained circling near the aircraft's
+        # OWN filed ORIGIN — the immediate, ungated "non-destination" tier
+        # below fired on every one, despite this having at least two
+        # common, non-diversion explanations: adsbdb's known regional/
+        # multi-leg callsign-reuse issue (see detect_landed_wrong_airport's
+        # own origin comment — the same static schedule mapping problem,
+        # here making a return-leg flight's TRUE origin look like a
+        # "diversion back to origin"), or route data that's simply stale/
+        # swapped for this callsign (rounds 16-18's recurring root cause).
+        # Unlike signal_lost_near_airport's equivalent fix (which suppresses
+        # unconditionally, since that detector has no sustained-evidence
+        # mechanism at all), holding_pattern already tracks a streak — so
+        # instead of suppressing origin-holds outright and risking missing
+        # a genuine early-return-then-hold, this reuses the EXACT same
+        # patience already applied to destination holds: fire only once
+        # sustained far longer than any routine explanation would predict.
+        # Kept at_destination=False (the stronger scoring tier) rather than
+        # reusing True — unlike a destination arrival, there's no common,
+        # ordinary reason to sustain a tight hold at one's own departure
+        # airport for this long, so a hold that survives this gate is still
+        # more informative than a validated destination hold, not less.
+        # Extended to same-metro (not just exact origin match) same round
+        # as the destination case above, same live-data justification.
+        track.holding_streak += 1
+        if track.holding_streak < cfg["holding_pattern_destination_min_streak"]:
+            return None
+        if nearest["icao"] == route["origin_icao"]:
+            route_note = f" (dit IS het vertrekpunt {route['origin_icao']}, maar het wachten duurt ongewoon lang — mogelijk een terugkeer)"
+        else:
+            route_note = f" (dit is vlakbij het vertrekpunt {route['origin_icao']}, maar het wachten duurt ongewoon lang — mogelijk een terugkeer)"
+        at_destination = False
     else:
         track.holding_streak = 0
-        route_note = f" (geplande bestemming was {track.route['destination_icao']})"
+        route_note = f" (geplande bestemming was {route['destination_icao']})"
+        at_destination = False
 
     return Event(
         hex=track.hex, callsign=track.callsign, event_type="holding_pattern",
@@ -491,14 +634,23 @@ def detect_holding_pattern(track: AircraftTrack, ac: dict, airport_db, cfg: dict
         weather_icao=nearest["icao"], lat=last.lat, lon=last.lon,
         squawk=ac.get("squawk"), alt=last.alt_baro,
         origin_icao=track.route["origin_icao"], dest_icao=track.route["destination_icao"],
+        at_destination=at_destination,
     )
 
 
-def evaluate(track: AircraftTrack, ac: dict, airport_db, cfg: dict, db_conn=None) -> list[Event]:
+def evaluate(track: AircraftTrack, ac: dict, airport_db, cfg: dict, db_conn=None, skip_behavioral: bool = False) -> list[Event]:
+    """skip_behavioral=True runs only detect_emergency — used for aircraft
+    classified as military/helicopter/GA-private/business-jet (classify.py)
+    when classification_suppress_non_airliner is on. A real emergency
+    squawk from any aircraft class is still real, urgent evidence, so
+    detect_emergency always runs regardless of this flag. See
+    MASTERPLAN.md sectie 4."""
     events = []
     ev = detect_emergency(track, ac)
     if ev:
         events.append(ev)
+    if skip_behavioral:
+        return events
     ev = detect_landed_wrong_airport(track, ac, airport_db, cfg, db_conn)
     if ev:
         events.append(ev)

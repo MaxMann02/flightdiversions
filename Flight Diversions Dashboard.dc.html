@@ -117,6 +117,54 @@
   </section>
   </sc-if>
 
+  <section style="background:#0f151e;border:1px solid #1f2a38;border-radius:11px;padding:14px 17px;display:flex;flex-direction:column;gap:12px;">
+    <div style="display:flex;align-items:baseline;justify-content:space-between;gap:12px;flex-wrap:wrap;">
+      <div style="display:flex;align-items:center;gap:10px;">
+        <div style="font-size:13px;font-weight:600;letter-spacing:1.5px;color:#c6d0da;text-transform:uppercase;">Active incidents</div>
+        <span style="font-family:ui-monospace,Menlo,monospace;font-size:10px;letter-spacing:1px;color:#5d6875;border:1px solid #232e3b;border-radius:5px;padding:2px 7px;">NEW</span>
+      </div>
+      <div style="font-family:ui-monospace,Menlo,monospace;font-size:11px;color:#6b7686;">{{ incidentStats.active }} open · precision (24h) {{ incidentStats.precision }}</div>
+    </div>
+    <sc-if value="{{ hasIncidents }}">
+      <div style="display:flex;flex-direction:column;gap:8px;">
+        <sc-for list="{{ incidentRows }}" as="i" hint-placeholder-count="3">
+          <div style="background:#0c1119;border:1px solid #1f2a38;border-radius:9px;padding:12px 14px;">
+            <div onClick="{{ i.toggle }}" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;cursor:pointer;">
+              <span style="{{ i.badgeStyle }}">{{ i.stateLabel }}</span>
+              <span style="font-family:ui-monospace,'SF Mono',Menlo,monospace;font-size:15px;font-weight:600;color:#eef2f7;letter-spacing:0.5px;">{{ i.callsign }}</span>
+              <span style="font-family:ui-monospace,Menlo,monospace;font-size:11px;color:#9aa6b4;">score {{ i.score }}</span>
+              <span style="font-family:ui-monospace,Menlo,monospace;font-size:11px;color:#6b7686;">{{ i.routeLabel }}</span>
+              <span style="margin-left:auto;font-family:ui-monospace,Menlo,monospace;font-size:11px;color:#6b7686;">open {{ i.ageLabel }} · {{ i.evidenceCount }} evidence ▾</span>
+            </div>
+            <sc-if value="{{ i.expanded }}">
+              <div style="margin-top:10px;padding-top:10px;border-top:1px solid #1c2431;display:flex;flex-direction:column;gap:10px;">
+                <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;font-family:ui-monospace,Menlo,monospace;font-size:11px;color:#7d8896;">
+                  <span>{{ i.hex }}</span>
+                  <span>{{ i.altLabel }}</span>
+                  <span>Squawk {{ i.squawk }}</span>
+                  <span>{{ i.aircraftClass }}</span>
+                  <a href="{{ i.mapLink }}" target="_blank" rel="noopener" style="margin-left:auto;">View live on ADS-B Exchange ↗</a>
+                </div>
+                <div style="display:flex;flex-direction:column;gap:6px;">
+                  <sc-for list="{{ i.evidence }}" as="ev" hint-placeholder-count="3">
+                    <div style="display:flex;align-items:baseline;gap:10px;font-size:12.5px;">
+                      <span style="font-family:ui-monospace,Menlo,monospace;font-size:10.5px;color:#5d6875;min-width:64px;">{{ ev.timeLabel }}</span>
+                      <span style="color:{{ ev.deltaColor }};font-family:ui-monospace,Menlo,monospace;font-size:11px;min-width:34px;">{{ ev.deltaLabel }}</span>
+                      <span style="color:#b7c2cf;">{{ ev.description }}</span>
+                    </div>
+                  </sc-for>
+                </div>
+              </div>
+            </sc-if>
+          </div>
+        </sc-for>
+      </div>
+    </sc-if>
+    <sc-if value="{{ !hasIncidents }}">
+      <div style="font-family:ui-monospace,Menlo,monospace;font-size:12px;color:#5d6875;padding:6px 0;">No active incidents right now.</div>
+    </sc-if>
+  </section>
+
   <section style="background:#0f151e;border:1px solid #1f2a38;border-radius:11px;padding:12px 14px;display:flex;align-items:center;gap:16px 22px;flex-wrap:wrap;">
     <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
       <span style="font-family:ui-monospace,Menlo,monospace;font-size:10px;letter-spacing:1.5px;color:#6b7686;text-transform:uppercase;">Confidence</span>
@@ -230,17 +278,25 @@
 <script type="text/x-dc" data-dc-script data-props="{&quot;showMap&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Layout&quot;},&quot;showLearnedRoutes&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Layout&quot;},&quot;live&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Behavior&quot;}}">
 class Component extends DCLogic {
   state = { now: Date.now(), confFilter: { CONFIRMED: true, LIKELY: true, POSSIBLE: true }, typeFilter: null, selectedId: null,
-    events: [], learnedRoutes: [], serverStats: { confirmed: 0, events24: 0, tracked: null, lastSweepSecondsAgo: null } };
+    events: [], learnedRoutes: [], serverStats: { confirmed: 0, events24: 0, tracked: null, lastSweepSecondsAgo: null },
+    incidents: [], incidentStats: {}, expandedIncidentId: null };
 
   componentDidMount() {
     this.setState({ now: Date.now() });
     if (this.props.live ?? true) this._clockT = setInterval(() => this.setState({ now: Date.now() }), 1000);
     this.fetchEvents();
     this._fetchT = setInterval(() => this.fetchEvents(), 5000);
+    // Separate fetch/timer from the legacy /api/events feed above — see
+    // MASTERPLAN.md sectie 3/10: /api/incidents is the new, persistent
+    // incident-lifecycle view (fase 3), kept alongside the raw event feed
+    // rather than replacing it.
+    this.fetchIncidents();
+    this._incidentFetchT = setInterval(() => this.fetchIncidents(), 5000);
   }
   componentWillUnmount() {
     if (this._clockT) clearInterval(this._clockT);
     if (this._fetchT) clearInterval(this._fetchT);
+    if (this._incidentFetchT) clearInterval(this._incidentFetchT);
   }
 
   async fetchEvents() {
@@ -253,6 +309,31 @@ class Component extends DCLogic {
       // Transient fetch error — keep showing the last known state.
     }
   }
+
+  async fetchIncidents() {
+    try {
+      const res = await fetch('/api/incidents');
+      if (!res.ok) return;
+      const data = await res.json();
+      this.setState({ incidents: data.active || [], incidentStats: data.stats || {} });
+    } catch (e) {
+      // Transient fetch error — keep showing the last known state.
+    }
+  }
+
+  incidentStateMeta() {
+    // Dutch incident-engine state strings (incidents.py) mapped onto the
+    // same English confMeta() palette already used for the event feed, so
+    // the two panels read as one visual system rather than two.
+    const cm = this.confMeta();
+    return {
+      BEVESTIGD: { ...cm.CONFIRMED, label: 'Confirmed' },
+      WAARSCHIJNLIJK: { ...cm.LIKELY, label: 'Likely' },
+      MOGELIJK: { ...cm.POSSIBLE, label: 'Possible' },
+    };
+  }
+
+  toggleIncidentExpanded(id) { this.setState(s => ({ expandedIncidentId: s.expandedIncidentId === id ? null : id })); }
 
   typeMeta() {
     return {
@@ -360,6 +441,39 @@ class Component extends DCLogic {
       };
     }
 
+    // MASTERPLAN.md sectie 3/10: incidents are persistent, re-scored cases
+    // (not one-shot events) — sorted by state severity (BEVESTIGD first)
+    // then by score, with an expandable evidence timeline per card.
+    const ism = this.incidentStateMeta();
+    const stateRank = { BEVESTIGD: 0, WAARSCHIJNLIJK: 1, MOGELIJK: 2 };
+    const incidentRows = [...(s.incidents || [])]
+      .sort((a, b) => (stateRank[a.state] ?? 9) - (stateRank[b.state] ?? 9) || b.score - a.score)
+      .map(inc => {
+        const meta = ism[inc.state] || ism.MOGELIJK;
+        const expanded = s.expandedIncidentId === inc.id;
+        const ageSec = Math.max(0, (s.now - inc.openedTsMs) / 1000);
+        const evidence = (inc.evidence || []).slice().reverse().map(ev => ({
+          key: ev.tsMs + '_' + ev.source,
+          timeLabel: this.timeAgo(Math.max(0, (s.now - ev.tsMs) / 1000)),
+          description: ev.description,
+          deltaLabel: (ev.delta >= 0 ? '+' : '') + Math.round(ev.delta),
+          deltaColor: ev.delta >= 0 ? '#ff6b6b' : '#35c46a',
+        }));
+        return {
+          id: inc.id, callsign: inc.callsign || inc.hex, hex: inc.hex,
+          stateLabel: meta.label.toUpperCase(), badgeStyle: badge(inc.state === 'BEVESTIGD' ? 'CONFIRMED' : inc.state === 'WAARSCHIJNLIJK' ? 'LIKELY' : 'POSSIBLE'),
+          score: Math.round(inc.score), routeLabel: routeLabel({ origin: inc.origin, dest: inc.dest }),
+          ageLabel: this.timeAgo(ageSec), squawk: inc.squawk || '—', altLabel: altOrDash(inc.alt),
+          aircraftClass: inc.aircraftClass || '—',
+          mapLink: 'https://globe.adsbexchange.com/?icao=' + inc.hex,
+          rowStyle: rowBase + 'border-color:' + meta.border + ';' + (expanded ? 'background:#131c27;' : ''),
+          toggle: () => this.toggleIncidentExpanded(inc.id),
+          expanded, evidence, evidenceCount: evidence.length,
+        };
+      });
+    const ist = s.incidentStats || {};
+    const precisionLabel = (ist.precisionRate != null) ? Math.round(ist.precisionRate * 100) + '%' : '—';
+
     const gridV = []; for (let lon = -150; lon <= 150; lon += 30) gridV.push({ x: +((lon + 180) / 360 * 2000).toFixed(1) });
     const gridH = []; for (let lat = -60; lat <= 60; lat += 30) gridH.push({ y: +((90 - lat) / 180 * 1000).toFixed(1) });
 
@@ -375,10 +489,21 @@ class Component extends DCLogic {
       liveLabel: liveOn ? 'LIVE' : 'PAUSED', liveColor: liveOn ? '#35c46a' : '#6b7686',
       liveDotStyle: 'width:9px;height:9px;border-radius:50%;background:' + (liveOn ? '#35c46a' : '#6b7686') + ';box-shadow:0 0 8px ' + (liveOn ? '#35c46a' : 'transparent') + ';' + (liveOn ? 'animation:pulseDot 1.6s ease-in-out infinite;' : ''),
       clock,
-      stats: { confirmed: confCount.CONFIRMED, events24: all.length, tracked: trackedLabel, lastSweep: lastSweepLabel, active: filtered.length, shown: filtered.length },
+      // confirmed/events24 come from serverStats (the server's true SQL
+      // COUNT(*) over the full 24h window, see server.py's handle_api_events
+      // comment), NOT confCount.CONFIRMED/all.length — those are derived
+      // from the capped (limit=200) `events` array and would silently
+      // undercount on a busy day (BACKTEST_LOG.md ronde 6 fixed this exact
+      // undercounting bug server-side; this front-end never actually
+      // consumed the fix — found and fixed ronde 22). confCount itself is
+      // still used below for the filter-chip counts, where "count within
+      // the currently loaded feed" is the correct, intentional meaning.
+      stats: { confirmed: ss.confirmed, events24: ss.events24, tracked: trackedLabel, lastSweep: lastSweepLabel, active: filtered.length, shown: filtered.length },
       feedRows, markers, gridV, gridH, confChips, typeChips, confirmedList,
       learnedRoutes: s.learnedRoutes || [],
       hasSelected: !!sel, sel, closePanel: () => this.close(),
+      incidentRows, hasIncidents: incidentRows.length > 0,
+      incidentStats: { active: incidentRows.length, precision: precisionLabel },
     };
   }
 }

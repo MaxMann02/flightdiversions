@@ -24,6 +24,7 @@ from aiohttp import web
 import db as db_module
 from airports import AirportDB
 from config import CONFIG
+from incidents import IncidentManager
 from main import tier0_loop, tier1_loop
 from server import build_app
 from state import TrackStore
@@ -47,7 +48,9 @@ async def _start_scan_loops(app: web.Application):
     # safe; see db.py's own comment on why.
     db_conn = db_module.connect()
     store = TrackStore(db_conn=db_conn)
-    log.info("%d alert-cooldowns geladen uit vorige sessie.", len(store.cooldowns))
+
+    incident_mgr = IncidentManager(db_conn, cfg, airport_db)
+    log.info("%d open incidenten geladen uit vorige sessie.", len(incident_mgr.open_hexes()))
 
     ssl_ctx = ssl.create_default_context(cafile=certifi.where())
     connector = aiohttp.TCPConnector(ssl=ssl_ctx)
@@ -56,8 +59,8 @@ async def _start_scan_loops(app: web.Application):
     app["scan_session"] = session
     app["scan_db"] = db_conn
     app["scan_tasks"] = [
-        asyncio.create_task(tier0_loop(session, store, cfg, db_conn)),
-        asyncio.create_task(tier1_loop(session, store, airport_db, cfg, db_conn)),
+        asyncio.create_task(tier0_loop(session, store, incident_mgr, cfg, db_conn)),
+        asyncio.create_task(tier1_loop(session, store, airport_db, incident_mgr, cfg, db_conn)),
     ]
 
 
