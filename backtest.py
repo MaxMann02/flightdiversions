@@ -397,6 +397,48 @@ def check_corridor_deviation_bow_suppression() -> bool:
     return suppressed_ok and still_fires_ok
 
 
+def check_signal_lost_origin_suppression(airport_db: AirportDB) -> bool:
+    """Live production data (2026-08-07, see BACKTEST_LOG.md ronde 17):
+    signal_lost_near_airport fired for ~21% of its live hits (6/29 sampled)
+    on aircraft last seen near their OWN filed ORIGIN, not some unrelated
+    airport — a freshly-departed aircraft still climbing out below
+    signal_lost_max_altitude_ft, whose ADS-B coverage briefly drops (common
+    near smaller/regional fields during initial climb). The detector
+    already excluded 'signal lost near the actual destination' as routine
+    but had no equivalent exclusion for origin. Not a Case: a
+    should-mostly-NOT-fire assertion (lost near origin) contrasted with a
+    should-still-fire one (lost near a genuinely unrelated third airport),
+    same pattern as check_corridor_deviation_bow_suppression."""
+    from detector import detect_signal_lost_near_airport
+    from state import AircraftTrack, TrackPoint
+
+    print("\n=== signal_lost_near_airport origin-suppression check ===")
+    cfg = CONFIG
+    origin = airport_db.get("KIAH")
+    dest = airport_db.get("KPHX")
+    third = airport_db.get("KDFW")  # real airport, nowhere near IAH or PHX's own coordinates
+
+    def make_track(pos: dict, alt_ft: float) -> AircraftTrack:
+        track = AircraftTrack(hex="signal_lost_regression")
+        track.route = {
+            "origin_icao": "KIAH", "origin_lat": origin["lat"], "origin_lon": origin["lon"],
+            "destination_icao": "KPHX", "destination_lat": dest["lat"], "destination_lon": dest["lon"],
+        }
+        track.history.append(TrackPoint(ts=0.0, lat=pos["lat"], lon=pos["lon"], alt_baro=alt_ft, track=90.0, on_ground=False))
+        return track
+
+    near_origin = make_track(origin, 4000.0)
+    suppressed_ok = detect_signal_lost_near_airport(near_origin, airport_db, cfg) is None
+    print(f"  last seen near own filed origin (freshly departed): {'OK (suppressed)' if suppressed_ok else 'FAIL (still fired)'}")
+
+    near_third = make_track(third, 4000.0)
+    fired = detect_signal_lost_near_airport(near_third, airport_db, cfg)
+    still_fires_ok = fired is not None and fired.event_type == "signal_lost_near_airport"
+    print(f"  last seen near an unrelated third airport: {'OK (still fires)' if still_fires_ok else 'FAIL (suppression too broad!)'}")
+
+    return suppressed_ok and still_fires_ok
+
+
 def check_classification_regressions() -> bool:
     """classify.py's decision order (MASTERPLAN.md sectie 4), sanity-checked
     against real live dbFlags/category values seen 2026-08-06 via
@@ -909,6 +951,7 @@ def main():
     holding_suppression_ok = check_course_deviation_holding_suppression()
     emergency_status_ok = check_emergency_status_regressions()
     bow_suppression_ok = check_corridor_deviation_bow_suppression()
+    signal_lost_origin_ok = check_signal_lost_origin_suppression(airport_db)
     classification_ok = check_classification_regressions()
     route_widening_ok = check_route_widening_regressions()
     incident_engine_ok = check_incident_engine_regressions(airport_db)
@@ -927,6 +970,7 @@ def main():
     print(f"course_deviation holding-pattern suppression: {'OK' if holding_suppression_ok else 'FAIL — see above'}")
     print(f"emergency-status normalization: {'OK' if emergency_status_ok else 'FAIL — see above'}")
     print(f"corridor_deviation bow-tolerance suppression: {'OK' if bow_suppression_ok else 'FAIL — see above'}")
+    print(f"signal_lost_near_airport origin-suppression: {'OK' if signal_lost_origin_ok else 'FAIL — see above'}")
     print(f"aircraft classification: {'OK' if classification_ok else 'FAIL — see above'}")
     print(f"route widening (hexdb.io + negative-retry): {'OK' if route_widening_ok else 'FAIL — see above'}")
     print(f"incident engine: {'OK' if incident_engine_ok else 'FAIL — see above'}")

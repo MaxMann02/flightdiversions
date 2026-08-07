@@ -440,6 +440,28 @@ def detect_signal_lost_near_airport(track: AircraftTrack, airport_db, cfg: dict)
         return None
     if nearest["icao"] == track.route["destination_icao"]:
         return None  # signal loss near the actual destination is routine — low-altitude coverage gaps happen there too, not just at diversion targets
+    if nearest["icao"] == track.route["origin_icao"]:
+        # Live data (2026-08-07, BACKTEST_LOG.md ronde 17): ~21% of live
+        # signal_lost_near_airport hits (6/29 sampled) were last seen near
+        # their OWN filed origin, not some unrelated airport — a freshly-
+        # departed aircraft still climbing out below signal_lost_max_
+        # altitude_ft, whose ADS-B coverage briefly drops (common near
+        # smaller/regional fields during initial climb) before it ever
+        # gets far enough to look like anything unusual. Unlike detect_
+        # landed_wrong_airport's origin handling (which uses last_takeoff_ts
+        # to allow a genuine early-return diversion through, because a
+        # landing is unambiguous ground truth), that same time-window trick
+        # doesn't help here: "still climbing out on departure" and "already
+        # turned back and inbound" both fall in the identical early-post-
+        # takeoff window, and this detector only has a last-known AIRBORNE
+        # position, not a confirmed touchdown — there's no reliable way to
+        # tell those two apart from this signal alone. A genuine early
+        # return that actually LANDS is still caught by detect_landed_
+        # wrong_airport's own, already-correct early-return logic (round 5);
+        # this exclusion only suppresses the weaker, unconfirmed "vanished
+        # near home" case, same reasoning as the destination exclusion
+        # directly above.
+        return None
 
     return Event(
         hex=track.hex, callsign=track.callsign, event_type="signal_lost_near_airport",

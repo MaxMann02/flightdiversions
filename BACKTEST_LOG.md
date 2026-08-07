@@ -1353,3 +1353,72 @@ describe current behavior (events are now saved unconditionally, dedup
 lives in `incidents.py`'s `notified_state` gate) with the historical
 mechanism referenced in clearly past-tense terms. No functional change,
 `python backtest.py` re-run clean after.
+
+## Round 17 — 2026-08-07 (`/loop` iteration) — signal_lost_near_airport origin blind spot
+
+Followed up on round 16's flagged next-round item: applied the same
+rigor to `signal_lost_near_airport` (30/200 live events, second-largest
+category after `corridor_deviation`) before touching anything.
+
+Pulled a fresh live snapshot (`35.227.51.25:8787/api/events`) and listed
+every `signal_lost_near_airport` event's origin/dest/nearest-airport
+triple (29 events this pull). **Found a clean, distinct pattern: 6/29
+(~21%) had `nearest == origin_icao`** — e.g. UPS5899 (KSDF->KLAS, nearest
+KSDF), RZO507 (LPPD->LEBL, nearest LPPD), AAL710 (KALB->KCLT, nearest
+KALB). The detector already excluded "signal lost near the actual
+DESTINATION" as routine (its own comment: "low-altitude coverage gaps
+happen there too, not just at diversion targets") but had no equivalent
+exclusion for ORIGIN — a freshly-departed aircraft still climbing out
+below `signal_lost_max_altitude_ft` (10000ft), whose ADS-B coverage
+briefly drops near its own (often smaller/regional) departure field, looks
+identical to "lost signal somewhere suspicious" to the unmodified check.
+
+**Considered mirroring `detect_landed_wrong_airport`'s existing origin
+handling (round 5's `last_takeoff_ts`/`early_return_max_minutes` check)
+before implementing anything — and concluded it doesn't transfer.**
+`detect_landed_wrong_airport` uses that time window to let a GENUINE
+early-return diversion through despite the origin match, because a
+landing is unambiguous ground truth (the aircraft definitely touched back
+down). `detect_signal_lost_near_airport` only ever has a last-known
+AIRBORNE position — "still climbing out on departure" and "already turned
+back and inbound" both fall in the exact same early-post-takeoff time
+window, so `last_takeoff_ts` can't distinguish them here the way it can
+for an actual touchdown. A genuine early return that DOES land is still
+caught correctly by `detect_landed_wrong_airport`'s own logic regardless
+— this detector only ever sees the weaker, unconfirmed "vanished near
+home" case, which isn't reliable evidence either way. **Fix: unconditional
+origin exclusion** (`detector.py`, same one-line shape as the existing
+destination exclusion, with a comment explaining why the landed_wrong_
+airport pattern doesn't apply here).
+
+Verified safe against the one real case that exercises this detector
+(UA2078's signal-lost variant, `backtest_cases.py`) before and after: its
+last position is near Luke AFB, never origin (KIAH), so the new exclusion
+has zero effect on it — confirmed unchanged at lead -12m00s.
+
+New `check_signal_lost_origin_suppression()` in `backtest.py`: a
+should-mostly-NOT-fire assertion (last seen at the aircraft's own filed
+origin, KIAH/KPHX route) contrasted with a should-still-fire one (last
+seen near a real, unrelated third airport, KDFW) — same
+suppression-check pattern as `check_corridor_deviation_bow_suppression`/
+`check_course_deviation_holding_suppression`.
+
+`python backtest.py`: 9/9 cases (all unchanged) + all 10 regression-check
+groups (9 prior + this new one) green. Bounded live smoke test
+(`serve_all.py`, `TELEGRAM_BOT_TOKEN=""`/`TELEGRAM_CHAT_ID=""`, ~90s, 2
+tier1 cycles, ~13500 aircraft tracked): no exceptions.
+
+**Still open, deliberately not chased this round either:** the
+REMAINING ~79% of live `signal_lost_near_airport` hits (23/29) show
+`nearest` airports that are neither origin nor destination, and several
+look like the SAME adsbdb-route-mismatch root cause round 16 found for
+`premature_descent` — e.g. JBU163 (KATL->KBOS, "nearest" reported as
+KSRQ/Sarasota FL, nowhere near a plausible Atlanta-Boston great circle) or
+SKW5593 (KBGR->KORD, nearest KMEM/Memphis, similarly implausible for a
+Bangor-Chicago routing). Unlike the origin-blind-spot fix above, this
+needs the harder investigation round 16 explicitly deferred (quantify
+whether `nearest` airports are actually geometrically implausible for the
+filed route, not just "not origin/dest," then decide whether the fix
+belongs in `route_plausible`'s resolution-time check, a secondary source
+cross-check, or the detector itself) — left for a dedicated future round
+rather than a second rushed pattern-match fix in the same session.
