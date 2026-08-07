@@ -309,14 +309,25 @@ def get_recent_resolved_incidents(conn: sqlite3.Connection, since_ts: float, lim
 
 
 def count_incidents_by_resolution(conn: sqlite3.Connection, since_ts: float) -> dict:
-    """{resolution_reason: count} for incidents resolved since since_ts —
-    backs the dashboard's precision-rate stat (MASTERPLAN.md sectie 10)."""
+    """{state: count} for incidents resolved since since_ts — backs the
+    dashboard's precision-rate stat (MASTERPLAN.md sectie 10). Grouped by
+    `state` (the terminal GESLOTEN_* constant, e.g. incidents.CLOSED_LANDED/
+    CLOSED_FALSE_ALARM), NOT `resolution_reason` — that column holds a
+    free-form human-readable description (incidents.py's `_resolve(...,
+    description=...)`, e.g. "geland op EDDM, niet de verwachte bestemming
+    — bevestigde diversie") that's never equal to a state constant. Fixed
+    2026-08-07 (self-review pass): the original GROUP BY resolution_reason
+    meant server.py's `resolution_counts.get(incidents.CLOSED_LANDED, 0)`
+    lookup could never match anything, so resolvedConfirmedDiversion24h/
+    resolvedFalseAlarm24h/precisionRate were always 0/0/None regardless of
+    how many incidents had actually resolved — untested by backtest.py,
+    which has no coverage of this function or the API's stats block."""
     cur = conn.execute(
-        "SELECT resolution_reason, COUNT(*) FROM incidents "
-        "WHERE resolved_ts IS NOT NULL AND resolved_ts >= ? GROUP BY resolution_reason",
+        "SELECT state, COUNT(*) FROM incidents "
+        "WHERE resolved_ts IS NOT NULL AND resolved_ts >= ? GROUP BY state",
         (since_ts,),
     )
-    return {reason: count for reason, count in cur.fetchall()}
+    return {state: count for state, count in cur.fetchall()}
 
 
 def get_sweep_status(conn: sqlite3.Connection) -> dict:

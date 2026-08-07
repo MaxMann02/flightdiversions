@@ -489,7 +489,16 @@ class Component extends DCLogic {
       liveLabel: liveOn ? 'LIVE' : 'PAUSED', liveColor: liveOn ? '#35c46a' : '#6b7686',
       liveDotStyle: 'width:9px;height:9px;border-radius:50%;background:' + (liveOn ? '#35c46a' : '#6b7686') + ';box-shadow:0 0 8px ' + (liveOn ? '#35c46a' : 'transparent') + ';' + (liveOn ? 'animation:pulseDot 1.6s ease-in-out infinite;' : ''),
       clock,
-      stats: { confirmed: confCount.CONFIRMED, events24: all.length, tracked: trackedLabel, lastSweep: lastSweepLabel, active: filtered.length, shown: filtered.length },
+      // confirmed/events24 come from serverStats (the server's true SQL
+      // COUNT(*) over the full 24h window, see server.py's handle_api_events
+      // comment), NOT confCount.CONFIRMED/all.length — those are derived
+      // from the capped (limit=200) `events` array and would silently
+      // undercount on a busy day (BACKTEST_LOG.md ronde 6 fixed this exact
+      // undercounting bug server-side; this front-end never actually
+      // consumed the fix — found and fixed ronde 22). confCount itself is
+      // still used below for the filter-chip counts, where "count within
+      // the currently loaded feed" is the correct, intentional meaning.
+      stats: { confirmed: ss.confirmed, events24: ss.events24, tracked: trackedLabel, lastSweep: lastSweepLabel, active: filtered.length, shown: filtered.length },
       feedRows, markers, gridV, gridH, confChips, typeChips, confirmedList,
       learnedRoutes: s.learnedRoutes || [],
       hasSelected: !!sel, sel, closePanel: () => this.close(),

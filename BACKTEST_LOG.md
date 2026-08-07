@@ -1803,3 +1803,74 @@ the new `check_holding_pattern_same_metro`) green. Bounded live smoke test
 (`serve_all.py`, `TELEGRAM_BOT_TOKEN=""`/`TELEGRAM_CHAT_ID=""`, ~80s, 2
 tier1 cycles, ~12300-12400 aircraft tracked, 2 open incidents correctly
 reloaded from the prior session's local db): no exceptions.
+
+## Round 22 — 2026-08-07 (parallel agent, same session as ronde 21) — precisionRate bug, dashboard stat undercounting
+
+Round 21's parallel background agent (launched mid-round, scoped to
+`notifier.py`/`server.py`/`providers.py`/the dashboard frontend —
+deliberately NOT the files ronde 21 was actively editing) reported back
+with two real bugs fixed and one confirmed-clean result. Reviewed its
+diffs directly before committing (same discipline as reviewing any other
+change this session) — both held up.
+
+**Bug 1: `precisionRate` was silently always `None`, regardless of real
+resolution history.** `db.py`'s `count_incidents_by_resolution` grouped
+resolved incidents by `resolution_reason` — a free-form human-readable
+description (`incidents.py`'s `_resolve(..., description=...)`, e.g.
+"geland op EDDM, niet de verwachte bestemming — bevestigde diversie") —
+but `server.py`'s `handle_api_incidents` looks up counts by the *state*
+constants (`incidents.CLOSED_LANDED`/`CLOSED_FALSE_ALARM`, i.e.
+`"GESLOTEN_GELAND"`/`"GESLOTEN_VALS_ALARM"`), which never equal a
+resolution_reason string. The lookup could never match anything, so
+`resolvedConfirmedDiversion24h`/`resolvedFalseAlarm24h`/`precisionRate`
+were always 0/0/`None` no matter how many incidents had actually
+resolved — MASTERPLAN.md sectie 10's own "self-observing metriek die laat
+zien of het systeem beter wordt" was silently inert since the day the
+incident engine shipped (round 10), never caught because `backtest.py`
+has no coverage of this function or the API's stats block. Fixed by
+grouping by `state` instead. Verified with a standalone in-memory-sqlite
+repro (4 synthetic resolved incidents, mixed states): old logic returned
+`0/0/None`, new logic correctly returns `confirmed=1, false_alarms=2,
+precisionRate=0.333`.
+
+**Bug 2: the dashboard's header "Confirmed active"/"Events · 24h" tiles
+re-introduced a bug already fixed once on the backend.** Round 6 fixed
+`server.py`'s own stats (deriving them from a real `SELECT COUNT(*)`,
+`data.stats.confirmed`/`data.stats.events24`, instead of the 200-row-
+capped `events` array) specifically because undercounting on a busy day
+is silent and hits exactly when accurate stats matter most. But the
+dashboard's `renderVals()` (`Flight Diversions Dashboard.dc.html`) never
+actually consumed that fix — it fetched `data.stats` into `serverStats`
+but only ever read `.tracked`/`.lastSweepSecondsAgo` from it, computing
+the confirmed/24h tiles from the local, capped `events` array the whole
+time. Round 16 observed live `events24=14714`/day — the tile would show
+≤200 instead. Fixed by sourcing `confirmed`/`events24` from `serverStats`;
+left the separate `confCount` object untouched since it's legitimately
+still used for the filter-chip counts (a different, correct "count within
+the currently loaded feed" meaning there).
+
+**Confirmed clean:** `providers.py` (no dead code — every exported
+function has a live call site; a suspicious-looking 5min hexdb.io
+route-cache TTL for successful lookups turned out harmless once traced —
+`main.py`'s `route_checked` gating means a resolved route is never
+re-looked-up repeatedly anyway) and `notifier.py` (already clean since
+round 11's rewrite). Also checked the dashboard incident-panel JS for the
+specific edge cases this round's task called out (zero-evidence
+incidents, an unrecognized state string) — both handled safely, though
+the state case can't actually occur since the server only ever sends
+`VISIBLE_STATES`.
+
+Also fixed one stale docstring (`server.py`'s `handle_api_incidents`,
+which still claimed the dashboard "didn't consume this yet" — the
+incident panel actually landed in round 11).
+
+`python -m py_compile db.py server.py`, then `python backtest.py`: 9/9
+cases + all 13 regression-check groups green (expected — none of these
+changes touch detection logic). Bounded live smoke test (`serve_all.py`,
+`TELEGRAM_BOT_TOKEN=""`/`TELEGRAM_CHAT_ID=""`, ~15s, 4 open incidents
+correctly reloaded from the local db): no exceptions. The agent's own
+report additionally verified `/api/events`/`/api/incidents` directly via
+curl during its own smoke test window (`stats.confirmed=44`,
+`events24=46`, `precisionRate` correctly `None` since the only
+recently-resolved incident in that window closed `GESLOTEN_TIMEOUT`,
+intentionally excluded from the ratio).

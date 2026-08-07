@@ -112,11 +112,13 @@ def _incident_to_json(row: dict, evidence: list[dict]) -> dict:
 
 
 async def handle_api_incidents(request: web.Request) -> web.Response:
-    """MASTERPLAN.md sectie 9/10 — the incident-lifecycle API. Not yet
-    consumed by Flight Diversions Dashboard.dc.html (that redesign is the
-    one piece of fase 3 left for a session with live browser verification,
-    see MASTERPLAN.md sectie 11) but fully functional and independently
-    testable: `curl /api/incidents` while serve_all.py runs."""
+    """MASTERPLAN.md sectie 9/10 — the incident-lifecycle API. Consumed by
+    Flight Diversions Dashboard.dc.html's "Active incidents" section (added
+    ronde 11) via a 5s poll; also independently testable on its own:
+    `curl /api/incidents` while serve_all.py runs. (Stale comment claiming
+    the dashboard didn't consume this yet found and fixed during ronde 22's
+    self-review — the dashboard integration landed in ronde 11, this
+    docstring was never updated after.)"""
     conn = request.app["db"]
     now = time.time()
     since = now - INCIDENT_FEED_WINDOW_SECONDS
