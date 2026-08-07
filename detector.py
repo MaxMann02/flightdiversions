@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 
 import db as db_module
-from airports import angle_diff_deg, bearing_deg, cross_track_distance_nm, haversine_nm
+from airports import airports_same_metro, angle_diff_deg, bearing_deg, cross_track_distance_nm, haversine_nm
 from providers import EMERGENCY_SQUAWKS
 from state import AircraftTrack
 
@@ -456,9 +456,26 @@ def detect_signal_lost_near_airport(track: AircraftTrack, airport_db, cfg: dict)
     nearest, _dist = airport_db.nearest(last.lat, last.lon, max_km=cfg["signal_lost_search_km"])
     if not nearest:
         return None
-    if nearest["icao"] == track.route["destination_icao"]:
+    route = track.route
+    # Deliberately NOT extended with airports_same_metro the way holding_
+    # pattern's equivalent exclusions were in the same round (BACKTEST_LOG.md
+    # ronde 21) — tried it first, and it broke this detector's own real,
+    # sourced case: UA2078 diverted from its filed KPHX to Luke AFB, only
+    # ~15nm away (well inside AIRPORT_SAME_METRO_RADIUS_NM) — because
+    # diverting to the NEAREST suitable alternate is exactly the realistic
+    # pattern this detector exists to catch, not noise to filter. Unlike
+    # holding_pattern (which still requires its own long streak even for a
+    # same-metro match, so a genuine emergency hold near a metro-sister
+    # airport would still eventually surface), this detector is a single
+    # last-known-position snapshot with no such safety net — silently
+    # suppressing "nearby but not exact" here would have permanently
+    # blinded it to real diversions-to-the-closest-alternate, not just
+    # filtered stale schedule data. Caught by python backtest.py (the
+    # UA2078 signal-lost variant went from passing to MISSED) before this
+    # was ever committed.
+    if nearest["icao"] == route["destination_icao"]:
         return None  # signal loss near the actual destination is routine — low-altitude coverage gaps happen there too, not just at diversion targets
-    if nearest["icao"] == track.route["origin_icao"]:
+    if nearest["icao"] == route["origin_icao"]:
         # Live data (2026-08-07, BACKTEST_LOG.md ronde 17): ~21% of live
         # signal_lost_near_airport hits (6/29 sampled) were last seen near
         # their OWN filed origin, not some unrelated airport — a freshly-
@@ -528,7 +545,21 @@ def detect_holding_pattern(track: AircraftTrack, ac: dict, airport_db, cfg: dict
         track.holding_streak = 0
         return None  # holding somewhere with no major airport nearby — not actionable
 
-    if nearest["icao"] == track.route["destination_icao"]:
+    route = track.route
+    # Same-metro-area check (BACKTEST_LOG.md ronde 21), added alongside the
+    # exact-ICAO match below: live data showed ~33% (7/21 sampled) of
+    # holding_pattern hits were near a DIFFERENT airport serving the SAME
+    # city as the filed destination/origin (e.g. Milan Malpensa vs. Linate,
+    # Dallas DFW vs. Love Field) — adsbdb's schedule data naming one member
+    # of a metro pair while the aircraft is actually headed to/from the
+    # other. See airports.airports_same_metro's docstring for the
+    # calibration behind the 35nm radius.
+    near_dest = (nearest["icao"] == route["destination_icao"]
+                 or airports_same_metro(nearest["lat"], nearest["lon"], route["destination_lat"], route["destination_lon"]))
+    near_origin = (nearest["icao"] == route["origin_icao"]
+                   or airports_same_metro(nearest["lat"], nearest["lon"], route["origin_lat"], route["origin_lon"]))
+
+    if near_dest:
         # Holding near the actual destination is normal for a while (arrival
         # sequencing). Backtested against a real case (AI850 Pune->Delhi:
         # held near Delhi 1hr+ before a fuel-emergency diversion to Gwalior)
@@ -538,9 +569,12 @@ def detect_holding_pattern(track: AircraftTrack, ac: dict, airport_db, cfg: dict
         track.holding_streak += 1
         if track.holding_streak < cfg["holding_pattern_destination_min_streak"]:
             return None
-        route_note = f" (dit IS de geplande bestemming {track.route['destination_icao']}, maar het wachten duurt ongewoon lang)"
+        if nearest["icao"] == route["destination_icao"]:
+            route_note = f" (dit IS de geplande bestemming {route['destination_icao']}, maar het wachten duurt ongewoon lang)"
+        else:
+            route_note = f" (dit is vlakbij de geplande bestemming {route['destination_icao']}, maar het wachten duurt ongewoon lang)"
         at_destination = True
-    elif nearest["icao"] == track.route["origin_icao"]:
+    elif near_origin:
         # Same reasoning as the destination case, added after live data
         # (BACKTEST_LOG.md ronde 19): ~24% (5/21 sampled) of live
         # holding_pattern hits were sustained circling near the aircraft's
@@ -564,14 +598,19 @@ def detect_holding_pattern(track: AircraftTrack, ac: dict, airport_db, cfg: dict
         # ordinary reason to sustain a tight hold at one's own departure
         # airport for this long, so a hold that survives this gate is still
         # more informative than a validated destination hold, not less.
+        # Extended to same-metro (not just exact origin match) same round
+        # as the destination case above, same live-data justification.
         track.holding_streak += 1
         if track.holding_streak < cfg["holding_pattern_destination_min_streak"]:
             return None
-        route_note = f" (dit IS het vertrekpunt {track.route['origin_icao']}, maar het wachten duurt ongewoon lang — mogelijk een terugkeer)"
+        if nearest["icao"] == route["origin_icao"]:
+            route_note = f" (dit IS het vertrekpunt {route['origin_icao']}, maar het wachten duurt ongewoon lang — mogelijk een terugkeer)"
+        else:
+            route_note = f" (dit is vlakbij het vertrekpunt {route['origin_icao']}, maar het wachten duurt ongewoon lang — mogelijk een terugkeer)"
         at_destination = False
     else:
         track.holding_streak = 0
-        route_note = f" (geplande bestemming was {track.route['destination_icao']})"
+        route_note = f" (geplande bestemming was {route['destination_icao']})"
         at_destination = False
 
     return Event(

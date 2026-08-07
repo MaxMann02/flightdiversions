@@ -1710,3 +1710,96 @@ green. Bounded live smoke test (`serve_all.py`, `TELEGRAM_BOT_TOKEN=""`/
 emergency this run (N4620D, squawk 7700) correctly detected, opened
 straight at BEVESTIGD, notified exactly once across several repeated
 tier0 hits.
+
+## Round 21 — 2026-08-07 (`/loop` iteration) — same-metro-area heuristic, one real fix + one important reverted attempt
+
+Mid-round, the user sent a live message: stop scheduling 25-minute wakeup
+gaps and continue immediately, and launch a second, parallel background
+agent to do useful work too. Complied: dropped the wakeup delay for the
+rest of this round, and launched a general-purpose agent scoped to
+self-review `notifier.py`/`server.py`/`providers.py`/the dashboard
+frontend — files this session hadn't scrutinized as closely as
+`detector.py`/`incidents.py`/`airspace.py`/`classify.py`, and deliberately
+NOT the files this round was actively editing, to avoid git conflicts.
+That agent found and fixed a stale docstring on `server.py`'s
+`handle_api_incidents` (claimed the dashboard "didn't consume this yet",
+written before round 11 actually wired up the incident panel) — still
+running/reporting further findings as this round's own work continued in
+parallel.
+
+**Quantified round 20's flagged same-metro-area pattern properly before
+building anything**, per the queued instruction. Pulled 3 more live
+snapshots and combined ALL 8 pulls collected across this session (1139
+unique events, deduplicated by event id) — enough to compute a real
+distance distribution instead of eyeballing a handful of examples. For
+each `wrong_airport`/`holding_pattern`/`signal_lost_near_airport` event
+whose reported "nearest" airport was neither the exact filed origin nor
+destination, computed the haversine distance from that airport to
+whichever of origin/destination was closer. Genuine sister-airport pairs
+(JFK-LGA 9nm, Milan Malpensa-Linate 26nm, Oakland-San Jose 26nm, London
+Stansted-Luton 22nm, LAX-area 31nm) clustered tightly under ~31nm, with a
+clear gap to the next-closest non-metro case at 46nm — 35nm sits with
+margin in that gap, calibrated the same way as `ROUTE_PLAUSIBLE_PROGRESS_
+MULTIPLIER` (round 7). Rates at that threshold: `holding_pattern` 7/21
+(33%), `signal_lost_near_airport` 18/95 (19%), `wrong_airport` 5/104 (5%,
+already partly mitigated by round 18's hexdb.io cross-check).
+
+**Built a generic, cheap heuristic instead of a per-city hardcoded
+list**, per the instruction's suggestion to consider something reusable
+across detectors: `airports.airports_same_metro(lat1, lon1, lat2, lon2)`,
+a plain distance check against the new `AIRPORT_SAME_METRO_RADIUS_NM`
+(35.0) constant — no new data source, no maintenance burden as new
+multi-airport-city pairs come up worldwide, reuses the already-everywhere
+`haversine_nm`.
+
+**Applied it to `holding_pattern`'s destination/origin exclusions —
+verified safe and kept.** Extended both `near_dest`/`near_origin` checks
+(the origin one from round 20) to also match a same-metro airport, not
+just an exact ICAO match. Safe specifically because holding_pattern
+already gates BOTH cases behind the long `holding_pattern_destination_
+min_streak` — a same-metro match doesn't skip that patience requirement,
+it only widens which positions get treated as "the routine, gated case"
+instead of "immediate, ungated case." A genuine emergency hold near a
+metro-sister airport is delayed by at most the same streak length already
+accepted for exact-destination holds (and AI850's real case already
+proves that's an acceptable trade — it fires 1h26m before the real
+decision even with that gate active), never silently lost. New `check_
+holding_pattern_same_metro()` verifies this using REAL, distance-verified
+airport coordinates (KDFW/KDAL, confirmed 10.09nm apart via a direct
+computation before writing the test, not guessed).
+
+**Attempted the identical extension for `signal_lost_near_airport` —
+found it breaks a real case, reverted before committing.** First pass
+extended that detector's destination/origin exclusions the same way. `python
+backtest.py` immediately caught the damage: the UA2078 signal-lost variant
+went from passing to MISSED. Root cause: UA2078's real diversion target,
+Luke AFB, is only ~15nm from the filed KPHX — well inside the 35nm
+radius — and "divert to the nearest suitable alternate" is exactly the
+realistic pattern this detector exists to catch, not noise. Unlike
+`holding_pattern`, `signal_lost_near_airport` is a single last-known-
+position snapshot with no streak/patience mechanism at all — suppressing
+"nearby but not exact" here doesn't delay detection, it silently and
+permanently loses it. Reverted the change for this detector specifically,
+with a comment explaining why, referencing the exact case that caught it.
+This is worth recording as a genuine finding in its own right, same as
+round 17's "reviewed, found clean" pattern: the same fix shape isn't
+automatically safe just because it worked for a similar-looking detector —
+the difference between "has a sustained-evidence mechanism" (holding_
+pattern, safe) and "single-shot" (signal_lost_near_airport, unsafe) is
+what actually determines whether a same-metro exclusion delays or
+destroys detection.
+
+**Deliberately not extended to `wrong_airport`** — its rate (5%) was
+already the smallest of the three, and it already has round 18's
+independent hexdb.io cross-check covering a meaningfully overlapping
+failure mode (a same-metro landing that's ALSO a schedule mismatch would
+likely already get downgraded there); adding a second, different
+mechanism on top wasn't judged worth the extra surface area this round
+given the small remaining signal.
+
+`python backtest.py`: 9/9 cases (all unchanged, including the now-restored
+UA2078 signal-lost variant) + all 13 regression-check groups (12 prior +
+the new `check_holding_pattern_same_metro`) green. Bounded live smoke test
+(`serve_all.py`, `TELEGRAM_BOT_TOKEN=""`/`TELEGRAM_CHAT_ID=""`, ~80s, 2
+tier1 cycles, ~12300-12400 aircraft tracked, 2 open incidents correctly
+reloaded from the prior session's local db): no exceptions.

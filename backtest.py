@@ -511,6 +511,74 @@ def check_holding_pattern_origin_gating(airport_db: AirportDB) -> bool:
     return gated_ok and eventually_fires_ok and unrelated_fires_ok
 
 
+def check_holding_pattern_same_metro(airport_db: AirportDB) -> bool:
+    """Live data (2026-08-07, BACKTEST_LOG.md ronde 21): ~33% (7/21
+    sampled) of live holding_pattern hits were near a DIFFERENT airport
+    serving the SAME city as the filed destination (e.g. Dallas Love Field
+    KDAL vs. the filed KDFW, 10nm apart) rather than an unrelated location —
+    adsbdb schedule data naming one member of a metro pair while the
+    aircraft is actually headed to the other. Fixed via a generic distance
+    check (airports.airports_same_metro, 35nm), extending BOTH the
+    destination and origin exclusions (not a hardcoded per-city list).
+    Deliberately NOT applied to signal_lost_near_airport in the same round
+    — that broke the real UA2078 case (Luke AFB is a genuine diversion
+    target only 15nm from filed KPHX), see that detector's own comment.
+    holding_pattern is safe from that failure mode because even a same-
+    metro match still requires the same long streak as an exact match, so
+    a genuine emergency hold near a metro-sister airport is delayed, not
+    silently lost, the way a single-snapshot detector's suppression would
+    be. Not a Case: a should-be-gated-like-destination assertion, same
+    pattern as check_holding_pattern_origin_gating above — uses real,
+    verified airport coordinates (KDFW/KDAL, confirmed 10nm apart) rather
+    than synthetic ones."""
+    import math
+
+    from detector import detect_holding_pattern
+    from state import AircraftTrack, TrackPoint
+
+    print("\n=== holding_pattern same-metro-area gating check ===")
+    cfg = CONFIG
+    filed_dest = airport_db.get("KDFW")
+    sister = airport_db.get("KDAL")  # real sister airport, ~10nm from KDFW, NOT an exact ICAO match
+    origin = airport_db.get("KIAH")
+    ac = {"on_ground": False}
+
+    def make_track() -> AircraftTrack:
+        track = AircraftTrack(hex="holding_metro_regression")
+        track.route = {
+            "origin_icao": "KIAH", "origin_lat": origin["lat"], "origin_lon": origin["lon"],
+            "destination_icao": "KDFW", "destination_lat": filed_dest["lat"], "destination_lon": filed_dest["lon"],
+        }
+        return track
+
+    def circle_sample(track: AircraftTrack, i: int, center: dict, lap_samples: int = 4, radius_nm: float = 4.0):
+        deg_per_sample = 360.0 / lap_samples
+        ang = math.radians((i * deg_per_sample) % 360)
+        dlat = (radius_nm / 60.0) * math.cos(ang)
+        dlon = (radius_nm / 60.0) * math.sin(ang) / math.cos(math.radians(center["lat"]))
+        trk = (i * deg_per_sample + 90) % 360
+        track.history.append(TrackPoint(ts=i * 60.0, lat=center["lat"] + dlat, lon=center["lon"] + dlon,
+                                         alt_baro=8000, track=trk, on_ground=False))
+
+    track = make_track()
+    fired_early = None
+    for i in range(cfg["holding_pattern_samples"] + 1):
+        circle_sample(track, i, sister)
+        fired_early = detect_holding_pattern(track, ac, airport_db, cfg)
+    gated_ok = fired_early is None
+    print(f"  circling near destination's metro-sister airport, short streak: {'OK (gated)' if gated_ok else 'FAIL (fired immediately)'}")
+
+    fired_late = None
+    for i in range(cfg["holding_pattern_samples"] + 1, cfg["holding_pattern_samples"] + cfg["holding_pattern_destination_min_streak"] + 2):
+        circle_sample(track, i, sister)
+        fired_late = detect_holding_pattern(track, ac, airport_db, cfg)
+    eventually_fires_ok = fired_late is not None and fired_late.at_destination is True
+    print(f"  circling near metro-sister airport, sustained past the long streak: "
+          f"{'OK (fires, at_destination tier)' if eventually_fires_ok else f'FAIL (fired_late={fired_late})'}")
+
+    return gated_ok and eventually_fires_ok
+
+
 def check_classification_regressions() -> bool:
     """classify.py's decision order (MASTERPLAN.md sectie 4), sanity-checked
     against real live dbFlags/category values seen 2026-08-06 via
@@ -1099,6 +1167,7 @@ def main():
     bow_suppression_ok = check_corridor_deviation_bow_suppression()
     signal_lost_origin_ok = check_signal_lost_origin_suppression(airport_db)
     holding_origin_gating_ok = check_holding_pattern_origin_gating(airport_db)
+    holding_same_metro_ok = check_holding_pattern_same_metro(airport_db)
     classification_ok = check_classification_regressions()
     route_widening_ok = check_route_widening_regressions()
     wrong_airport_crosscheck_ok = check_wrong_airport_route_crosscheck()
@@ -1120,6 +1189,7 @@ def main():
     print(f"corridor_deviation bow-tolerance suppression: {'OK' if bow_suppression_ok else 'FAIL — see above'}")
     print(f"signal_lost_near_airport origin-suppression: {'OK' if signal_lost_origin_ok else 'FAIL — see above'}")
     print(f"holding_pattern origin-streak gating: {'OK' if holding_origin_gating_ok else 'FAIL — see above'}")
+    print(f"holding_pattern same-metro-area gating: {'OK' if holding_same_metro_ok else 'FAIL — see above'}")
     print(f"aircraft classification: {'OK' if classification_ok else 'FAIL — see above'}")
     print(f"route widening (hexdb.io + negative-retry): {'OK' if route_widening_ok else 'FAIL — see above'}")
     print(f"wrong_airport route-source cross-check: {'OK' if wrong_airport_crosscheck_ok else 'FAIL — see above'}")

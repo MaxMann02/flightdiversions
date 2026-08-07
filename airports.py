@@ -118,6 +118,35 @@ def angle_diff_deg(a: float, b: float) -> float:
     return d if d <= 180 else 360 - d
 
 
+# Generic "close enough to be the same metro area" radius — deliberately a
+# plain distance threshold, not a hardcoded per-city airport list (cheap,
+# needs no maintenance as new multi-airport pairs come up worldwide).
+# Calibrated against live data (2026-08-07, BACKTEST_LOG.md ronde 21):
+# combined ~1100 unique live events across this session's pulls, checking
+# holding_pattern/signal_lost_near_airport/wrong_airport hits whose
+# "nearest" airport was neither the exact filed origin nor destination.
+# Every genuine sister-airport pair found (JFK-LGA 9nm, Milan Malpensa-
+# Linate 26nm, Oakland-San Jose 26nm, LAX-area 31nm, London Stansted-Luton
+# 22nm) fell within 31nm; the next-closest non-metro case sat at 46nm with
+# a large gap in between — 35nm sits with margin in that gap, same
+# "start reasoned, verify against real data" approach as ROUTE_PLAUSIBLE_
+# PROGRESS_MULTIPLIER (round 7) and corridor_deviation_bow_heading_deg.
+AIRPORT_SAME_METRO_RADIUS_NM = 35.0
+
+
+def airports_same_metro(lat1: float, lon1: float, lat2: float, lon2: float) -> bool:
+    """True if two airport coordinates are close enough to plausibly serve
+    the same city/metro area (e.g. JFK vs LGA, Milan Malpensa vs Linate),
+    even though their ICAO codes differ. Used to stop route-dependent
+    detectors from treating 'the aircraft is actually near its filed
+    origin/destination's SISTER airport' as if it were an unrelated
+    location — a real, recurring pattern behind holding_pattern/
+    signal_lost_near_airport/wrong_airport false positives (adsbdb schedule
+    data naming one airport of a metro pair while the aircraft is actually
+    headed to/from the other)."""
+    return haversine_nm(lat1, lon1, lat2, lon2) <= AIRPORT_SAME_METRO_RADIUS_NM
+
+
 EARTH_RADIUS_NM = 3440.065
 
 
