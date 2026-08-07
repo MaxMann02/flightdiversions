@@ -1250,3 +1250,85 @@ its original escalation despite having decayed back down to BEWAKING by
 the time it finally crossed the auto-close threshold this run — exactly
 the "honest, don't mislabel a real escalation as nothing" behavior that
 fix exists for.
+
+**Continued same round — pulled fresh live data** from the deployed
+dashboard (`http://35.227.51.25:8787/api/events`, 200 most recent events)
+per the queued instruction to keep hunting false-positive patterns.
+`/api/incidents` 404s on that host, confirming the deployed VM predates
+round 10's incident-engine phase — all analysis below is against the raw
+per-detector-hit pipeline, same as rounds 7-8's live diagnoses.
+
+**`premature_descent` is firing at large scale on ordinary global
+traffic**: 44 of 200 events (22%; extrapolated from `stats.events24=14714`,
+roughly ~3200/day). Every single one is a LONE, non-repeating hit on a
+DIFFERENT aircraft (44 distinct callsigns, zero repeats) — a diverse mix of
+major carriers worldwide (United, Southwest, Delta, British Airways, KLM,
+Lufthansa, El Al, JetBlue, American, ANA-affiliated regionals, etc.), each
+still hundreds to ~2000nm from its filed destination. Computed the actual
+ratio of reported remaining-distance to the detector's own (already
+3x-generous) expected-top-of-descent distance for all 44: every one is at
+least 3.0x over that threshold, several 15-28x over (e.g. UAL325 KDEN->KBOS
+at 29400ft, 2155nm out, 24.5x over; VOI505 MMPB->KEWR at 25675ft, 1708nm
+out, 22.2x over). Only 6/44 also show a `corridor_deviation` for the same
+callsign in the same window — most of these aircraft aren't laterally off
+their filed route at all, just doing an ordinary mid-cruise altitude change
+the detector reads as "early descent toward landing."
+
+**First checked whether a distance-based cap could fix this — it can't.**
+Computed the same ratio for the ONE real, sourced case that actually
+exercises this detector (EK225's premature-descent variant,
+`backtest_cases.py`): it fires 4654nm from its filed KSFO, at a similar
+34000ft-class altitude — a HIGHER ratio (45x) than any of the 44 live noise
+cases. That's not a coincidence, it's the detector's actual intended
+signature: a genuine diversion makes the filed destination irrelevantly far
+away, so "still very far from the filed destination while descending" is
+exactly the real signal EK225 provides, not a fluke to filter out.
+Tightening the multiplier or capping absolute/relative distance would have
+directly broken the only sourced case this detector has ever caught,
+while barely touching the noise (whose ratios cluster mostly in the
+single-digit-to-teens range, well under EK225's 45x).
+
+**The real distinguishing signal instead: duration.** All 44 live cases are
+one-off, non-repeating — the same aircraft never reappears with a lower
+altitude/closer distance later in the window — consistent with a brief,
+ATC-directed cruise step-down (typically executes over 1-3min at moderate
+rate, then levels off) rather than a committed descent. EK225's real
+descent, by contrast, sustains ~1575ft/min continuously for 20+ minutes
+straight. The detector's existing `premature_descent_samples`/
+`premature_descent_min_drop_ft` gate (4 samples/4000ft, i.e. a 4-minute
+window) is short enough that an ordinary multi-minute step-down can
+complete entirely within it before leveling off — the detector's own
+docstring already notes it was hardened once against a *single-step*
+step-down-then-level pattern (requiring every consecutive sample to
+decrease, not just net decrease), but a step spread across ~4 consecutive
+minutes still fits inside the existing window untouched by that earlier
+fix.
+
+**Fix (`config.py`):** `premature_descent_samples` 4→8,
+`premature_descent_min_drop_ft` 4000→6000 (multiplier left at 3.0,
+unchanged, since the distance side of the check is deliberately NOT what's
+being tightened here — see above). Doubling the window requires roughly
+double the sustained, uninterrupted descent duration before firing, which
+a brief step-down-then-level pattern won't clear but a real committed
+descent easily does — verified against EK225 specifically: it sustains the
+stricter window fine (fires 4min later than before, -7m00s lead instead of
+-3m00s, still comfortably useful). Explicitly documented in `config.py` as
+NOT independently live-reverified post-change (no redeploy access this
+session, so there's no way to re-pull fresh live data through the new
+threshold and confirm the noise is actually gone) — a reasoned,
+backtest-safe improvement consistent with this project's tune-from-live-
+evidence culture (same pattern as round 7's `ROUTE_PLAUSIBLE_PROGRESS_
+MULTIPLIER` tightening), flagged honestly as needing live confirmation in
+a later round rather than claimed as verified.
+
+`python backtest.py`: 9/9 cases (EK225 premature-descent timing shifted as
+described above, otherwise unchanged) + all 9 regression-check groups still
+green. Bounded live smoke test (`serve_all.py`, `TELEGRAM_BOT_TOKEN=""`/
+`TELEGRAM_CHAT_ID=""`, ~75s, 2 tier1 cycles, ~13850 aircraft tracked): no
+exceptions.
+
+**Also worth a future round's attention, not chased further here:**
+`signal_lost_near_airport` was the next-largest category live (30/200,
+15%) — not investigated this round due to time; worth the same kind of
+ratio/repeat analysis applied to `premature_descent` above before assuming
+it's clean.

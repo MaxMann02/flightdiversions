@@ -44,9 +44,30 @@ _DEFAULTS = {
     # Premature descent: sustained descent of at least this many feet, while
     # still further from the destination than `multiplier`x the standard
     # ~3nm-per-1000ft top-of-descent rule of thumb would predict.
-    "premature_descent_min_drop_ft": 4000,
+    # samples/min_drop_ft raised from 4/4000 (2026-08-07, BACKTEST_LOG.md
+    # ronde 16) after live data showed the old, shorter window firing on
+    # ordinary ATC-directed cruise step-downs: 44 different real, unrelated
+    # aircraft worldwide in one ~20min window, each a lone non-repeating hit
+    # (i.e. it never continued descending afterward — consistent with a
+    # brief step-down that levels off, not a committed descent), with
+    # dist_to_dest 3x-28x beyond the ALREADY-generous 3x multiplier
+    # threshold. A distance-based cap can't fix this: EK225's own real,
+    # sourced premature_descent case (backtest_cases.py) fires 4654nm from
+    # its filed KSFO — thousands of nm further out than any of the live
+    # noise cases — because that's the exact, intended signature of "the
+    # filed destination is now irrelevant, this is a diversion", so
+    # tightening the distance/multiplier would have broken real detection,
+    # not just noise. A committed real descent (EK225 sustains ~1575ft/min
+    # for 20+ consecutive minutes) easily clears a longer window; a brief
+    # ATC step-down (typically executes over 1-3min then levels off, which
+    # already breaks the existing "strict continuous decrease" check once
+    # the window outlasts the step) does not. Not independently
+    # live-reverified post-change (no redeploy access this session) — a
+    # reasoned, backtest-safe improvement per this project's tune-from-live-
+    # evidence culture, live effectiveness to be confirmed in a later round.
+    "premature_descent_min_drop_ft": 6000,
     "premature_descent_multiplier": 3.0,
-    "premature_descent_samples": 4,
+    "premature_descent_samples": 8,
 
     # Holding pattern: total heading rotation (deg) across this many samples,
     # while staying within max_radius_nm of the window's centroid.
