@@ -1329,6 +1329,27 @@ exceptions.
 
 **Also worth a future round's attention, not chased further here:**
 `signal_lost_near_airport` was the next-largest category live (30/200,
-15%) — not investigated this round due to time; worth the same kind of
-ratio/repeat analysis applied to `premature_descent` above before assuming
-it's clean.
+15%) — a quick look showed the same likely root cause as `premature_
+descent` above (adsbdb route mismatches: e.g. UAL3928 filed SBGL->KIAH,
+signal lost near KEWR at -150ft — Newark isn't plausibly "on the way"
+between Rio and Houston, suggesting the filed route itself is wrong for
+this callsign, same shape as round 7's AAL974/SWA2820). Deliberately NOT
+turned into a third detector-geometry change this round without the same
+EK225-style cross-check discipline applied to `premature_descent` above —
+two geometry changes already touched in one round is enough surface area;
+a rushed third change risks breaking `detect_signal_lost_near_airport`'s
+own real case (the UA2078 signal-lost variant) without properly verifying
+first. Good next-round target, same method: quantify the pattern, then
+check it against the real sourced case before touching thresholds.
+
+**Small cleanup, same round:** found two stale comments (`server.py`'s
+`FEED_WINDOW_SECONDS` comment, `backtest.py`'s `check_course_deviation_
+holding_suppression` docstring) still describing the `alert_cooldown_
+seconds`-gated `enrich_and_dispatch` dispatch mechanism in present tense,
+even though it was removed in rounds 10-11 when the incident engine took
+over dedup/escalation — found while reading through the codebase for this
+round's other changes, not from a targeted grep sweep. Fixed both to
+describe current behavior (events are now saved unconditionally, dedup
+lives in `incidents.py`'s `notified_state` gate) with the historical
+mechanism referenced in clearly past-tense terms. No functional change,
+`python backtest.py` re-run clean after.
