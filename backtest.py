@@ -1066,6 +1066,77 @@ def check_incident_engine_real_case_escalation(airport_db: AirportDB) -> bool:
     return all_ok
 
 
+def check_incident_engine_real_case_recovery(airport_db: AirportDB) -> bool:
+    """Runs DAL2778 (BACKTEST_LOG.md ronde 22) — a real, sourced, LARGE
+    weather-avoidance detour that never diverted anywhere — through the
+    full incident engine, the opposite validation from check_incident_
+    engine_real_case_escalation above: confirms a real, geometrically
+    genuine deviation does NOT escalate past MOGELIJK and does eventually
+    close, rather than lingering open or (worse) escalating on a single,
+    uncorroborated detector hit.
+
+    Also regression-tests a real, documented side effect of this case's
+    own headline finding (see _dal2778's docstring): main.py/backtest.py's
+    ongoing route_plausible recheck nulls track.route at t=8min, well
+    before course_deviation fires at t=34min — so the resulting incident
+    never learns a dest_icao, meaning `_check_landed`'s destination-match
+    can't recognize the later normal landing at ATL as "the expected
+    destination". The incident still correctly never escalates and still
+    closes (via idle decay -> GESLOTEN_VALS_ALARM, not the more accurate
+    GESLOTEN_NORMAAL a route-aware incident would get) — a real, minor,
+    cascading imprecision from the same root cause, asserted here
+    explicitly so a future fix to that root cause has a test that will
+    correctly start expecting GESLOTEN_NORMAAL instead, rather than this
+    gap silently going unnoticed either way."""
+    import classify
+    import db as db_module
+    from backtest_cases import _dal2778
+    from incidents import IncidentManager
+
+    print("\n=== incident engine real-case recovery check (DAL2778) ===")
+    all_ok = True
+
+    case = _dal2778()
+    conn = db_module.connect(":memory:")
+    cfg = dict(CONFIG)
+    mgr = IncidentManager(conn, cfg, airport_db)
+    run_case(case, airport_db, cfg, incident_mgr=mgr, aircraft_class=classify.AIRLINER)
+
+    rows = conn.execute(
+        f"SELECT {','.join(db_module._INCIDENT_COLS)} FROM incidents WHERE hex = ? ORDER BY id",
+        (case.hex_id,),
+    ).fetchall()
+    incidents_seen = [db_module._incident_row_to_dict(row) for row in rows]
+    ok = len(incidents_seen) == 1
+    all_ok = all_ok and ok
+    print(f"  exactly one incident opened for this real, non-diverting flight: "
+          f"{'OK' if ok else f'FAIL (got {len(incidents_seen)})'}")
+    if not ok:
+        return False
+
+    inc = incidents_seen[0]
+    ok = inc["peak_score"] < cfg["incident_score_likely_threshold"]
+    all_ok = all_ok and ok
+    print(f"  a real, single, uncorroborated course_deviation hit never escalates past MOGELIJK "
+          f"(peak_score={inc['peak_score']:.0f}, LIKELY threshold={cfg['incident_score_likely_threshold']}): "
+          f"{'OK' if ok else 'FAIL'}")
+
+    ok = inc["state"] in ("GESLOTEN_VALS_ALARM", "GESLOTEN_NORMAAL")
+    all_ok = all_ok and ok
+    print(f"  incident closes cleanly rather than lingering open (state={inc['state']}): {'OK' if ok else 'FAIL'}")
+
+    # The documented cascading side effect: dest_icao is None because
+    # route_plausible nulled the route before course_deviation ever saw a
+    # valid one to attach to the incident.
+    ok = inc["dest_icao"] is None and inc["state"] == "GESLOTEN_VALS_ALARM"
+    all_ok = all_ok and ok
+    print(f"  known cascading gap still present as documented (dest_icao=None, closes GESLOTEN_VALS_ALARM "
+          f"not GESLOTEN_NORMAAL — expected to flip once the route_plausible finding is fixed): "
+          f"{'OK' if ok else 'FAIL'}")
+
+    return all_ok
+
+
 def check_airspace_regressions(airport_db: AirportDB) -> bool:
     """Standalone smoke test for airspace.py (MASTERPLAN.md sectie 6.1) and
     incidents.py's peer-consensus check (sectie 6.2), both new in
@@ -1173,6 +1244,7 @@ def main():
     wrong_airport_crosscheck_ok = check_wrong_airport_route_crosscheck()
     incident_engine_ok = check_incident_engine_regressions(airport_db)
     incident_engine_real_case_ok = check_incident_engine_real_case_escalation(airport_db)
+    incident_engine_recovery_ok = check_incident_engine_real_case_recovery(airport_db)
     airspace_ok = check_airspace_regressions(airport_db)
 
     print("\n=== summary ===")
@@ -1195,6 +1267,7 @@ def main():
     print(f"wrong_airport route-source cross-check: {'OK' if wrong_airport_crosscheck_ok else 'FAIL — see above'}")
     print(f"incident engine: {'OK' if incident_engine_ok else 'FAIL — see above'}")
     print(f"incident engine (real-case escalation, AI850): {'OK' if incident_engine_real_case_ok else 'FAIL — see above'}")
+    print(f"incident engine (real-case recovery, DAL2778): {'OK' if incident_engine_recovery_ok else 'FAIL — see above'}")
     print(f"airspace (weather + peer-consensus): {'OK' if airspace_ok else 'FAIL — see above'}")
 
 

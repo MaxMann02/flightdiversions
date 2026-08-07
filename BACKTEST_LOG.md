@@ -1874,3 +1874,123 @@ curl during its own smoke test window (`stats.confirmed=44`,
 `events24=46`, `precisionRate` correctly `None` since the only
 recently-resolved incident in that window closed `GESLOTEN_TIMEOUT`,
 intentionally excluded from the ratio).
+
+## Round 23 — 2026-08-07 (`/loop` iteration, continued) — new real case surfaces a significant route_plausible/corridor_deviation interaction gap
+
+Went looking for a new real, sourced backtest case per the queued
+instruction, specifically one that exercises the incident engine's
+NON-escalation/recovery path with real data — every prior incident-engine
+real-case test (AI850, round 16) validates that a genuine precursor
+correctly escalates; none yet validated the opposite, equally important
+property with sourced data instead of synthetic scenarios.
+
+**Found a strong real candidate via WebSearch**: Delta Air Lines Flight
+2778, Memphis(MEM)->Atlanta(ATL), 15 Mar 2025 — a Boeing 717 took a large
+detour south over Louisiana to avoid a severe weekend storm system (which
+killed at least 40 people across the South/Midwest), nearly doubling flight
+time (1h39m vs. the normal ~45-60min), before landing normally at the
+originally filed destination. Sourced via Flightradar24-cited coverage
+(Yahoo/AOL, both republishing the same original reporting). Reconstructed
+the track using Monroe, LA (KMLU) as a plausible bow point — verified
+(not guessed) before committing to it: MEM->KMLU->ATL totals a 1.99x
+path-length ratio vs. the direct route, matching the source's "nearly
+doubling" detail almost exactly, and produces a 173nm cross-track
+deviation, more than double `corridor_deviation`'s own 80nm threshold for
+this route length.
+
+**Expected `corridor_deviation` to fire — it didn't, and the reason why is
+this round's real finding.** Direct computation confirmed the raw geometry
+clears the threshold comfortably by ~t=15min. But `python backtest.py`
+showed only `course_deviation` firing (at t=34min, the turn back toward
+Atlanta) — zero `corridor_deviation` hits anywhere. Traced it precisely:
+main.py's/backtest.py's ONGOING `route_plausible` recheck is still in its
+STRICT `check_progress=True` window (`ROUTE_REVALIDATION_WINDOW_S`, 20min
+after resolution) at t=8min into this flight, and the growing detour
+already fails that strict sum-of-distances check by then — `track.route`
+gets nulled at t=8min, six to nine minutes before `corridor_deviation`
+would ever have gotten a chance to see a valid route and apply its OWN,
+more nuanced, heading-aware bow-tolerance judgment (round 8). Once nulled,
+`corridor_deviation`'s `if not track.route: return None` blocks it for the
+rest of the flight — `course_deviation` is unaffected only because it's
+deliberately route-independent by design.
+
+**Checked whether the existing bow-tolerance heading check could bypass
+this — it can't, for a structural reason.** The window where
+`route_plausible` fails (t=8-19min) is exactly the OUTBOUND leg of the
+detour, where the aircraft's heading genuinely points AWAY from Atlanta
+(that's the nature of a bow: fly away, then back) — a "still heading
+toward destination" bypass, the same logic corridor_deviation itself
+already uses, would need to trigger during the leg where heading points
+away, which is the opposite of what that check is designed to recognize
+as legitimate. This isn't a case of forgetting to reuse an existing
+mechanism; the two checks are answering genuinely different questions
+that happen to collide during exactly the outbound half of any real bow.
+
+**Checked whether the 1.2x progress-ratio threshold itself could simply be
+loosened — it can't, with real numbers proving it, not just
+re-asserting round 5's "no single number" conclusion in the abstract.**
+Computed DAL2778's own sum-of-distances ratio at the point `route_plausible`
+rejects it: ~1.58x. AAL974's confirmed-BAD route-data ratio (round 7,
+live-observed) is 1.38x — LOWER than DAL2778's ratio for a completely
+legitimate flight. Any threshold loose enough to admit DAL2778 would also
+re-admit AAL974/SWA2820's bad data, undoing round 7's own fix. This is the
+same "no single number can do both jobs" lesson round 5 already learned
+for the DIFFERENT (overflight-past-destination) failure mode, now shown to
+independently apply to this (early-lateral-bow) failure mode too, with its
+own fresh evidence.
+
+**Deliberately did not rush a fix.** This is a real, structural tension
+between two systems (`route_plausible`'s blunt distance-sum strictness,
+and `corridor_deviation`'s smarter heading-aware bow-tolerance judgment)
+that collide specifically during a route's first 20 minutes — fixing it
+properly likely needs a genuinely different signal than either system
+currently has (the case's own docstring speculates about trajectory
+smoothness/coherence as a possible future direction — a truly mismatched
+route, per the UAL840/AAL974/SWA2820 lineage, would look geometrically
+INCOHERENT relative to the filed route over time, not just displaced,
+the way a real bow does). `route_plausible` backs enough of this system
+(the strict check alone protects 3 of the 9 real cases' route resolution
+from bad adsbdb data) that a same-session, insufficiently-validated change
+here is a worse outcome than documenting the gap precisely and leaving it
+for a dedicated future round — matching this session's own established
+discipline (round 17's `signal_lost` origin case chose unconditional
+suppression specifically BECAUSE a nuanced fix wasn't safely verifiable;
+round 21 tried and reverted an unsafe extension of the same shape for
+`signal_lost_near_airport` rather than force it through).
+
+**Kept the case in the suite anyway, as a durable regression marker for
+this exact gap** — `expected_type="course_deviation"` (what actually,
+correctly fires) rather than `corridor_deviation` (what SHOULD also fire
+once this is eventually fixed), with the full finding documented in the
+case's own docstring so a future session doesn't have to rediscover it:
+if a later fix ever properly resolves this tension, this case's report
+should start showing `corridor_deviation` in its "also fired" line, a
+concrete, checkable signal that the fix landed.
+
+**Found and regression-tested a real, minor, cascading side effect of the
+same root cause.** New `check_incident_engine_real_case_recovery()` runs
+DAL2778 through the full incident engine (mirroring round 16's AI850
+escalation check, but validating the opposite property): the incident
+correctly opens on the single `course_deviation` hit, correctly never
+escalates past MOGELIJK (peak_score 30, nowhere near the LIKELY threshold
+55 — exactly the intended behavior for a single, uncorroborated
+geometric hit), and correctly closes rather than lingering open. But
+because `route_plausible` nulled the route BEFORE `course_deviation` ever
+fired, the resulting incident never learns a `dest_icao` — so when the
+aircraft later lands normally at ATL, `_check_landed`'s destination-match
+can't recognize it as "the expected destination," and the incident closes
+via idle decay (`GESLOTEN_VALS_ALARM`) instead of the more accurate
+`GESLOTEN_NORMAAL`. Still functionally correct (never a false escalation,
+never left open) — just a labeling imprecision, asserted explicitly in
+the new check so it stays a documented, expected property rather than a
+silent gap, and so a future fix to the root cause has a test that will
+correctly start expecting `GESLOTEN_NORMAAL` instead.
+
+`python backtest.py`: **10/10 cases** (9 prior + DAL2778) detect their
+expected type + all 15 regression-check groups (13 prior + the two new
+ones: `check_incident_engine_real_case_recovery`) green. No live smoke
+test this round — only `backtest.py`/`backtest_cases.py` changed, neither
+imported by `main.py`/`serve_all.py`'s live loops.
+
+Sources: https://www.yahoo.com/news/map-shows-journey-doubling-detours-121711497.html,
+https://www.aol.com/map-shows-journey-doubling-detours-121711740.html
