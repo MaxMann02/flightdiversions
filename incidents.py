@@ -47,6 +47,27 @@ _STATE_RANK = {WATCHING: 0, POSSIBLE: 1, LIKELY: 2, CONFIRMED: 3}
 # made while implementing this, see BACKTEST_LOG.md ronde 10).
 DEVIATION_EVENT_TYPES = ("course_deviation", "corridor_deviation")
 
+# Evidence sources whose underlying detect_* condition can keep re-firing
+# every single cycle for as long as the underlying situation persists (an
+# ongoing hold, a continuous descent) — as opposed to a one-shot signal
+# (wrong_airport/signal_lost fire once, at the moment of landing/loss).
+# Found via a real-case (AI850) multi-detector-escalation backtest
+# (BACKTEST_LOG.md ronde 16): holding_pattern and premature_descent had NO
+# repeat dampening, unlike course_deviation/corridor_deviation (which
+# already only give a smaller top-up on repeats, see DEVIATION_EVENT_TYPES
+# above) — an inconsistency, not a deliberate design choice. Undamped, an
+# ordinary extended ATC hold at a busy destination (already required to
+# sustain 20+ minutes past holding_pattern_destination_min_streak before it
+# ever fires at all) reached BEVESTIGD, and dispatched a Telegram
+# notification, within 3 more minutes of that gate clearing — with zero
+# corroborating evidence, purely from the same detector re-confirming the
+# same ongoing hold every cycle. Same failure mode for premature_descent
+# during any sustained continuous descent (e.g. EJU3722 in MASTERPLAN.md
+# sectie 12, a long-but-legitimate TMA approach). Repeat weights below use
+# the same ~1/3-of-first-hit ratio already established for
+# DEVIATION_EVENT_TYPES.
+REPEATABLE_EVENT_TYPES = DEVIATION_EVENT_TYPES + ("holding_pattern", "premature_descent")
+
 # Evidence sources that are themselves negative-only/context, never a sign
 # the incident is more serious than a plain deviation — excluded from
 # _check_deviation_recovered's "is this incident still just a deviation"
@@ -69,10 +90,11 @@ def _state_for_score(score: float, cfg: dict) -> str:
 def score_for_event(ev, is_repeat_type: bool) -> tuple[float, str, str]:
     """Base evidence weight for a fresh detector.Event. is_repeat_type:
     whether this SAME incident already has an earlier contribution from
-    this exact event_type — course_deviation/corridor_deviation get a
+    this exact event_type — every type in REPEATABLE_EVENT_TYPES gets a
     smaller top-up on repeats rather than the full first-hit weight each
-    time. Returns (delta, source, description). See MASTERPLAN.md sectie
-    3.3 for the full rationale behind each weight."""
+    time (see that constant's docstring for why). Returns (delta, source,
+    description). See MASTERPLAN.md sectie 3.3 for the full rationale
+    behind each weight."""
     et = ev.event_type
     if et == "emergency":
         if ev.squawk in EMERGENCY_SQUAWKS:
@@ -89,12 +111,12 @@ def score_for_event(ev, is_repeat_type: bool) -> tuple[float, str, str]:
         return 40.0, "signal_lost", "signaal verloren nabij niet-bestemming, laag"
     if et == "holding_pattern":
         if ev.at_destination:
-            return 25.0, "holding_destination", "ongewoon lang wachtpatroon bij bestemming"
-        return 35.0, "holding_non_destination", "wachtpatroon bij niet-bestemming"
+            return (8.0 if is_repeat_type else 25.0), "holding_destination", "ongewoon lang wachtpatroon bij bestemming"
+        return (12.0 if is_repeat_type else 35.0), "holding_non_destination", "wachtpatroon bij niet-bestemming"
     if et in DEVIATION_EVENT_TYPES:
         return (10.0 if is_repeat_type else 30.0), et, f"{et} (koers wijst niet meer naar bestemming)"
     if et == "premature_descent":
-        return 25.0, "premature_descent", "vroegtijdige daling"
+        return (8.0 if is_repeat_type else 25.0), "premature_descent", "vroegtijdige daling"
     return 10.0, et, ev.message  # fallback for any future detector type
 
 
@@ -125,7 +147,11 @@ class IncidentManager:
     def open_hexes(self) -> list[str]:
         return list(self._open.keys())
 
-    def _evidence_types_seen(self, incident_id: int) -> set:
+    def _evidence_sources_seen(self, incident_id: int) -> set:
+        """The set of evidence `source` strings already recorded for this
+        incident — NOT the same as detector.py event_types (renamed from
+        _evidence_types_seen, BACKTEST_LOG.md ronde 16, after that naming
+        mismatch caused a real bug, see apply_events below)."""
         return {row["source"] for row in db_module.get_incident_evidence(self.db, incident_id)}
 
     def _apply_delta(self, hex_id: str, now: float, delta: float, source: str, description: str,
@@ -187,8 +213,23 @@ class IncidentManager:
         incident. Returns a list of transition dicts (see _maybe_notify)."""
         transitions = []
         for ev in events:
-            existing_types = self._evidence_types_seen(self._open[hex_id]["id"]) if hex_id in self._open else set()
-            is_repeat = ev.event_type in existing_types
+            existing_sources = self._evidence_sources_seen(self._open[hex_id]["id"]) if hex_id in self._open else set()
+            # is_repeat must compare against the SOURCE string this event
+            # would produce, not ev.event_type directly — they only happen
+            # to be equal for course_deviation/corridor_deviation/
+            # premature_descent/wrong_airport. holding_pattern's source is
+            # "holding_destination"/"holding_non_destination" (depends on
+            # at_destination) and emergency's is one of three squawk/
+            # confidence-dependent strings — comparing ev.event_type against
+            # existing_sources for those silently always evaluated to
+            # False, so holding_pattern/premature_descent's repeat weight
+            # (added this round, BACKTEST_LOG.md ronde 16, to fix unbounded
+            # per-cycle re-scoring of an ongoing hold/descent) never
+            # actually engaged. score_for_event's source choice doesn't
+            # depend on is_repeat_type, so computing it with is_repeat_type=
+            # False first to learn the prospective source is safe/pure.
+            _, prospective_source, _ = score_for_event(ev, False)
+            is_repeat = prospective_source in existing_sources
             delta, source, description = score_for_event(ev, is_repeat)
             inc, old_state, new_state = self._apply_delta(
                 hex_id, now, delta, source, description, ev.confidence,
@@ -253,7 +294,7 @@ class IncidentManager:
             return None
         if inc.get("dest_icao") and nearest["icao"] == inc["dest_icao"]:
             return self._resolve(hex_id, now, CLOSED_NORMAL, "geland op verwachte bestemming")
-        if "wrong_airport" in self._evidence_types_seen(inc["id"]):
+        if "wrong_airport" in self._evidence_sources_seen(inc["id"]):
             return self._resolve(
                 hex_id, now, CLOSED_LANDED,
                 f"geland op {nearest['icao']}, niet de verwachte bestemming — bevestigde diversie",
@@ -285,7 +326,7 @@ class IncidentManager:
         DEVIATION_EVENT_TYPES) is what actually reflects the intent."""
         if ac is None or ac.get("track") is None or ac.get("lat") is None:
             return None
-        evidence_types = self._evidence_types_seen(inc["id"])
+        evidence_types = self._evidence_sources_seen(inc["id"])
         if not evidence_types or (evidence_types - _NON_REINFORCING_SOURCES) - set(DEVIATION_EVENT_TYPES):
             return None  # reinforced by something stronger than a deviation — don't auto-recover
         dest_icao = inc.get("dest_icao")
@@ -310,7 +351,7 @@ class IncidentManager:
         point re-discounting every cycle once already noted."""
         if not hazards or inc.get("last_lat") is None:
             return None
-        if "weather_explains" in self._evidence_types_seen(inc["id"]):
+        if "weather_explains" in self._evidence_sources_seen(inc["id"]):
             return None
         hazard = explain_position(inc["last_lat"], inc["last_lon"], inc.get("last_alt"), hazards)
         if not hazard:
@@ -339,7 +380,7 @@ class IncidentManager:
         return count
 
     def _check_peer_consensus(self, inc: dict, now: float):
-        if "peer_consensus" in self._evidence_types_seen(inc["id"]):
+        if "peer_consensus" in self._evidence_sources_seen(inc["id"]):
             return None
         # -1: peer count already excludes this incident itself, so N-1
         # others in the same cell means N total including this one.

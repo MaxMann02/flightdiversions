@@ -1133,3 +1133,120 @@ which `grep` alone can't catch — `CLOSED_LANDED` WAS referenced in
 `_resolve()` call). The second kind needs either a dedicated regression
 test per terminal state (now done, 10/10 scenarios covering it) or a
 runtime assertion that every state ever gets exercised.
+
+## Round 16 — 2026-08-07 (`/loop` iteration, autonomous overnight) — real-case incident-engine escalation, two live scoring bugs
+
+Followed the queued instruction to build a backtest case that exercises
+`incidents.py` itself (multiple detectors firing in succession for the same
+aircraft, score/state actually escalating), not just `detector.py`'s
+geometry — every existing incident-engine test
+(`check_incident_engine_regressions`) only ever fed it hand-built synthetic
+`Event`s, never a real case's actual detector output replayed over time.
+
+**Chose AI850** (already in the suite) as the vehicle: replaying its real
+track through `detector.py` shows THREE distinct real event_types firing in
+sequence for the same aircraft — `holding_pattern` (~88 times over the
+~90min hold near Delhi), then `emergency`/squawk 7700 (~30 times during the
+MAYDAY), then `wrong_airport` once at the Gwalior landing — exactly the
+multi-detector-escalation shape asked for. Added `incident_mgr`/
+`aircraft_class` parameters to `backtest.py`'s `run_case()` so a real Case's
+samples can drive `IncidentManager.step()` alongside the existing detector
+replay, reusing the exact same orchestration-mirror loop (route resolution,
+`just_took_off`, ground-state timing) rather than duplicating it — fidelity
+to that mirror is the whole point, a second, slightly-different copy would
+defeat it.
+
+**Bug 1 found immediately: `holding_pattern` and `premature_descent` had NO
+repeat-hit dampening**, unlike `course_deviation`/`corridor_deviation`
+(which already only add a smaller top-up on repeats). Every one of
+AI850's ~88 consecutive `holding_pattern` hits added the full +25 —
+reaching BEVESTIGD (and dispatching a Telegram notification) within 3
+MINUTES of the hold first qualifying, regardless of whether the situation
+was actually escalating. Confirmed the same shape independently for
+`premature_descent` via the existing EK225 premature-descent case: 22
+consecutive fires, would also hit CONFIRMED within ~4min of any sustained
+descent, real diversion or not (exactly the EJU3722 "long legitimate TMA
+approach" scenario `MASTERPLAN.md` sectie 12 already flagged as worth
+investigating). Fixed: `incidents.py`'s `score_for_event` now takes
+`is_repeat_type` for these two types the same way it already did for the
+deviation types (~1/3-of-first-hit ratio, matching the established
+convention): holding-at-destination 25→8, holding-elsewhere 35→12,
+premature_descent 25→8.
+
+**Bug 2, more fundamental, found while verifying bug 1's fix actually
+engaged: it didn't, silently.** `apply_events`' `is_repeat` check compared
+`ev.event_type` (e.g. `"holding_pattern"`) against `_evidence_types_seen()`
+— which, despite its name, returns evidence *source* strings (e.g.
+`"holding_destination"`), not event_types. Those only happen to be equal
+for `course_deviation`/`corridor_deviation`/`premature_descent`/
+`wrong_airport`, where `score_for_event` uses the event_type itself as the
+source. `holding_pattern`'s source is one of two at_destination-dependent
+strings, and `emergency`'s is one of three squawk/confidence-dependent
+strings — neither ever equals its event_type, so `is_repeat` silently
+evaluated to `False` every time for those, regardless of history. Bug 1's
+fresh dampening code was correctly written but structurally unreachable for
+the exact case it was meant to fix. Root-caused by literally re-running the
+manual repro after adding the dampening code and seeing the score climb
++25/cycle instead of the expected +8/cycle — would not have been caught by
+`check_incident_engine_regressions`'s existing synthetic scenarios, since
+those only ever feed a SECOND event of the same type by directly calling
+`score_for_event(ev, True)`/`False` rather than letting `apply_events`
+derive `is_repeat` itself.
+
+Fixed by having `apply_events` compute the prospective source via
+`score_for_event(ev, False)` first (source selection doesn't depend on
+`is_repeat_type`, only the delta does, so this is safe/pure) and comparing
+THAT against `existing_sources`, instead of comparing `ev.event_type`
+directly. Also renamed `_evidence_types_seen` → `_evidence_sources_seen`
+(all 4 other call sites updated) — the old name was itself part of what let
+this bug slip through review, since it reads as if it returns event_types.
+
+**Result of both fixes together, re-verified against the real AI850 track:**
+score now climbs +8/cycle after the first hold hit (25, 33, 41, 49, 57 →
+WAARSCHIJNLIJK at +4min, 65, 73, 81, 89 → BEVESTIGD at +8min) instead of
+jumping to BEVESTIGD in 3 cycles flat — a real escalation curve instead of
+an near-instant cliff, while still reaching BEVESTIGD well inside a
+defensible window (a hold sustained ~31min total, well past the existing
+20-cycle destination-hold gate, is still genuinely unusual). The hold-driven
+incident then goes idle once the hold clears (aircraft moves off toward
+Jaipur) and — confirmed against REAL data for the first time, round 15's
+fix was synthetic-only — correctly times out as `GESLOTEN_TIMEOUT` (not
+`GESLOTEN_VALS_ALARM`) since it had already reached BEVESTIGD. A SECOND,
+separate incident then opens ~63min later from the real MAYDAY squawk,
+escalates straight to BEVESTIGD via `emergency_squawk`, and correctly closes
+as `GESLOTEN_GELAND` on the Gwalior landing via `wrong_airport` evidence —
+also round 15's other fix, also exercised against real data for the first
+time. `incidents.py`'s BEVESTIGD-level escalation lands +2h21m before
+AI850's real MAYDAY declaration — the same early-warning property round 1
+found at the raw-detector level now confirmed to survive all the way
+through the incident engine's scoring/state machine.
+
+New `check_incident_engine_real_case_escalation()` in `backtest.py`, run
+against AI850: two distinct incidents open for one aircraft; the hold
+incident accumulates >=4 damped `holding_destination` evidence rows (not
+one jump); peak_score reaches the CONFIRMED threshold and it closes
+`GESLOTEN_TIMEOUT` with the honest resolution reason; the incident is never
+mislabeled `GESLOTEN_VALS_ALARM`; the second incident's evidence includes
+BOTH `emergency_squawk` and `wrong_airport` (real multi-source
+corroboration, not a repeat of one type) and closes `GESLOTEN_GELAND`;
+BEVESTIGD is reached before the real MAYDAY. Also added a structural,
+case-independent invariant check iterating `incidents.REPEATABLE_EVENT_TYPES`
+(now genuinely referenced by code, not just a documentation comment) that
+asserts every declared-repeatable event_type actually scores a repeat hit
+lower than a first hit — guards against a future new detector type being
+added to that tuple without wiring dampening, the exact class of bug 1
+above.
+
+**9/9 cases + all 9 regression-check groups pass** (`python backtest.py`),
+including the new one. Bounded live smoke test (`serve_all.py`,
+`TELEGRAM_BOT_TOKEN=""`/`TELEGRAM_CHAT_ID=""`, ~130s, 3 tier1 cycles,
+~13700-13780 real aircraft tracked per cycle): no exceptions, and a nice
+unplanned confirmation of the round-15 fix on real persisted data — the
+1 open incident reloaded from a prior session was N65440 (the NORDO case
+from round 10/11), which went idle during this run and correctly closed
+`GESLOTEN_TIMEOUT` ("status onbekend, niet bevestigd vals alarm"), not
+`GESLOTEN_VALS_ALARM`, since it carried `notified_state=BEVESTIGD` from
+its original escalation despite having decayed back down to BEWAKING by
+the time it finally crossed the auto-close threshold this run — exactly
+the "honest, don't mislabel a real escalation as nothing" behavior that
+fix exists for.

@@ -65,12 +65,21 @@ def _ac_from_sample(s: Sample, hex_id: str, callsign: str) -> dict:
     }
 
 
-def run_case(case: Case, airport_db: AirportDB, cfg: dict | None = None) -> list:
+def run_case(case: Case, airport_db: AirportDB, cfg: dict | None = None,
+             incident_mgr=None, aircraft_class: str = "AIRLINER") -> list:
     """Replays a case's samples through the real detector functions in the
     same order/state-mutation sequence main.py's tier0/tier1 loops use.
     Returns a list of (t, Event) for every event the detectors raised —
     NOT de-duped by cooldown, since we want to see every raw detector hit,
-    not just what would have cleared the alert cooldown."""
+    not just what would have cleared the alert cooldown.
+
+    incident_mgr: optional incidents.IncidentManager — when given, every
+    cycle's fresh events (plus reassessment when there are none) are also
+    fed through IncidentManager.step(), exactly mirroring how main.py's
+    tier1_loop drives it per aircraft per cycle. Lets a real, sourced Case
+    exercise the incident-lifecycle engine's actual scoring/state machine,
+    not just detector.py's geometry — see check_incident_engine_real_case_
+    escalation (BACKTEST_LOG.md ronde 16)."""
     cfg = cfg or CONFIG
     store = TrackStore()
     origin = airport_db.get(case.origin_icao)
@@ -138,10 +147,12 @@ def run_case(case: Case, airport_db: AirportDB, cfg: dict | None = None) -> list
         # ground (see _early_return_* cases in backtest_cases.py).
         just_took_off = (not ac["on_ground"]) and track.was_on_ground is True
 
+        cycle_events = []
         ev = detect_emergency(track, ac)
         if ev:
-            fired.append((s.t, ev))
-        for ev in evaluate(track, ac, airport_db, cfg, db_conn=None):
+            cycle_events.append(ev)
+        cycle_events.extend(evaluate(track, ac, airport_db, cfg, db_conn=None))
+        for ev in cycle_events:
             fired.append((s.t, ev))
 
         if just_took_off:
@@ -151,6 +162,9 @@ def run_case(case: Case, airport_db: AirportDB, cfg: dict | None = None) -> list
         # evaluate() runs, so detect_landed_wrong_airport sees the PRIOR
         # cycle's ground state when it checks for a fresh landing.
         track.was_on_ground = ac["on_ground"]
+
+        if incident_mgr is not None:
+            incident_mgr.step(case.hex_id, case.callsign, aircraft_class, cycle_events, ac, s.t, hazards=None)
 
     if case.goes_missing and case.samples:
         # Mirrors main.py's tier1_loop: consecutive tier1 cycles absent
@@ -650,6 +664,149 @@ def check_incident_engine_regressions(airport_db: AirportDB) -> bool:
     return all_ok
 
 
+def check_incident_engine_real_case_escalation(airport_db: AirportDB) -> bool:
+    """Runs a real, sourced Case (AI850) through BOTH detector.py's geometry
+    AND incidents.py's scoring/state-machine together, via run_case's
+    incident_mgr hook — every other incident-engine check
+    (check_incident_engine_regressions) only ever feeds it hand-built
+    synthetic Events, never a real case's actual detector output over time.
+    AI850 is a good vehicle specifically because THREE different real
+    detector event_types fire for the same aircraft in sequence
+    (holding_pattern for ~90min, then emergency/squawk 7700, then
+    wrong_airport at landing) — exactly the 'multiple detectors fire in
+    succession for the same aircraft and the score/state must actually
+    escalate' scenario, not just detector.py's geometry in isolation.
+
+    Also doubles as the first REAL-case regression coverage for two bugs
+    fixed via self-review in BACKTEST_LOG.md ronde 15 (GESLOTEN_TIMEOUT/
+    GESLOTEN_GELAND reachability) — round 15's own tests were synthetic.
+
+    Found while building this: holding_pattern (and premature_descent) had
+    no repeat-hit dampening the way course_deviation/corridor_deviation
+    already did — AI850's ~90min sustained hold would otherwise add +25
+    EVERY cycle, hitting BEVESTIGD (and dispatching a Telegram
+    notification) within 3 minutes of first qualifying, for what can be a
+    completely routine extended ATC hold. Fixed in incidents.py this round
+    (score_for_event's holding_pattern/premature_descent branches now take
+    is_repeat_type like the deviation types do) — and found a second, more
+    fundamental bug while wiring the fix in: apply_events compared
+    ev.event_type against evidence *source* strings, which only happens to
+    be equal for course_deviation/corridor_deviation/premature_descent/
+    wrong_airport. holding_pattern's source ('holding_destination'/
+    'holding_non_destination') and emergency's (one of three squawk/
+    confidence-dependent strings) never matched ev.event_type, so is_repeat
+    silently evaluated to False regardless — meaning the fresh dampening
+    code above wouldn't actually have engaged without this second fix
+    either. See incidents.py's apply_events docstring/comment for the fix."""
+    import classify
+    import db as db_module
+    from backtest_cases import _ai850
+    from detector import Event
+    from incidents import REPEATABLE_EVENT_TYPES, IncidentManager, score_for_event
+
+    print("\n=== incident engine real-case escalation check (AI850) ===")
+    all_ok = True
+
+    # Structural invariant, not tied to AI850 specifically: every event_type
+    # declared REPEATABLE must actually score a repeat hit lower than a
+    # first hit — guards against a future detector type being added to
+    # REPEATABLE_EVENT_TYPES without wiring dampening into score_for_event,
+    # the exact bug class this round found for holding_pattern/
+    # premature_descent (see REPEATABLE_EVENT_TYPES's docstring).
+    dampening_ok = True
+    for et in REPEATABLE_EVENT_TYPES:
+        probe = Event(hex="probe", callsign="PROBE", event_type=et, confidence="MOGELIJK",
+                       message="probe", at_destination=True)
+        first_delta, _, _ = score_for_event(probe, False)
+        repeat_delta, _, _ = score_for_event(probe, True)
+        if not (repeat_delta < first_delta):
+            dampening_ok = False
+            print(f"  {et}: repeat delta ({repeat_delta}) not smaller than first-hit delta ({first_delta})")
+    all_ok = all_ok and dampening_ok
+    print(f"  every REPEATABLE_EVENT_TYPES type actually dampens repeat hits: {'OK' if dampening_ok else 'FAIL (see above)'}")
+
+    case = _ai850()
+    conn = db_module.connect(":memory:")
+    cfg = dict(CONFIG)
+    mgr = IncidentManager(conn, cfg, airport_db)
+    run_case(case, airport_db, cfg, incident_mgr=mgr, aircraft_class=classify.AIRLINER)
+
+    rows = conn.execute(
+        f"SELECT {','.join(db_module._INCIDENT_COLS)} FROM incidents WHERE hex = ? ORDER BY id",
+        (case.hex_id,),
+    ).fetchall()
+    incidents_seen = [db_module._incident_row_to_dict(row) for row in rows]
+    ok = len(incidents_seen) == 2
+    all_ok = all_ok and ok
+    print(f"  two distinct incidents opened for this one aircraft (hold-driven, then emergency-driven): "
+          f"{'OK' if ok else f'FAIL (got {len(incidents_seen)})'}")
+    if not ok:
+        return False
+
+    hold_incident, emergency_incident = incidents_seen
+
+    hold_evidence = db_module.get_incident_evidence(conn, hold_incident["id"])
+    hold_sources = [e["source"] for e in hold_evidence]
+    # Damped repeat scoring means the FIRST hold-driven incident should take
+    # several repeat hits (not one giant jump) to cross each threshold —
+    # concretely, more than one 'holding_destination' evidence row before
+    # ever reaching BEVESTIGD requires actual escalation.
+    ok = hold_sources.count("holding_destination") >= 4
+    all_ok = all_ok and ok
+    print(f"  sustained hold contributes multiple damped evidence rows, not one jump "
+          f"({hold_sources.count('holding_destination')} holding_destination rows): {'OK' if ok else 'FAIL'}")
+
+    # peak_score reached BEVESTIGD before the incident eventually went idle
+    # (no more holding evidence once the aircraft leaves the hold) and
+    # timed out — state itself is GESLOTEN_TIMEOUT by the time we read it
+    # back, peak_score is what shows it actually escalated all the way.
+    ok = (hold_incident["peak_score"] >= cfg["incident_score_confirmed_threshold"]
+          and hold_incident["state"] == "GESLOTEN_TIMEOUT"
+          and hold_incident["resolution_reason"] and "eerdere escalatie" in hold_incident["resolution_reason"])
+    all_ok = all_ok and ok
+    print(f"  hold-driven incident escalates all the way to BEVESTIGD (peak_score={hold_incident['peak_score']:.0f}), "
+          f"then times out honestly (state={hold_incident['state']}, reason={hold_incident['resolution_reason']!r}): "
+          f"{'OK' if ok else 'FAIL'}")
+
+    # This incident was never notified as a false alarm — the round-15 fix
+    # (GESLOTEN_TIMEOUT vs GESLOTEN_VALS_ALARM) exercised against real data
+    # for the first time.
+    ok = hold_incident["state"] != "GESLOTEN_VALS_ALARM"
+    all_ok = all_ok and ok
+    print(f"  a real, once-BEVESTIGD incident going idle is NOT mislabeled a false alarm: {'OK' if ok else 'FAIL'}")
+
+    emergency_sources = {e["source"] for e in db_module.get_incident_evidence(conn, emergency_incident["id"])}
+    ok = ("emergency_squawk" in emergency_sources and "wrong_airport" in emergency_sources
+          and emergency_incident["state"] == "GESLOTEN_GELAND")
+    all_ok = all_ok and ok
+    print(f"  second incident (real MAYDAY squawk) escalates via emergency_squawk THEN wrong_airport "
+          f"evidence and closes as a confirmed diversion (state={emergency_incident['state']}): "
+          f"{'OK' if ok else 'FAIL'}")
+
+    # The early-warning property round 1 found for the raw detector
+    # (holding_pattern fires 1h26m before the crew's real divert decision)
+    # should hold at the INCIDENT level too: BEVESTIGD reached well before
+    # AI850's real MAYDAY declaration (t=189min).
+    # Find the ts of the evidence row whose cumulative score first reached
+    # the CONFIRMED threshold — reconstruct cumulative score from deltas.
+    cum = 0.0
+    confirmed_ts = None
+    for row in db_module.get_incident_evidence(conn, hold_incident["id"]):
+        cum += row["delta"]
+        if cum >= cfg["incident_score_confirmed_threshold"]:
+            confirmed_ts = row["ts"]
+            break
+    real_mayday_t = 189 * 60.0
+    ok = confirmed_ts is not None and confirmed_ts < real_mayday_t
+    all_ok = all_ok and ok
+    lead_min = (real_mayday_t - confirmed_ts) / 60.0 if confirmed_ts is not None else None
+    print(f"  incident reaches BEVESTIGD well before the real MAYDAY declaration "
+          f"({fmt_t(real_mayday_t - confirmed_ts) if confirmed_ts is not None else 'n/a'} early): "
+          f"{'OK' if ok else 'FAIL'}")
+
+    return all_ok
+
+
 def check_airspace_regressions(airport_db: AirportDB) -> bool:
     """Standalone smoke test for airspace.py (MASTERPLAN.md sectie 6.1) and
     incidents.py's peer-consensus check (sectie 6.2), both new in
@@ -752,6 +909,7 @@ def main():
     classification_ok = check_classification_regressions()
     route_widening_ok = check_route_widening_regressions()
     incident_engine_ok = check_incident_engine_regressions(airport_db)
+    incident_engine_real_case_ok = check_incident_engine_real_case_escalation(airport_db)
     airspace_ok = check_airspace_regressions(airport_db)
 
     print("\n=== summary ===")
@@ -769,6 +927,7 @@ def main():
     print(f"aircraft classification: {'OK' if classification_ok else 'FAIL — see above'}")
     print(f"route widening (hexdb.io + negative-retry): {'OK' if route_widening_ok else 'FAIL — see above'}")
     print(f"incident engine: {'OK' if incident_engine_ok else 'FAIL — see above'}")
+    print(f"incident engine (real-case escalation, AI850): {'OK' if incident_engine_real_case_ok else 'FAIL — see above'}")
     print(f"airspace (weather + peer-consensus): {'OK' if airspace_ok else 'FAIL — see above'}")
 
 
