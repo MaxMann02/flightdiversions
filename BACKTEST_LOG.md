@@ -1584,3 +1584,63 @@ window to exercise the new code path end-to-end against the real hexdb.io
 API — acceptable given the mocked test covers the logic directly and the
 function it calls (`providers.lookup_route_hexdb`) was already live-
 verified in round 9.
+
+## Round 19 — 2026-08-07 (`/loop` iteration) — course_deviation dead code, live-VM staleness proof
+
+Pulled a fresh live snapshot to apply the same corroboration/plausibility
+analysis to `course_deviation` and `holding_pattern` (round 18's item 2).
+Small samples this pull (9 and 6 events respectively) — one
+`course_deviation` event stood out immediately: SFR325 (FACT->FALA
+resolved) fired with the message "aanhoudende koerswijziging ... (nieuwe
+koers wijst nu wél richting FALA)" — i.e. the message text itself says the
+new heading DOES point toward the filed destination, which should have
+been suppressed by round 8's bow-tolerance fix.
+
+**Traced this to its root rather than assuming a live regression.**
+`detect_course_deviation`'s stage-2 confirmation (`detector.py`) already
+has the real suppression check: `if track.route: ... if angle_diff_deg(
+p_latest.track, bearing_to_dest) <= cfg["corridor_deviation_bow_heading_
+deg"]: return None` (60° by default). The event's message text comes from
+a SEPARATE helper, `_deviation_context`, called immediately after with the
+SAME `p_latest` — but using its OWN hardcoded 30° threshold instead of the
+same config value. Since 30° is a strict subset of "<=60°", any event that
+actually reaches `_deviation_context` (meaning the real check already
+found `angle_diff > 60`) can NEVER also satisfy `< 30` — the "wél richting"
+message branch is mathematically unreachable from the CURRENT code. Seeing
+it on the live dashboard is therefore solid, independent proof the
+deployed VM predates round 8's course_deviation bow-tolerance fix (not a
+bug in this repo) — consistent with, and a second confirmation of, round
+17/18's `/api/incidents` 404 finding that the VM is running stale code.
+
+**Fix: removed the dead branch**, simplifying `_deviation_context` to
+unconditionally describe what's already guaranteed true by the time it
+runs (route known implies heading now points away from the destination —
+that's the only way the caller's suppression check could have let the
+event through). No behavior change (the branch was unreachable either
+way) — purely removes misleading dead code and the inconsistent duplicate
+threshold, with a docstring explaining why this looked live-reachable on
+a first read even though it provably isn't. `python backtest.py`: 9/9 +
+all 11 regression-check groups unaffected (no detection-logic change).
+Bounded live smoke test (`serve_all.py`, `TELEGRAM_BOT_TOKEN=""`/
+`TELEGRAM_CHAT_ID=""`, ~75s): no exceptions; the same ongoing real
+GBODB (squawk 7600/NORDO) emergency from round 18's smoke test is still
+correctly tracked and not re-notifying.
+
+**course_deviation/holding_pattern samples otherwise too small this pull
+for a confident corroboration-rate verdict** (9 and 6 events) — 8/9
+course_deviation events had no resolved route at all (the pre-existing,
+already-acknowledged adsbdb-coverage-gap pattern from round 8's original
+diagnosis, MASTERPLAN.md sectie 1a — not new). `holding_pattern`'s 6
+samples all show a hold reported near a DIFFERENT airport than the filed
+destination (the stronger, non-gated scoring tier) — plausible this is the
+SAME adsbdb-route-mismatch root cause as rounds 16-18 (a plane genuinely
+holding at its TRUE destination, misclassified as a non-destination hold
+purely because the filed destination is wrong), but 6 samples isn't enough
+to act on with the same confidence as round 18's 25-sample wrong_airport
+finding. Left as a concrete, well-scoped next-round target: pull a larger
+holding_pattern sample, check corroboration rate the same way, and if the
+pattern holds, extend round 18's hexdb.io cross-check to holding_pattern's
+non-destination branch specifically (the same architecture already exists
+in `main.py`'s `enrich_events`, this would be a third, analogous
+application of the identical pattern — should be quick once the live
+evidence justifies it).

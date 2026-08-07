@@ -130,12 +130,30 @@ PENDING_HOLD_TOLERANCE_DEG = 35
 
 
 def _deviation_context(track: AircraftTrack, p_latest) -> str:
+    """Only ever called from detect_course_deviation, AFTER its own
+    bow-tolerance suppression check has already passed (see that call
+    site) — which, whenever track.route is set, already guarantees the
+    current heading is more than corridor_deviation_bow_heading_deg away
+    from the bearing to the filed destination (otherwise the event would
+    have been suppressed before ever reaching here). So there's no "but
+    the new heading still points toward the destination" case left to
+    describe by the time this runs.
+
+    Found via live review (BACKTEST_LOG.md ronde 19): the live dashboard
+    showed a course_deviation event with the message "nieuwe koers wijst
+    nu wél richting X" — impossible from the CURRENT code (solid proof the
+    deployed VM predates round 8's bow-tolerance fix for course_deviation,
+    not a bug in this repo), but this function used its OWN separate,
+    inconsistent, hardcoded 30-degree threshold instead of the real check's
+    cfg-driven corridor_deviation_bow_heading_deg (60 by default) — a
+    dead/unreachable branch (any angle < 30 is also <= 60, so the caller's
+    suppression check would already have returned None first) that made
+    the live symptom look, on a first read, like it could still happen
+    from this code. Simplified to just describe what's now unconditionally
+    true instead of re-deriving a check that already ran."""
     if not track.route:
         return ""
     dest = track.route["destination_icao"]
-    new_bearing_to_dest = bearing_deg(p_latest.lat, p_latest.lon, track.route["destination_lat"], track.route["destination_lon"])
-    if angle_diff_deg(p_latest.track, new_bearing_to_dest) < 30:
-        return f" (nieuwe koers wijst nu wél richting {dest})"
     return f" (nieuwe koers wijst niet richting oorspronkelijke bestemming {dest})"
 
 
