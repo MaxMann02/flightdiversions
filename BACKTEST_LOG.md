@@ -2052,3 +2052,31 @@ smoke test (`serve_all.py`, `TELEGRAM_BOT_TOKEN=""`/`TELEGRAM_CHAT_ID=""`,
 test): no exceptions; a different real, live emergency this run (N81051,
 squawk 7600/NORDO) correctly detected, opened straight at BEVESTIGD,
 notified exactly once across several repeated tier0 hits.
+
+**Continued same round — README.md documentation drift.** Reviewed
+`weather.py` and `fr24_confirm.py` (confirmed clean, both small and
+already well-scoped — no changes needed), audited every one of `config.py`'s
+41 `_DEFAULTS` keys for a live reference outside `config.py` itself (grep-
+based, same discipline as round 5 — all 41 referenced, none dead), and
+checked `config.json.example` against `config.py`'s actual defaults
+(intentionally minimal starter template, not a full mirror — not stale,
+working as designed).
+
+Then checked `README.md` — user-facing documentation, arguably more
+important to keep accurate than internal code comments — and found the
+SAME two staleness patterns already fixed internally this session, just
+never propagated to the README's own independent description:
+1. "`/api/incidents` ... nog niet in `Flight Diversions Dashboard.dc.html`
+   verwerkt" — the exact same stale claim round 22's parallel agent found
+   and fixed in `server.py`'s docstring (the dashboard has consumed this
+   endpoint since round 11). Fixed to describe the actual "Active
+   incidents" section.
+2. "Elk event dat `main.py` daadwerkelijk afvuurt (d.w.z. de alert-cooldown
+   doorstaat) wordt opgeslagen" — describes the removed cooldown-gated
+   dispatch model, the same class of staleness found and fixed twice
+   already this session (round 16 in `server.py`, round 24 in `db.py`).
+   Fixed to describe the current unconditional-save + incident-engine-
+   gated-notification model.
+
+No functional code changed — documentation only, no `backtest.py` re-run
+or smoke test needed.

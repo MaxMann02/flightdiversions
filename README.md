@@ -49,8 +49,8 @@ eenmalig-dispatch-systeem; de sectie-1-diagnose daar legt met echte
 productiedata uit waarom dat niet volstond).
 
 `/api/incidents` (naast het bestaande `/api/events`) geeft deze levende
-incidenten inclusief tijdlijn van bewijs — nog niet in
-`Flight Diversions Dashboard.dc.html` verwerkt, wel volledig werkend.
+incidenten inclusief tijdlijn van bewijs — zichtbaar op het dashboard in
+de "Active incidents"-sectie (elke 5s ververst).
 
 Bekende beperking: adsbdb's route-database is betrouwbaar voor
 lijnvluchten (één callsign = één vaste bestemming), maar niet voor kleine
@@ -114,11 +114,13 @@ python server.py
 
 Start een lokale webserver (standaard op poort 8787, aan te passen via de
 env var `DASHBOARD_PORT`) die `Flight Diversions Dashboard.dc.html` serveert
-en een live JSON API (`/api/events`) eronder. De monitor (`main.py`) en de
-dashboard-server zijn losse processen die dezelfde sqlite-database delen —
-je kunt ze onafhankelijk starten en stoppen. Elk event dat `main.py`
-daadwerkelijk afvuurt (d.w.z. de alert-cooldown doorstaat) wordt opgeslagen
-en verschijnt binnen enkele seconden op het dashboard.
+en een live JSON API (`/api/events` + `/api/incidents`) eronder. De monitor
+(`main.py`) en de dashboard-server zijn losse processen die dezelfde
+sqlite-database delen — je kunt ze onafhankelijk starten en stoppen. Elk
+ruwe detector-signaal wordt direct opgeslagen (geen cooldown meer — dat
+was het oude model) en verschijnt binnen enkele seconden op het dashboard
+onder "Recent events"; of een signaal ook een Telegram-melding oplevert
+hangt af van het incident waar het bewijs voor is (zie hierboven).
 
 ## Online hosten (24/7, bereikbaar via een link)
 
