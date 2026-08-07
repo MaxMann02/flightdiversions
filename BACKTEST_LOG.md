@@ -1994,3 +1994,61 @@ imported by `main.py`/`serve_all.py`'s live loops.
 
 Sources: https://www.yahoo.com/news/map-shows-journey-doubling-detours-121711497.html,
 https://www.aol.com/map-shows-journey-doubling-detours-121711740.html
+
+## Round 24 — 2026-08-07 (`/loop` iteration, continued) — falsy-timestamp bug in `TrackStore.update`
+
+Self-review pass over `state.py` (not yet scrutinized this session — a
+second parallel agent was working on `main.py`/`detector.py` at the time,
+so this deliberately covered different files).
+
+**Found a real, if subtle, bug: `ts = ts or time.time()`** in `TrackStore.
+update` (and the identical pattern in `TrackStore.prune`, and in `db.py`'s
+`save_event`/`record_route_observation`) treats an explicitly-passed
+`ts=0.0` the same as "not provided" — `0.0` is falsy in Python, so `or`
+silently substitutes the real wall-clock time instead of the caller's
+actual, intentional `0.0`. Confirmed with a one-line repro: `0.0 or
+time.time()` returns the current epoch timestamp, not `0.0`.
+
+Harmless in live production — `main.py` always passes a real epoch `now`
+value, which is never literally `0.0`. But real for `backtest.py`'s `Case`
+harness: every synthetic track in `backtest_cases.py` starts at `t0 = 0.0`,
+and `run_case` calls `store.update(ac, s.t)` with that exact value for the
+first sample of most cases (confirmed for AI850 specifically) — the
+opening `TrackPoint` of these tracks silently got today's real wall-clock
+time instead of the intended `0.0`.
+
+**No observable effect on any of the 10 current cases** (re-ran `python
+backtest.py` after the fix: all 10 cases' lead times are byte-for-byte
+identical to before) — `HISTORY_MAXLEN=20` means the corrupted first point
+gets evicted from the rolling window well before any of today's detectors
+read a `.ts` difference that spans back to it. Fixed anyway rather than
+left as "harmless today": a future case with fewer samples, or a detector
+that reads an early timestamp difference, would have silently gotten wrong
+results with no error or warning — exactly the kind of latent bug this
+session's own "grep for dangling references after every change" discipline
+exists to catch before it bites, not after.
+
+Fixed all 4 occurrences of the identical `x or default` pattern found via
+grep (`state.py`'s `TrackStore.update`/`prune`, `db.py`'s `save_event`/
+`record_route_observation`) to `x if x is not None else default` — the
+other 3 are currently latent (never actually called with an explicit,
+possibly-falsy value anywhere in this codebase today) rather than
+triggered, fixed anyway to close the whole bug class rather than just the
+one call site that happened to trigger it, matching this session's
+established practice (round 21's generic `airports_same_metro` helper,
+round 17/20's paired origin-exclusion fixes).
+
+**Also fixed a stale docstring found in the same file while at it**:
+`db.py`'s `save_event` still described the pre-round-10 "called at the
+same point the Telegram alert is sent, only once per cooldown window"
+dispatch model — the exact same class of staleness round 16 found and
+fixed in `server.py`'s `FEED_WINDOW_SECONDS` comment, just never applied
+to this second, nearby copy of the same outdated description.
+
+`python -m py_compile state.py db.py`, then `python backtest.py`: 10/10
+cases (all unchanged) + all 15 regression-check groups green. Bounded live
+smoke test (`serve_all.py`, `TELEGRAM_BOT_TOKEN=""`/`TELEGRAM_CHAT_ID=""`,
+~75s, port 8798 to avoid colliding with the parallel agent's own smoke
+test): no exceptions; a different real, live emergency this run (N81051,
+squawk 7600/NORDO) correctly detected, opened straight at BEVESTIGD,
+notified exactly once across several repeated tier0 hits.

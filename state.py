@@ -108,13 +108,28 @@ class TrackStore:
         return t
 
     def update(self, ac: dict, ts: float | None = None) -> AircraftTrack:
-        ts = ts or time.time()
+        # `ts or time.time()` (found via self-review, BACKTEST_LOG.md ronde
+        # 24) is a real bug for a caller that passes ts=0.0 explicitly — 0.0
+        # is falsy, so `or` silently substitutes the real wall-clock time
+        # instead of the caller's actual, intentional timestamp. Harmless in
+        # live production (main.py always passes a real epoch `now`, never
+        # exactly 0.0) but real for backtest.py's Case harness, which builds
+        # every synthetic track starting at t=0.0 — the very FIRST sample of
+        # most cases (e.g. AI850) silently got today's wall-clock time
+        # instead of 0.0 on its opening TrackPoint. `is not None` is the
+        # correct default-substitution check here, same fix applied to the
+        # other 3 occurrences of this exact pattern found in the same pass
+        # (db.py's save_event/record_route_observation, this method's own
+        # prune() below) — those two in db.py are currently never actually
+        # called with an explicit ts, so latent rather than triggered, fixed
+        # anyway to close the whole bug class, not just the triggered instance.
+        ts = ts if ts is not None else time.time()
         t = self.get_or_create(ac["hex"])
         t.add_point(ac, ts)
         return t
 
     def prune(self, now: float | None = None):
-        now = now or time.time()
+        now = now if now is not None else time.time()
         stale = [h for h, t in self.tracks.items() if now - t.last_seen > STALE_AFTER_SECONDS]
         for h in stale:
             del self.tracks[h]

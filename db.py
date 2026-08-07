@@ -126,7 +126,13 @@ def record_route_observation(conn: sqlite3.Connection, callsign: str, origin_ica
     time, independent of adsbdb's static/sometimes-stale mapping."""
     if not callsign or not origin_icao or not destination_icao:
         return
-    ts = ts or time.time()
+    # `is not None`, not `ts or time.time()` — 0.0 is a falsy-but-valid
+    # timestamp; see state.py's TrackStore.update for where this exact
+    # pattern was found to actually bite (BACKTEST_LOG.md ronde 24). Never
+    # actually called with an explicit ts anywhere in this codebase today,
+    # so latent here rather than triggered — fixed anyway to close the
+    # whole bug class, not just the one call site that happened to trigger it.
+    ts = ts if ts is not None else time.time()
     conn.execute(
         "INSERT INTO learned_routes (callsign, origin_icao, destination_icao, times_seen, last_seen) "
         "VALUES (?, ?, ?, 1, ?) "
@@ -162,9 +168,21 @@ def get_top_learned_routes(conn: sqlite3.Connection, limit: int = 20) -> list[di
 
 def save_event(conn: sqlite3.Connection, ev, ts: float | None = None):
     """Persists a detector.Event (or anything with the same attributes) so
-    the dashboard can display it. Called at the same point the Telegram
-    alert is sent, i.e. only once per (hex, event_type) cooldown window."""
-    ts = ts or time.time()
+    the dashboard can display it. Called unconditionally for every raw
+    detector.Event main.py's tier0_loop/tier1_loop produce — NOT gated by
+    a cooldown or tied to Telegram dispatch (that description was stale,
+    describing the pre-round-10 dispatch model; found and fixed alongside
+    a related stale comment in server.py during round 16's self-review —
+    see that file's FEED_WINDOW_SECONDS comment for the full explanation).
+    `events` is a raw, append-only log of every detector hit; de-
+    duplication/escalation happens entirely in the incident engine
+    (incidents.py's notified_state gate), not here."""
+    # `is not None`, not `ts or time.time()` — see state.py's TrackStore.
+    # update for where this exact pattern was found to actually bite
+    # (BACKTEST_LOG.md ronde 24). Never actually called with an explicit ts
+    # anywhere in this codebase today, so latent here rather than
+    # triggered — fixed anyway to close the whole bug class.
+    ts = ts if ts is not None else time.time()
     conn.execute(
         "INSERT INTO events (hex, callsign, event_type, confidence, message, squawk, alt, lat, lon, "
         "origin_icao, dest_icao, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
