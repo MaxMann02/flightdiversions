@@ -14,7 +14,8 @@ import db as db_module
 import incidents
 import providers
 import weather
-from airports import AirportDB, ROUTE_REVALIDATION_WINDOW_S, haversine_nm, route_plausible
+from airports import (AirportDB, ROUTE_REVALIDATION_WINDOW_S, haversine_nm,
+                      route_corroborated_by_progress, route_plausible)
 from config import CONFIG
 from detector import detect_emergency, detect_signal_lost_near_airport, evaluate
 from incidents import IncidentManager
@@ -80,12 +81,27 @@ async def enrich_events(session, cfg: dict, events: list, airport_db=None) -> li
             hexdb_pair = await providers.lookup_route_hexdb(session, ev.callsign)
             if hexdb_pair is not None and hexdb_pair[1] != ev.dest_icao:
                 ev.confidence = "WAARSCHIJNLIJK"
+                # CHECKPOINT.md bevinding 1: ev.confidence alléén was hier
+                # volledig inert — incidents.py's score_for_event las het
+                # buiten de emergency-tak nergens, dus een betwiste landing
+                # kreeg dezelfde 90 punten (en dus BEVESTIGD + 🚨) als een
+                # onbetwiste. De structurele vlag is wat het gewicht echt
+                # verlaagt; ev.confidence blijft staan voor de events-tabel/
+                # dashboard.
+                ev.route_source_disputed = True
                 ev.message += (
                     f" (tweede routebron (hexdb.io) noemt {hexdb_pair[1]} als bestemming i.p.v. "
                     f"{ev.dest_icao} — mogelijk verouderde/foute scheduledata bij de eerste bron)"
                 )
                 log.warning("wrong_airport voor %s: hexdb.io route disagreement (%s vs adsbdb's %s), gedegradeerd",
                             ev.callsign, hexdb_pair[1], ev.dest_icao)
+            elif hexdb_pair is not None:
+                # hexdb.io noemt DEZELFDE bestemming: dat is positieve
+                # corroboratie van de referentiedata, niet slechts "geen
+                # tegenspraak". Zie CHECKPOINT.md bevinding 2 — voor het
+                # hoogste zekerheidsniveau is het verschil tussen
+                # "geverifieerd" en "niemand sprak het tegen" wezenlijk.
+                ev.route_corroborated = True
 
         # Same second-opinion-on-the-REFERENCE-DATA idea as the wrong_airport
         # check above, extended to the other two detectors that depend on
@@ -197,6 +213,13 @@ async def enrich_events(session, cfg: dict, events: list, airport_db=None) -> li
                     )
                     log.warning("%s voor %s: hexdb.io route disagreement (%s vs adsbdb's %s), evidence-gewicht verlaagd",
                                 ev.event_type, ev.callsign, hexdb_pair[1], ev.dest_icao)
+            elif hexdb_pair is not None:
+                # Zelfde bestemming bij een tweede, onafhankelijke bron: dat
+                # is positieve corroboratie van de referentiedata waar deze
+                # detectoren volledig op steunen — zie CHECKPOINT.md bevinding
+                # 2 voor waarom "niemand sprak het tegen" daar niet mee gelijk
+                # staat.
+                ev.route_corroborated = True
 
         # The 'emergency status' ADS-B subfield (nordo/lifeguard/minfuel/...)
         # is a separate, much less reliable signal than the 7700/7600/7500
@@ -408,6 +431,8 @@ async def tier1_loop(session, store: TrackStore, airport_db: AirportDB, incident
                                     route = None
                             t.route = route
                             t.route_resolved_ts = now if route is not None else None
+                            # Nieuwe route = nieuwe, nog onbevestigde aanname.
+                            t.route_corroborated = False
                             # A route-less result only counts as "checked" (i.e.
                             # not retried again THIS cycle) once adsbdb gave a
                             # definitive answer that also isn't due for its
@@ -490,6 +515,36 @@ async def tier1_loop(session, store: TrackStore, airport_db: AirportDB, incident
                         log.info("route voor %s niet meer plausibel gezien huidige positie, losgelaten", track.callsign)
                         track.route = None
                         track.route_checked = False
+                        track.route_corroborated = False
+
+                # Positieve route-corroboratie (CHECKPOINT.md bevinding 2).
+                # route_plausible hierboven filtert alleen ONmogelijke routes
+                # weg — "niet weerlegd" is iets anders dan "bevestigd", en het
+                # verschil is precies waar incidents.py's BEVESTIGD-poort op
+                # steunt. Blijft staan zolang dezelfde route geldt.
+                #
+                # Meet bewust alleen de BESTEMMING (CHECKPOINT.md bevinding 9).
+                # Hier stond eerst ook een tak op track.pending_origin ("wij
+                # zagen het toestel vertrekken vanaf de gefilede origin"), maar
+                # die bevestigt de verkeerde helft: elke route-afhankelijke
+                # detector meet tegen de bestemming, en wrong_airport gaat er
+                # volledig over. Bij het scenario dat deze hele ronde
+                # motiveerde (DLH8NK: gefiled EDDF->LEMG, werkelijk
+                # EDDF->EDDM) klopt de origin juist wél, dus die tak liet hem
+                # ongewijzigd door naar BEVESTIGD. De vroege-terugkeercasus die
+                # hem rechtvaardigde blijkt de route helemaal niet nodig te
+                # hebben en heeft nu een eigen route-onafhankelijke
+                # bewijsbron — zie detector.Event.early_return.
+                if (track.route and not track.route_corroborated and ac.get("lat") is not None
+                        and route_corroborated_by_progress(
+                            track.route["origin_lat"], track.route["origin_lon"],
+                            track.route["destination_lat"], track.route["destination_lon"],
+                            ac["lat"], ac["lon"])):
+                    # We hebben het toestel een substantieel deel van de
+                    # gefilede route zien afleggen richting de gefilede
+                    # bestemming — dat doet een toestel met een verkeerd
+                    # gematchte route niet.
+                    track.route_corroborated = True
 
                 skip_behavioral = (
                     cfg["classification_suppress_non_airliner"]
@@ -540,6 +595,10 @@ async def tier1_loop(session, store: TrackStore, airport_db: AirportDB, incident
                     if not skip:
                         ev = detect_signal_lost_near_airport(t, airport_db, cfg)
                         if ev:
+                            # Stamped here rather than inside the detector:
+                            # this one runs outside evaluate(), which is where
+                            # every other route-dependent Event gets it.
+                            ev.route_corroborated = bool(t.route_corroborated)
                             events_by_hex.setdefault(hex_id, []).append(ev)
 
             all_events = [ev for evs in events_by_hex.values() for ev in evs]
@@ -561,7 +620,8 @@ async def tier1_loop(session, store: TrackStore, airport_db: AirportDB, incident
             # slowly than aircraft positions, cached internally per
             # weather_sigmet_refresh_seconds anyway) and passed synchronously
             # into every step() call this cycle — see incidents.py's
-            # reassess() docstring for why the fetch lives here, not there.
+            # apply_context_checks() docstring for why the fetch lives here,
+            # not there.
             hazards = await airspace.get_active_hazards(session, cfg) if cfg["weather_sigmet_enabled"] else None
 
             transitions = []

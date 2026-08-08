@@ -4,11 +4,10 @@ model. Zie MASTERPLAN.md sectie 3 voor het volledige ontwerp.
 
 STATUS (2026-08-06, zie BACKTEST_LOG.md ronde 10): dit bestand is af en
 zelfstandig getest (zie backtest.py's check_incident_engine_regressions),
-maar NOG NIET aangesloten op main.py/notifier.py/server.py — dat is de
-eerstvolgende stap voor een nieuwe sessie, niet iets dat dit bestand zelf
-nog mist. Zie MASTERPLAN.md sectie 11, fase 3 voor het resterende
-werk (wiring in tier0_loop/tier1_loop, notifier.notify_incident_transition,
-server.py's /api/incidents, dashboard-HTML).
+en is inmiddels — al een aantal rondes — ook daadwerkelijk aangesloten op
+main.py's tier0_loop/tier1_loop, notifier.notify_incident_transition en
+server.py. Zie MASTERPLAN.md sectie 11, fase 3 voor hoe die aansluiting is
+uitgevoerd.
 
 Kernidee: een Event van detector.py is geen melding meer, het is EVIDENCE
 voor een (mogelijk al bestaand) Incident voor dat vliegtuig. Elke
@@ -66,6 +65,12 @@ DEVIATION_EVENT_TYPES = ("course_deviation", "corridor_deviation")
 # sectie 12, a long-but-legitimate TMA approach). Repeat weights below use
 # the same ~1/3-of-first-hit ratio already established for
 # DEVIATION_EVENT_TYPES.
+#
+# Deze demping vertraagt een divergerende reeks alleen, ze begrenst hem
+# niet: een vaste breuk van het eerste gewicht blijft bij herhaling
+# onbeperkt optellen. Wat de bijdrage per bron daadwerkelijk begrenst is
+# _SOURCE_SCORE_CAP, verderop in dit bestand — zie CHECKPOINT.md
+# bevinding 3.
 REPEATABLE_EVENT_TYPES = DEVIATION_EVENT_TYPES + ("holding_pattern", "premature_descent")
 
 # Evidence sources that are themselves negative-only/context, never a sign
@@ -74,42 +79,148 @@ REPEATABLE_EVENT_TYPES = DEVIATION_EVENT_TYPES + ("holding_pattern", "premature_
 # test so a PRIOR recovery (or a weather/peer-consensus note) doesn't
 # permanently disable recovery detection for the rest of the incident's
 # life. See that method's docstring / BACKTEST_LOG.md ronde 15.
-_NON_REINFORCING_SOURCES = {"deviation_resolved", "weather_explains", "peer_consensus"}
+_NON_REINFORCING_SOURCES = {"deviation_resolved", "weather_explains", "peer_consensus",
+                            "route_corroborated"}
 
-# BEVESTIGD ('CONFIRMED') should mean something close to certain — but
-# REPEATABLE_EVENT_TYPES lets a single provisional signal keep re-scoring
-# for as long as the underlying condition persists, and _state_for_score is
-# purely a score-vs-threshold check with no notion of WHERE that score came
-# from. For course_deviation/corridor_deviation specifically, that's a real
-# gap: a real, live report (2026-08-07) showed an incident reach BEVESTIGD
-# from repeated premature_descent hits alone, off a filed destination that
-# turned out to be wrong (see main.py's enrich_events geometry cross-check,
-# which now suppresses THAT specific failure mode) — and the same math
-# applies just as easily to a sustained course/corridor deviation: the
-# bow-tolerance check only asks "does the CURRENT heading still point at
-# the destination", not "is there an ordinary explanation for pointing away
-# this long" — and a long, deliberate reroute around contested/restricted
-# airspace or adverse weather is exactly such an explanation, at ANY
-# duration, purely at cruise altitude with no descent or other corroborating
-# sign. So: course_deviation/corridor_deviation evidence ALONE, no matter
-# how many times it repeats, cannot carry an incident to BEVESTIGD — it
-# needs corroboration from some OTHER kind of evidence (a concurrent
-# descent, a hold, a landing, an emergency squawk — anything genuinely
-# independent), which is a real qualitative difference, not just "it kept
-# happening longer".
+# Alle bronnamen die score_for_event voor een wrong_airport-Event kan
+# produceren (vol vertrouwen / betwiste routebron / onbevestigde grondstatus).
+# _check_landed test hierop om een echte diversie als GESLOTEN_GELAND af te
+# sluiten in plaats van hem te laten wegvervallen — zie CHECKPOINT.md
+# bevinding 1.
+_WRONG_AIRPORT_SOURCES = {"wrong_airport", "wrong_airport_disputed", "wrong_airport_unconfirmed",
+                          "wrong_airport_early_return"}
+
+# Bronnen waarvan de WAARNEMING zelf niet van de gefilede route afhangt, en die
+# daarom als enige geen route-corroboratie nodig hebben om BEVESTIGD te halen
+# (zie _confirmed_bar_met punt 1):
 #
-# Deliberately NOT extended to holding_pattern or premature_descent: unlike
-# a deviation that can persist indefinitely for entirely routine reasons,
-# both already gate their FIRST event behind a precondition that is itself
-# already extreme — holding_pattern_destination_min_streak's 20+-cycle
-# sustained tight loiter, and (as of this round) premature_descent's own
-# geometry cross-check against a second route source. See the real AI850
-# case (BACKTEST_LOG.md, check_incident_engine_real_case_escalation): a
-# genuine 1hr+ abnormal hold escalating to BEVESTIGD on holding_pattern
-# evidence alone is the correct, desired outcome there, not the failure
-# mode this guards against — a blanket "no provisional type may ever reach
-# BEVESTIGD alone" rule would have broken that already-validated real case.
-_DEVIATION_ONLY_SOURCES = set(DEVIATION_EVENT_TYPES)
+#  - emergency_squawk: een bewuste 4-cijferige piloothandeling. Geen
+#    datakwaliteits- of routine-operatieverklaring produceert die, en welke
+#    bestemming er gefiled staat doet er niet aan toe.
+#  - wrong_airport_early_return: wij hebben dit toestel zelf zien opstijgen van
+#    luchthaven X en binnen early_return_max_minutes weer zien landen op
+#    diezelfde luchthaven X. Beide uiteinden zijn onze eigen waarneming, de
+#    gefilede bestemming komt er niet in voor, en een toestel dat kort na
+#    vertrek terugkeert is abnormaal ongeacht waar het volgens de schedule heen
+#    zou gaan. Zie CHECKPOINT.md bevinding 9 voor waarom dit een eigen bron is
+#    en niet (zoals eerst) via route-corroboratie liep: "wij zagen het
+#    vertrekken vanaf de gefilede origin" bevestigt de VERTREKhelft van de
+#    route, terwijl wrong_airport volledig over de BESTEMMING gaat — dat liet
+#    precies het DLH8NK-scenario (kloppende origin, foute bestemming) weer door.
+_ROUTE_INDEPENDENT_SOURCES = {"emergency_squawk", "wrong_airport_early_return"}
+
+# ---------------------------------------------------------------------------
+# Bewijs-DIMENSIES (CHECKPOINT.md bevinding 4)
+#
+# De oude opzet telde deltas van verschillende `source`-strings zonder meer bij
+# elkaar op en behandelde dat als onafhankelijke corroboratie. Dat klopt niet:
+# op detect_emergency na meet ELKE detector tegen track.route["destination_*"].
+# Eén foute gefilede bestemming laat corridor_deviation, premature_descent,
+# holding_pattern, signal_lost_near_airport én wrong_airport tegelijk afgaan —
+# dan lijken vijf detectoren het eens, terwijl het één fout is die vijf keer
+# wordt waargenomen. Optellen van bewijs veronderstelt conditionele
+# onafhankelijkheid; hier is er één alternatieve hypothese ("de route klopt
+# niet") die alle waarnemingen tegelijk voorspelt, dus meer detectoren maken
+# die hypothese niet onwaarschijnlijker.
+#
+# Een dimensie is de SOORT abnormaliteit. Twee evidence-rijen in dezelfde
+# dimensie zijn dezelfde waarneming die zich herhaalt of vanuit een tweede hoek
+# gezien wordt (course_deviation en corridor_deviation zijn letterlijk twee
+# metingen van dezelfde laterale afwijking), geen onafhankelijke corroboratie.
+DIM_DECLARED = "declared"          # bewuste piloot-/ATC-handeling (squawk/statusveld)
+DIM_GROUND_TRUTH = "ground_truth"  # fysiek waargenomen aan de grond, ergens anders
+DIM_VANISHED = "vanished"          # afgeleide landing uit signaalverlies
+DIM_VERTICAL = "vertical"          # hoogteprofiel klopt niet met de bestemming
+DIM_LATERAL = "lateral"            # laterale koers-/corridorafwijking
+DIM_LOITER = "loiter"              # wachtpatroon
+
+_DIMENSION_FOR_SOURCE = {
+    "emergency_squawk": DIM_DECLARED,
+    "emergency_status": DIM_DECLARED,
+    "emergency_status_low_trust": DIM_DECLARED,
+    "wrong_airport": DIM_GROUND_TRUTH,
+    "wrong_airport_disputed": DIM_GROUND_TRUTH,
+    "wrong_airport_unconfirmed": DIM_GROUND_TRUTH,
+    "wrong_airport_early_return": DIM_GROUND_TRUTH,
+    "signal_lost": DIM_VANISHED,
+    "signal_lost_disputed": DIM_VANISHED,
+    "premature_descent": DIM_VERTICAL,
+    "premature_descent_disputed": DIM_VERTICAL,
+    "course_deviation": DIM_LATERAL,
+    "corridor_deviation": DIM_LATERAL,
+    "holding_destination": DIM_LOITER,
+    "holding_non_destination": DIM_LOITER,
+}
+# Dimensies die "één soort abnormaliteit" vertegenwoordigen: twee daarvan
+# tegelijk is het kwalitatieve verschil dat _confirmed_bar_met zoekt. DECLARED
+# staat er bewust NIET in — zie punt 1/5 van _confirmed_bar_met.
+_SOFT_DIMENSIONS = {DIM_VANISHED, DIM_VERTICAL, DIM_LATERAL, DIM_LOITER}
+
+# Dimensies die een actieve weers-/luchtruimverklaring of een gedeelde
+# regionale oorzaak daadwerkelijk kán verklaren: eromheen vliegen en wachten.
+# NIET een waargenomen landing elders (slecht weer is juist de meest
+# voorkomende oorzaak van een ECHTE diversie — daar de zekerheid van verlagen
+# is precies verkeerd om), niet een noodsquawk, en niet een aanhoudende daling
+# ver van de bestemming. Zie CHECKPOINT.md bevinding 6.
+_BENIGN_EXPLAINABLE_DIMENSIONS = {DIM_LATERAL, DIM_LOITER}
+_BENIGN_EXPLANATION_SOURCES = {"weather_explains", "peer_consensus"}
+
+# ---------------------------------------------------------------------------
+# Verzadigingsplafonds per bewijsbron (CHECKPOINT.md bevinding 3 en 8)
+#
+# Maximale TOTALE bijdrage van één bewijsbron aan één incident.
+#
+# Herhaling van hetzelfde signaal sluit RUIS uit (een enkele foute fix, een
+# decodeglitch, één ATC-vector) maar niet de SYSTEMATISCHE onschuldige
+# verklaringen (verouderde routedata, weersomleiding, ATC-vertraging, normale
+# aankomstsequencing) — die voorspellen juist dat het signaal blíjft. Een score
+# die met herhaling onbeperkt doorgroeit, groeit dus door in een richting waar
+# het bewijs niet heen wijst.
+#
+# De oude REPEATABLE_EVENT_TYPES-demping (ronde 16) erkende dit maar loste het
+# niet op: een vaste breuk (~1/3) vertraagt een divergerende reeks, ze
+# convergeert er niet van. De enige rem was incident_score_max (150), ruim BOVEN
+# de BEVESTIGD-drempel (85), zodat aanhouden alléén de top haalde:
+# holding_non_destination in 6 cycli (~6 min), premature_descent in 9,
+# emergency_status in 3, en zelfs het als decodeartefact gedocumenteerde
+# emergency_status_low_trust in 11. Nu convergeert elke bron naar een eigen
+# plafond in plaats van te divergeren.
+#
+# Elk plafond op een provisionele bron ligt ONDER
+# incident_score_confirmed_threshold (85): volgehouden enkelvoudig bewijs komt
+# uit op WAARSCHIJNLIJK — dat notificeert al (zie _maybe_notify), dus dit kost
+# vrijwel geen meldingen en maakt alleen het hoogste label weer betekenisvol.
+# Alleen emergency_squawk (bewuste 4-cijferige piloothandeling) en
+# wrong_airport (fysiek waargenomen landing) liggen erboven; die twee worden
+# apart begrensd door _confirmed_bar_met.
+_SOURCE_SCORE_CAP = {
+    # Een echte 7700/7600/7500 moet onmiddellijk én blijvend BEVESTIGD zijn.
+    "emergency_squawk":            150.0,
+    # Precies de WAARSCHIJNLIJK-drempel: een volgehouden, cross-provider-
+    # bevestigd emergency-statusveld op een discrete squawk is een melding
+    # waard, maar het statusveld is live onbetrouwbaar gebleken (MASTERPLAN
+    # sectie 1c/7) en is zonder squawk of ander bewijs geen bevestiging.
+    "emergency_status":             55.0,
+    # Bewust nét onder de MOGELIJK-drempel (25): het gedocumenteerde
+    # conspicuity-squawk-decodeartefact (AUA96J/AUA12K/CFG6UA) komt in zijn
+    # eentje niet eens op het dashboard, maar draagt nog wel bij aan een
+    # incident dat ander bewijs heeft.
+    "emergency_status_low_trust":   24.0,
+    "wrong_airport":                90.0,
+    "wrong_airport_disputed":       30.0,
+    "wrong_airport_unconfirmed":    25.0,
+    "wrong_airport_early_return":   90.0,
+    "signal_lost":                  40.0,
+    "signal_lost_disputed":         13.0,
+    "premature_descent":            60.0,
+    "premature_descent_disputed":   16.0,
+    "course_deviation":             55.0,
+    "corridor_deviation":           55.0,
+    "holding_destination":          65.0,
+    "holding_non_destination":      70.0,
+}
+# Onbekende (toekomstige) bron: conservatief onder de WAARSCHIJNLIJK-drempel.
+_DEFAULT_SOURCE_SCORE_CAP = 40.0
 
 
 def _state_for_score(score: float, cfg: dict) -> str:
@@ -141,6 +252,39 @@ def score_for_event(ev, is_repeat_type: bool) -> tuple[float, str, str]:
             return 8.0, "emergency_status_low_trust", "emergency-status (laag vertrouwen — conspicuity-squawk of niet bevestigd)"
         return 35.0, "emergency_status", "emergency-status op discrete squawk"
     if et == "wrong_airport":
+        # CHECKPOINT.md bevinding 1: main.py's enrich_events kende voor
+        # wrong_airport al twee vetos, maar allebei zetten ze alléén
+        # ev.confidence — en deze functie las ev.confidence buiten de
+        # emergency-tak nergens. Beide vetos waren daardoor volledig inert:
+        # een betwiste landing kreeg dezelfde 90 punten (>= de BEVESTIGD-
+        # drempel van 85) als een onbetwiste, inclusief 🚨-Telegram. Ronde 24
+        # schreef die observatie ("only `emergency` does") wel op voor
+        # premature_descent/signal_lost, maar trok de conclusie niet door naar
+        # wrong_airport's eigen, al bestaande degradatie.
+        if ev.early_return:
+            # Zelf waargenomen opstijgen van X en binnen
+            # early_return_max_minutes weer landen op X — zie
+            # _ROUTE_INDEPENDENT_SOURCES en detector.Event.early_return. Vol
+            # gewicht, en de enige wrong_airport-variant die zonder
+            # bestemmingscorroboratie mag bevestigen, omdat de waarneming de
+            # gefilede bestemming helemaal niet gebruikt. Vóór de
+            # route_source_disputed-tak: hexdb.io's mening over de BESTEMMING
+            # is niet relevant voor een gebeurtenis die zich volledig op het
+            # VERTREKveld afspeelt.
+            return 90.0, "wrong_airport_early_return", "kort na vertrek teruggekeerd naar het zelf waargenomen vertrekveld"
+        if ev.route_source_disputed:
+            # Tweede routebron (hexdb.io) noemt een ANDERE bestemming: dan is
+            # niet de landing verdacht maar de referentie waartegen we hem
+            # afmeten. ~1/3 van het normale gewicht, dezelfde dempingsratio
+            # als signal_lost_disputed/premature_descent_disputed.
+            return 30.0, "wrong_airport_disputed", "geland op onverwachte luchthaven (tweede routebron betwist de bestemming)"
+        if ev.confidence != "BEVESTIGD":
+            # De tweede ADS-B-provider bevestigde de grondstatus niet: hier is
+            # de WAARNEMING zelf betwist (staat dit toestel hier echt aan de
+            # grond), niet de referentiedata. Zwaarder gedempt dan een
+            # betwiste route — zonder betrouwbare grondwaarneming is er
+            # helemaal geen "geland"-feit meer om te interpreteren.
+            return 25.0, "wrong_airport_unconfirmed", "geland op onverwachte luchthaven (grondstatus niet bevestigd door tweede bron)"
         return 90.0, "wrong_airport", "geland op onverwachte luchthaven"
     if et == "signal_lost_near_airport":
         if ev.route_source_disputed:
@@ -209,44 +353,178 @@ class IncidentManager:
         mismatch caused a real bug, see apply_events below)."""
         return {row["source"] for row in db_module.get_incident_evidence(self.db, incident_id)}
 
-    def _confirmed_bar_met(self, incident_id: int | None, current_source: str | None = None) -> bool:
-        """False when every piece of reinforcing evidence this incident has
-        (including current_source, about to be recorded but not yet
-        persisted — same not-yet-persisted timing as is_repeat's lookup in
-        apply_events) is a course_deviation/corridor_deviation hit — see
-        _DEVIATION_ONLY_SOURCES' docstring above for why that specific
-        combination isn't trusted to reach BEVESTIGD by repetition alone."""
+    def _evidence_dimensions(self, sources: set) -> set:
+        """De verzameling bewijs-DIMENSIES achter een verzameling
+        bronnamen — zie _DIMENSION_FOR_SOURCE. Niet-bezwarende bronnen
+        (herstel, weer, peer-consensus, route-corroboratie) tellen niet mee."""
+        reinforcing = sources - _NON_REINFORCING_SOURCES
+        return {_DIMENSION_FOR_SOURCE.get(s, s) for s in reinforcing}
+
+    def _evidence_within_dimensions(self, incident_id: int, dims: set) -> bool:
+        """True als ALLE bezwarende evidence van dit incident binnen `dims`
+        valt. Gebruikt om een benigne verklaring (weer/peer-consensus) alleen
+        toe te passen op bewijs dat zij daadwerkelijk kán verklaren."""
+        own = self._evidence_dimensions(self._evidence_sources_seen(incident_id))
+        return bool(own) and own.issubset(dims)
+
+    def _confirmed_bar_met(self, incident_id: int | None, current_source: str | None = None,
+                            route_corroborated_now: bool = False) -> bool:
+        """Of dit incident BEVESTIGD MAG heten, los van of de score de drempel
+        haalt. BEVESTIGD betekent in dit systeem: er blijft geen redelijke
+        alternatieve verklaring meer over voor wat we waarnemen. Dat is een
+        uitspraak over de STRUCTUUR van het bewijs, niet over de hoogte van
+        een som — de som weet immers niet waar hij vandaan komt.
+
+        De alternatieve verklaringen die daadwerkelijk uitgesloten moeten
+        worden, en wat elk ervan uitsluit:
+
+          - sensorruis / decodeartefact          -> herhaling (zit al in de
+            score, en convergeert nu netjes via _SOURCE_SCORE_CAP);
+          - de gefilede route is verouderd/fout  -> route-corroboratie
+            (punt 2 hieronder). Dit is bij dit systeem niet theoretisch maar
+            de GEMETEN hoofdfoutbron: 24/25 live wrong_airport/BEVESTIGD-hits
+            zonder corroboratie (ronde 18) en 6/8 hexdb-lookups die een andere
+            bestemming noemden (ronde 24);
+          - weers-/luchtruimomleiding, ATC-vertraging, normale
+            aankomstsequencing -> bewijs in meer dan één dimensie (punt 5) en
+            geen actieve benigne verklaring (punt 3).
+
+        current_source: de bron die op het punt staat weggeschreven te worden
+        maar nog niet persistent is — zelfde not-yet-persisted timing als
+        is_repeat's lookup in apply_events."""
         sources = self._evidence_sources_seen(incident_id) if incident_id is not None else set()
         if current_source is not None:
             sources = sources | {current_source}
         reinforcing = sources - _NON_REINFORCING_SOURCES
-        return not reinforcing or not reinforcing.issubset(_DEVIATION_ONLY_SOURCES)
+        if not reinforcing:
+            return False
 
-    def _resolve_state(self, incident_id: int | None, score: float, current_source: str | None = None) -> str:
+        # 1. Bewijs waarvan de waarneming zelf niet van de gefilede route
+        #    afhangt (noodsquawk, of een zelf waargenomen vroege terugkeer
+        #    naar hetzelfde vertrekveld) hoeft door niets anders gesteund te
+        #    worden — zie _ROUTE_INDEPENDENT_SOURCES. Bewust getest op
+        #    BRONNAAM en niet op DIM_DECLARED: het losse ADS-B emergency-
+        #    STATUSVELD (emergency_status*) is live onbetrouwbaar gebleken
+        #    (MASTERPLAN sectie 1c/7) en mag deze poort niet in zijn eentje
+        #    openen — precies het onderscheid dat dit project sinds ronde 7
+        #    verdedigt.
+        if reinforcing & _ROUTE_INDEPENDENT_SOURCES:
+            return True
+
+        # 2. Al het overige bewijs is een gevolgtrekking TEN OPZICHTE VAN de
+        #    gefilede route. Zolang die route alleen op één crowdsourced
+        #    schedulebron rust, is "de route klopt niet" niet uitgesloten — en
+        #    die ene hypothese verklaart in één klap élk route-afhankelijk
+        #    signaal tegelijk, dus meer detectoren maken haar niet
+        #    onwaarschijnlijker. Zie CHECKPOINT.md bevinding 2/4.
+        if not (route_corroborated_now or "route_corroborated" in sources):
+            return False
+
+        dims = self._evidence_dimensions(sources)
+
+        # 3. Een benigne verklaring (actief SIGMET/CWA/TFR op deze positie, of
+        #    meerdere toestellen die tegelijk hetzelfde doen) verloopt niet:
+        #    zolang het bewijs binnen de dimensies valt die zij verklaart,
+        #    blijft zij een redelijk alternatief — hoe lang het gedrag ook
+        #    aanhoudt. Grondbewijs valt daarbuiten: een landing elders wordt
+        #    door weersvermijding niet verklaard.
+        if (sources & _BENIGN_EXPLANATION_SOURCES) and DIM_GROUND_TRUTH not in dims:
+            return False
+
+        # 4. Een waargenomen landing op een andere dan de (nu gecorroboreerde)
+        #    gefilede bestemming is fysiek grondbewijs — dat ís de diversie.
+        if DIM_GROUND_TRUTH in dims:
+            return True
+
+        # 5. Anders: minstens twee wezenlijk verschillende soorten
+        #    abnormaliteit. Eén soort, hoe lang ook volgehouden, blijft
+        #    verenigbaar met een gewone operationele verklaring — herhaling
+        #    sluit ruis uit, geen systematische oorzaak.
+        return len(dims & _SOFT_DIMENSIONS) >= 2
+
+    def _resolve_state(self, incident_id: int | None, score: float, current_source: str | None = None,
+                        route_corroborated_now: bool = False) -> str:
         """_state_for_score's raw threshold state, capped at WAARSCHIJNLIJK
         when it would otherwise read BEVESTIGD but _confirmed_bar_met says
         the evidence behind that score doesn't actually earn it yet. Score/
         decay/notification bookkeeping elsewhere is untouched — only what
         state gets exposed and notified changes."""
         state = _state_for_score(score, self.cfg)
-        if state == CONFIRMED and not self._confirmed_bar_met(incident_id, current_source):
+        if state == CONFIRMED and not self._confirmed_bar_met(incident_id, current_source, route_corroborated_now):
             return LIKELY
         return state
+
+    def _source_contrib(self, inc: dict) -> dict:
+        """Per-bron lopende bijdrage aan de HUIDIGE score van dit incident
+        (CHECKPOINT.md bevinding 3). Invariant: de score die aan bron S toe te
+        schrijven is, is nooit groter dan _SOURCE_SCORE_CAP[S].
+
+        Bij het herladen van een incident uit de DB (procesherstart) wordt dit
+        conservatief gereconstrueerd als min(cap, som van alle positieve
+        deltas van die bron) — dat kan de resterende ruimte onderschatten als
+        er sinds die deltas verval is opgetreden, wat de veilige kant is."""
+        contrib = inc.get("source_contrib")
+        if contrib is None:
+            contrib = {}
+            for row in db_module.get_incident_evidence(self.db, inc["id"]):
+                if row["delta"] and row["delta"] > 0:
+                    contrib[row["source"]] = contrib.get(row["source"], 0.0) + row["delta"]
+            for src in contrib:
+                contrib[src] = min(contrib[src], _SOURCE_SCORE_CAP.get(src, _DEFAULT_SOURCE_SCORE_CAP))
+            inc["source_contrib"] = contrib
+        return contrib
+
+    def _record_route_corroboration(self, inc: dict, now: float, route_corroborated: bool):
+        """Legt eenmalig vast dat de gefilede route achter dit incident
+        onafhankelijk bevestigd is. Delta 0.0 en opgenomen in
+        _NON_REINFORCING_SOURCES: het is context die de BEVESTIGD-poort
+        ontgrendelt, geen bezwarend bewijs dat de score verhoogt."""
+        if not route_corroborated:
+            return
+        if "route_corroborated" in self._evidence_sources_seen(inc["id"]):
+            return
+        db_module.add_incident_evidence(
+            self.db, inc["id"], now, "route_corroborated", 0.0,
+            "route onafhankelijk bevestigd (eigen waargenomen vertrek/voortgang of tweede routebron)", None,
+        )
+
+    def _cap_delta(self, inc: dict | None, delta: float, source: str) -> float:
+        """Kapt `delta` af op de resterende ruimte onder deze bron z'n
+        verzadigingsplafond, en boekt de toegekende bijdrage bij. Een
+        afgekapte delta van 0.0 levert nog steeds een evidence-rij op — de
+        tijdlijn moet blijven laten zien DAT het signaal aanhoudt, ook als het
+        de zekerheid niet meer verhoogt."""
+        if delta <= 0:
+            return delta
+        cap = _SOURCE_SCORE_CAP.get(source, _DEFAULT_SOURCE_SCORE_CAP)
+        contrib = self._source_contrib(inc) if inc is not None else {}
+        granted = min(delta, max(0.0, cap - contrib.get(source, 0.0)))
+        contrib[source] = contrib.get(source, 0.0) + granted
+        return granted
 
     def _apply_delta(self, hex_id: str, now: float, delta: float, source: str, description: str,
                       detector_confidence: str | None, callsign: str = "", aircraft_class: str | None = None,
                       origin_icao: str | None = None, dest_icao: str | None = None,
                       lat: float | None = None, lon: float | None = None, alt: float | None = None,
-                      squawk: str | None = None) -> tuple[dict, str | None, str]:
+                      squawk: str | None = None,
+                      route_corroborated: bool = False) -> tuple[dict, str | None, str]:
         """Core mutation: find-or-create the open incident for hex_id, add
         one evidence row, recompute score/state, persist, return
         (incident, old_state_or_None, new_state) — old_state is None for a
-        brand-new incident."""
+        brand-new incident.
+
+        route_corroborated: of de gefilede route achter dit bewijs
+        onafhankelijk bevestigd is (zie detector.Event.route_corroborated).
+        Wordt eenmalig als evidence-rij met delta 0.0 vastgelegd, zodat de
+        vaststelling persistent en zichtbaar in de tijdlijn is zonder
+        schemawijziging, en meegewogen in _confirmed_bar_met."""
         inc = self._open.get(hex_id)
         old_state = None
         if inc is None:
+            delta = self._cap_delta(None, delta, source)
             initial_score = max(0.0, min(self.cfg.get("incident_score_max", 150), delta))
-            state = self._resolve_state(None, initial_score, current_source=source)
+            state = self._resolve_state(None, initial_score, current_source=source,
+                                        route_corroborated_now=route_corroborated)
             incident_id = db_module.create_incident(self.db, hex_id, callsign, state, initial_score, now, aircraft_class)
             inc = {
                 "id": incident_id, "hex": hex_id, "callsign": callsign, "state": state,
@@ -255,14 +533,19 @@ class IncidentManager:
                 "origin_icao": None, "dest_icao": None, "last_lat": None, "last_lon": None,
                 "last_alt": None, "last_squawk": None, "aircraft_class": aircraft_class,
                 "notified_state": None,
+                "source_contrib": {source: max(0.0, delta)},
             }
             self._open[hex_id] = inc
+            self._record_route_corroboration(inc, now, route_corroborated)
         else:
             old_state = inc["state"]
+            self._record_route_corroboration(inc, now, route_corroborated)
+            delta = self._cap_delta(inc, delta, source)
             inc["score"] = max(0.0, min(self.cfg.get("incident_score_max", 150), inc["score"] + delta))
             inc["peak_score"] = max(inc["peak_score"], inc["score"])
             inc["last_evidence_ts"] = now
-            inc["state"] = self._resolve_state(inc["id"], inc["score"], current_source=source)
+            inc["state"] = self._resolve_state(inc["id"], inc["score"], current_source=source,
+                                               route_corroborated_now=route_corroborated)
 
         inc["callsign"] = callsign or inc.get("callsign")
         if origin_icao:
@@ -315,6 +598,7 @@ class IncidentManager:
                 callsign=callsign, aircraft_class=aircraft_class,
                 origin_icao=ev.origin_icao, dest_icao=ev.dest_icao,
                 lat=ev.lat, lon=ev.lon, alt=ev.alt, squawk=ev.squawk,
+                route_corroborated=getattr(ev, "route_corroborated", False),
             )
             t = self._maybe_notify(inc, old_state, new_state, now)
             if t:
@@ -373,7 +657,7 @@ class IncidentManager:
             return None
         if inc.get("dest_icao") and nearest["icao"] == inc["dest_icao"]:
             return self._resolve(hex_id, now, CLOSED_NORMAL, "geland op verwachte bestemming")
-        if "wrong_airport" in self._evidence_sources_seen(inc["id"]):
+        if _WRONG_AIRPORT_SOURCES & self._evidence_sources_seen(inc["id"]):
             return self._resolve(
                 hex_id, now, CLOSED_LANDED,
                 f"geland op {nearest['icao']}, niet de verwachte bestemming — bevestigde diversie",
@@ -427,10 +711,25 @@ class IncidentManager:
         an active SIGMET/CWA hazard polygon at a matching altitude is
         probably routine weather-avoidance, not a real diversion. Applied
         at most once per incident (checking evidence_types_seen) — no
-        point re-discounting every cycle once already noted."""
+        point re-discounting every cycle once already noted.
+
+        Scoped to _BENIGN_EXPLAINABLE_DIMENSIONS as of CHECKPOINT.md
+        bevinding 6. It used to apply to ANY incident whose last position
+        happened to fall inside a hazard polygon, regardless of what
+        evidence that incident carried. That is wrong in the one direction
+        that matters most: an incident carrying wrong_airport evidence (the
+        aircraft is physically on the ground at another airport) got -50 and
+        dropped from BEVESTIGD to MOGELIJK — but bad weather does not
+        explain landing somewhere else, it is the single most common cause
+        of a REAL diversion. The check was lowering confidence in exactly
+        the case it should have raised it. What weather-avoidance does
+        explain is flying around something and waiting, i.e. the lateral and
+        loiter dimensions — nothing else."""
         if not hazards or inc.get("last_lat") is None:
             return None
         if "weather_explains" in self._evidence_sources_seen(inc["id"]):
+            return None
+        if not self._evidence_within_dimensions(inc["id"], _BENIGN_EXPLAINABLE_DIMENSIONS):
             return None
         hazard = explain_position(inc["last_lat"], inc["last_lon"], inc.get("last_alt"), hazards)
         if not hazard:
@@ -459,7 +758,19 @@ class IncidentManager:
         return count
 
     def _check_peer_consensus(self, inc: dict, now: float):
+        """Scoped to _BENIGN_EXPLAINABLE_DIMENSIONS as of CHECKPOINT.md
+        bevinding 6, for a sharper version of the same problem as
+        _check_weather_explains. The premise — "several aircraft are doing
+        the same thing here at the same time, so it's a shared cause rather
+        than an individual diversion" — holds for enroute DEVIATIONS. For
+        LANDINGS it is exactly inverted: an airport closing and ten aircraft
+        each diverting to their alternate is ten real diversions, the most
+        newsworthy thing this system can see, and the unscoped rule
+        suppressed every one of them (each is inside the same grid cell, so
+        each one's peers are the other nine)."""
         if "peer_consensus" in self._evidence_sources_seen(inc["id"]):
+            return None
+        if not self._evidence_within_dimensions(inc["id"], _BENIGN_EXPLAINABLE_DIMENSIONS):
             return None
         # -1: peer count already excludes this incident itself, so N-1
         # others in the same cell means N total including this one.
@@ -470,15 +781,48 @@ class IncidentManager:
             "meerdere andere toestellen wijken tegelijk op vergelijkbare wijze uit in dit gebied — mogelijk gedeelde oorzaak, geen individuele diversie", None,
         )
 
+    def apply_context_checks(self, hex_id: str, now: float, hazards: list | None = None) -> list[dict]:
+        """Benigne-verklaringcontext (weer/luchtruim, peer-consensus) voor één
+        open incident. Draait ELKE cyclus, ook cycli mét vers bewijs — zie
+        step() en CHECKPOINT.md bevinding 5.
+
+        Stond vroeger in reassess(), die alleen draait als er GEEN vers bewijs
+        was. Daardoor werden deze checks structureel overgeslagen in precies
+        het scenario waarvoor ze bestaan: een detector die elke cyclus opnieuw
+        vuurt (een aanhoudende uitwijking om weer heen, een lange hold) is
+        juist het geval waarin een incident doorklimt, en dat is ook het geval
+        waarin `events` nooit leeg is. main.py haalde de SIGMET-polygonen elke
+        cyclus keurig op en gaf ze door, waarna ze nooit werden geraadpleegd.
+        Beide checks zijn intern al eenmalig-per-incident, dus vaker aanroepen
+        levert geen herhaalde aftrek op."""
+        transitions = []
+        for enabled, check in (
+            (self.cfg.get("weather_sigmet_enabled"), lambda i: self._check_weather_explains(i, hazards, now)),
+            (self.cfg.get("peer_consensus_enabled"), lambda i: self._check_peer_consensus(i, now)),
+        ):
+            if not enabled:
+                continue
+            inc = self._open.get(hex_id)
+            if inc is None:
+                break
+            result = check(inc)
+            if result:
+                t = self._maybe_notify(result[0], result[1], result[2], now)
+                if t:
+                    transitions.append(t)
+        return transitions
+
     def reassess(self, hex_id: str, ac: dict | None, now: float, hazards: list | None = None) -> dict | None:
-        """Decay + recovery-detection + weather/peer-consensus context +
-        auto-close for one open incident that did NOT receive fresh
-        evidence this cycle (see step()) — MASTERPLAN.md sectie 3.5/6.
-        hazards: pre-fetched airspace.get_active_hazards() result for this
-        cycle, or None to skip the weather check (kept as a plain
-        synchronous list here rather than an async fetch inside this
-        method, so incidents.py itself stays network-free — main.py fetches
-        once per tier1 cycle and passes it in)."""
+        """Decay + recovery-detection + auto-close for one open incident that
+        did NOT receive fresh evidence this cycle (see step()) —
+        MASTERPLAN.md sectie 3.5/6. The weather/peer-consensus context checks
+        moved to apply_context_checks(), which runs every cycle instead
+        (CHECKPOINT.md bevinding 5); recovery-detection stays here, since
+        "the deviation resolved" is only meaningful in a cycle that brought
+        no fresh evidence of it continuing.
+
+        hazards is still accepted (and unused here) so main.py's and
+        backtest.py's call signatures don't have to distinguish."""
         inc = self._open.get(hex_id)
         if inc is None:
             return None
@@ -496,25 +840,18 @@ class IncidentManager:
             if t:
                 return t
 
-        if self.cfg.get("weather_sigmet_enabled"):
-            explained = self._check_weather_explains(inc, hazards, now)
-            if explained:
-                inc, old_state, new_state = explained
-                t = self._maybe_notify(inc, old_state, new_state, now)
-                if t:
-                    return t
-
-        if self.cfg.get("peer_consensus_enabled"):
-            consensus = self._check_peer_consensus(inc, now)
-            if consensus:
-                inc, old_state, new_state = consensus
-                t = self._maybe_notify(inc, old_state, new_state, now)
-                if t:
-                    return t
-
         decay = self.cfg["incident_score_decay_factor_per_cycle"]
         old_score = inc["score"]
         inc["score"] = inc["score"] * decay
+        # De per-bron bijdrage vervalt mee (CHECKPOINT.md bevinding 3). Anders
+        # zou een bron die zijn verzadigingsplafond raakte en daarna verviel
+        # nooit meer kunnen bijdragen, terwijl het onderliggende signaal
+        # gewoon doorloopt — het plafond hoort de score te begrenzen die op
+        # enig MOMENT aan die bron toe te schrijven is, niet het totaal dat
+        # hij ooit heeft opgeleverd.
+        contrib = self._source_contrib(inc)
+        for src in contrib:
+            contrib[src] *= decay
         if inc["score"] == old_score:
             return None
         old_state = inc["state"]
@@ -563,13 +900,18 @@ class IncidentManager:
               ac: dict | None, now: float, hazards: list | None = None) -> list[dict]:
         """Single entry point for main.py, once per tracked aircraft per
         tier1 cycle. Applies fresh evidence (if any), then landing-based
-        resolution, then — only when there was NO fresh evidence this
+        resolution, then the benign-explanation context checks (every
+        cycle), and finally — only when there was NO fresh evidence this
         cycle, so a score bump isn't immediately partially undone by the
-        same cycle's decay — recovery-detection/weather+peer-consensus
-        context/decay/auto-close. Returns a list of transition dicts to
-        dispatch as notifications. hazards: this cycle's pre-fetched
-        airspace.get_active_hazards() result, or None to skip the weather
-        check — see reassess()."""
+        same cycle's decay — recovery-detection/decay/auto-close. Returns a
+        list of transition dicts to dispatch as notifications. hazards: this
+        cycle's pre-fetched airspace.get_active_hazards() result, or None to
+        skip the weather check — see apply_context_checks().
+
+        The context checks deliberately sit OUTSIDE the `if not events`
+        branch (CHECKPOINT.md bevinding 5): a detector that re-fires every
+        cycle is exactly the situation in which an incident climbs, and it
+        was also exactly the situation in which those checks never ran."""
         transitions = []
         if events:
             transitions.extend(self.apply_events(hex_id, callsign, aircraft_class, events, now))
@@ -580,6 +922,11 @@ class IncidentManager:
         landed_t = self._check_landed(hex_id, ac, now)
         if landed_t:
             transitions.append(landed_t)
+            return transitions
+
+        transitions.extend(self.apply_context_checks(hex_id, now, hazards))
+
+        if hex_id not in self._open:
             return transitions
 
         if not events:

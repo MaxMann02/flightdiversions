@@ -224,6 +224,45 @@ def route_plausible(origin_lat, origin_lon, dest_lat, dest_lon, cur_lat, cur_lon
     return dist_from_origin + dist_to_dest <= route_len * ROUTE_PLAUSIBLE_PROGRESS_MULTIPLIER
 
 
+# Hoeveel van de gefilede route we het toestel ZELF moeten hebben zien
+# afleggen voordat we de route als door eigen waarneming gecorroboreerd
+# beschouwen. 0.30 = het toestel is minstens 30% dichter bij de gefilede
+# bestemming gekomen dan het vertrekpunt lag, zonder dat de afgelegde weg meer
+# dan ROUTE_PLAUSIBLE_PROGRESS_MULTIPLIER x de directe afstand werd.
+#
+# Ruim gekozen: een verkeerd gematchte schedule (de gemeten hoofdfoutbron van
+# dit systeem — zie CHECKPOINT.md bevinding 2) wijst naar een bestemming waar
+# het toestel juist NIET naartoe vliegt, dus daar daalt de resterende afstand
+# helemaal niet en is 30% al onbereikbaar. Hoger zetten zou alleen echte
+# vroege diversies onnodig ongecorroboreerd laten; die worden juist door de
+# tweede corroboratieweg (zelf waargenomen vertrek vanaf het gefilede
+# vertrekpunt) opgevangen.
+ROUTE_CORROBORATION_MIN_PROGRESS = 0.30
+
+
+def route_corroborated_by_progress(origin_lat, origin_lon, dest_lat, dest_lon,
+                                   cur_lat, cur_lon) -> bool:
+    """True als we dit toestel de gefilede route daadwerkelijk een substantieel
+    stuk hebben zien afleggen — onze eigen waarneming als tweede mening over de
+    enkele, crowdsourced schedulebron waar de route vandaan komt.
+
+    Bewust het POSITIEVE spiegelbeeld van route_plausible: die filtert alleen
+    ONmogelijke routes weg ("niet aantoonbaar fout"), wat iets heel anders is
+    dan bevestiging ("aantoonbaar gevlogen"). Dat verschil is precies waar
+    incidents.py's BEVESTIGD-poort op steunt: zolang de gefilede bestemming
+    alleen onweersproken is en niet bevestigd, blijft "de route klopt niet"
+    een redelijke alternatieve verklaring voor élk route-afhankelijk signaal
+    tegelijk."""
+    route_len = haversine_nm(origin_lat, origin_lon, dest_lat, dest_lon)
+    if route_len < 1:
+        return False
+    if not route_plausible(origin_lat, origin_lon, dest_lat, dest_lon,
+                           cur_lat, cur_lon, check_progress=True):
+        return False
+    dist_to_dest = haversine_nm(cur_lat, cur_lon, dest_lat, dest_lon)
+    return dist_to_dest <= route_len * (1.0 - ROUTE_CORROBORATION_MIN_PROGRESS)
+
+
 def _intermediate_point(lat1, lon1, lat2, lon2, fraction):
     """Point along the great circle from (lat1,lon1) to (lat2,lon2), at the
     given fraction of angular distance (0=start, 1=end)."""

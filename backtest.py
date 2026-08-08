@@ -14,7 +14,8 @@ Run: `python backtest.py`
 import math
 from dataclasses import dataclass, field
 
-from airports import AirportDB, ROUTE_REVALIDATION_WINDOW_S, bearing_deg, route_plausible
+from airports import (AirportDB, ROUTE_REVALIDATION_WINDOW_S, bearing_deg,
+                      route_corroborated_by_progress, route_plausible)
 from config import CONFIG
 from detector import detect_emergency, detect_signal_lost_near_airport, evaluate
 from state import TrackStore
@@ -139,6 +140,22 @@ def run_case(case: Case, airport_db: AirportDB, cfg: dict | None = None,
             ):
                 track.route = None
                 track.route_checked = False
+                track.route_corroborated = False
+
+        # Mirrors main.py's tier1_loop: positive route corroboration — we
+        # watched this aircraft fly a substantial part of the filed route
+        # toward the filed DESTINATION. Needed here so a real, sourced Case
+        # exercises incidents.py's BEVESTIGD gate under the same route-trust
+        # conditions production would have, instead of silently never being
+        # corroborated (which would make every case look artificially
+        # unconfirmable). See CHECKPOINT.md bevinding 2 en 9.
+        if track.route and not track.route_corroborated and ac.get("lat") is not None:
+            if route_corroborated_by_progress(
+                track.route["origin_lat"], track.route["origin_lon"],
+                track.route["destination_lat"], track.route["destination_lon"],
+                ac["lat"], ac["lon"],
+            ):
+                track.route_corroborated = True
 
         # Mirrors main.py's tier1_loop: just_took_off is computed from the
         # PRIOR cycle's ground state, before it's updated below — needed so
@@ -156,7 +173,15 @@ def run_case(case: Case, airport_db: AirportDB, cfg: dict | None = None,
             fired.append((s.t, ev))
 
         if just_took_off:
-            track.last_takeoff_ts = s.t
+            # Mirrors main.py's tier1_loop record_takeoff call. Sets BOTH
+            # last_takeoff_ts (for detect_landed_wrong_airport's early-return
+            # window) and pending_origin — the latter is what the observed-
+            # departure branch of the route-corroboration check above reads,
+            # so without it an early-return case like TO3510 could never be
+            # corroborated here even though production would corroborate it
+            # immediately. See CHECKPOINT.md bevinding 2.
+            departure_ap, _ = airport_db.nearest(s.lat, s.lon, max_km=15.0)
+            store.record_takeoff(track, departure_ap, s.t)
 
         # Mirrors main.py's tier1_loop: was_on_ground only updates AFTER
         # evaluate() runs, so detect_landed_wrong_airport sees the PRIOR
@@ -175,7 +200,21 @@ def run_case(case: Case, airport_db: AirportDB, cfg: dict | None = None,
         track.missing_cycles = cfg["signal_lost_missing_cycles"]
         ev = detect_signal_lost_near_airport(track, airport_db, cfg)
         if ev:
-            fired.append((last_t + cfg["signal_lost_missing_cycles"] * cfg["tier1_interval_seconds"], ev))
+            missing_t = last_t + cfg["signal_lost_missing_cycles"] * cfg["tier1_interval_seconds"]
+            fired.append((missing_t, ev))
+            # Mirrors main.py's tier1_loop, which puts this event into
+            # events_by_hex like any other and therefore feeds it to
+            # IncidentManager.step(). This harness used to append it to
+            # `fired` only, so signal_lost_near_airport was the one detector
+            # whose evidence never reached the incident engine at all in a
+            # backtest — invisible while the engine was only exercised by
+            # hand-built Events, but wrong as soon as a real case's incident
+            # outcome is asserted (check_real_case_confidence_outcomes).
+            # ac=None mirrors production: the aircraft is, by definition of
+            # this case, absent from the snapshot.
+            ev.route_corroborated = bool(track.route_corroborated)
+            if incident_mgr is not None:
+                incident_mgr.step(case.hex_id, case.callsign, aircraft_class, [ev], None, missing_t)
 
     return fired
 
@@ -748,6 +787,70 @@ def check_wrong_airport_route_crosscheck() -> bool:
     return all_ok
 
 
+def check_wrong_airport_evidence_weight(airport_db: AirportDB) -> bool:
+    """CHECKPOINT.md bevinding 1. enrich_events had two vetoes on
+    wrong_airport (cross-provider ground-state disagreement, hexdb.io route
+    disagreement) that BOTH only set ev.confidence — while
+    incidents.score_for_event read ev.confidence nowhere outside its
+    `emergency` branch. Both vetoes were therefore completely inert: a
+    disputed landing scored the same flat 90.0 (>= the BEVESTIGD threshold
+    of 85) as an undisputed one, and dispatched the same 🚨 Telegram. This
+    checks the evidence WEIGHT, which is what actually drives the incident
+    state — check_wrong_airport_route_crosscheck above only ever checked the
+    (cosmetic) confidence label."""
+    import classify
+    import db as db_module
+    import incidents as incidents_module
+    from detector import Event
+
+    print("\n=== wrong_airport evidence weight (disputed / unconfirmed) ===")
+    all_ok = True
+
+    trusted = Event(hex="wa1", callsign="TST1", event_type="wrong_airport", confidence="BEVESTIGD",
+                    message="test", origin_icao="EHAM", dest_icao="EGLL")
+    disputed = Event(hex="wa2", callsign="TST2", event_type="wrong_airport", confidence="WAARSCHIJNLIJK",
+                     message="test", origin_icao="EHAM", dest_icao="EGLL", route_source_disputed=True)
+    unconfirmed = Event(hex="wa3", callsign="TST3", event_type="wrong_airport", confidence="WAARSCHIJNLIJK",
+                        message="test", origin_icao="EHAM", dest_icao="EGLL")
+
+    for label, ev, want_delta, want_source in (
+        ("onbetwist", trusted, 90.0, "wrong_airport"),
+        ("routebron betwist", disputed, 30.0, "wrong_airport_disputed"),
+        ("grondstatus onbevestigd", unconfirmed, 25.0, "wrong_airport_unconfirmed"),
+    ):
+        delta, source, _ = incidents_module.score_for_event(ev, False)
+        ok = delta == want_delta and source == want_source
+        all_ok = all_ok and ok
+        print(f"  wrong_airport, {label}: {delta:.0f} punten via '{source}' "
+              f"(verwacht {want_delta:.0f}/'{want_source}'): {'OK' if ok else 'FAIL'}")
+
+    # End-to-end through the incident engine: a lone disputed/unconfirmed
+    # wrong_airport must no longer reach BEVESTIGD. (Before this fix both
+    # landed on 90 -> CONFIRMED.)
+    cfg = dict(CONFIG)
+    for label, ev, hex_id in (("betwist", disputed, "wa2"), ("onbevestigd", unconfirmed, "wa3")):
+        mgr = incidents_module.IncidentManager(db_module.connect(":memory:"), cfg, airport_db)
+        mgr.step(hex_id, "TST", classify.AIRLINER, [ev], {"squawk": "1200"}, 100.0)
+        state = mgr._open[hex_id]["state"]
+        ok = state != incidents_module.CONFIRMED
+        all_ok = all_ok and ok
+        print(f"  lone {label} wrong_airport bereikt geen BEVESTIGD (state={state}): {'OK' if ok else 'FAIL'}")
+
+    # A wrong_airport incident must still close as GESLOTEN_GELAND (a
+    # confirmed diversion) even when the evidence landed under one of the
+    # new source names — regression for _check_landed's source test.
+    mgr = incidents_module.IncidentManager(db_module.connect(":memory:"), cfg, airport_db)
+    mgr.step("wa4", "TST4", classify.AIRLINER, [disputed], {"squawk": "1200"}, 200.0)
+    other_ap = airport_db.get("EDDF")
+    t = mgr.step("wa4", "TST4", classify.AIRLINER, [],
+                 {"squawk": "1200", "on_ground": True, "lat": other_ap["lat"], "lon": other_ap["lon"]}, 260.0)
+    closed_ok = "wa4" not in mgr._open
+    all_ok = all_ok and closed_ok
+    print(f"  betwiste wrong_airport sluit nog steeds af als GESLOTEN_GELAND: {'OK' if closed_ok else f'FAIL (transitions={t})'}")
+
+    return all_ok
+
+
 def check_premature_descent_signal_lost_route_crosscheck(airport_db: AirportDB) -> bool:
     """Live data (2026-08-07, BACKTEST_LOG.md ronde 24): pulled a fresh
     /api/events snapshot and hexdb.io-queried 8 of the sampled
@@ -946,6 +1049,344 @@ def check_premature_descent_signal_lost_route_crosscheck(airport_db: AirportDB) 
     return all_ok
 
 
+def check_saturation_caps(airport_db: AirportDB) -> bool:
+    """CHECKPOINT.md bevinding 3 en 8. The repeat dampening added in round 16
+    was a fixed fraction (~1/3 of the first-hit weight), so the series still
+    diverged — the only brake was incident_score_max (150), well ABOVE the
+    BEVESTIGD threshold (85). A single signal that simply kept firing
+    therefore reached the top level on its own: holding_non_destination in 6
+    tier1 cycles (~6 minutes), premature_descent in 9, emergency_status in 3,
+    and even emergency_status_low_trust — the conspicuity-squawk decode
+    artifact the project itself documented as unreliable — in 11.
+
+    The underlying reasoning that does hold: repetition eliminates NOISE
+    hypotheses (a single bad fix, a decode glitch, one ATC vector). It does
+    not eliminate SYSTEMATIC benign ones (stale route data, a weather
+    reroute, an ATC delay, normal arrival sequencing) — those actively
+    predict that the signal persists. So evidence weight from one source has
+    to converge, not diverge, and converge to something under the level that
+    is supposed to mean 'no reasonable alternative remains'."""
+    import classify
+    import db as db_module
+    import incidents as incidents_module
+    from detector import Event
+
+    print("\n=== verzadigingsplafonds per bewijsbron ===")
+    all_ok = True
+    cfg = dict(CONFIG)
+    confirmed = cfg["incident_score_confirmed_threshold"]
+    likely = cfg["incident_score_likely_threshold"]
+    possible = cfg["incident_score_possible_threshold"]
+
+    def sustain(hex_id, ev_factory, cycles=30):
+        """Feed the same detector Event `cycles` times in a row (one per
+        tier1 cycle) and return (score, state) — the 'signal simply keeps
+        happening' scenario."""
+        mgr = incidents_module.IncidentManager(db_module.connect(":memory:"), cfg, airport_db)
+        t = 1000.0
+        for i in range(cycles):
+            mgr.step(hex_id, "TSTC", classify.AIRLINER, [ev_factory(i)], {"squawk": "1200"}, t)
+            t += 60.0
+        inc = mgr._open[hex_id]
+        return inc["score"], inc["state"]
+
+    def hold_nd(i):
+        return Event(hex="cap1", callsign="TSTC", event_type="holding_pattern", confidence="MOGELIJK",
+                     message=f"m{i}", origin_icao="EHAM", dest_icao="EGLL", at_destination=False,
+                     route_corroborated=True)
+
+    def descent(i):
+        return Event(hex="cap2", callsign="TSTC", event_type="premature_descent", confidence="MOGELIJK",
+                     message=f"m{i}", origin_icao="EHAM", dest_icao="EGLL", route_corroborated=True)
+
+    def low_trust_emergency(i):
+        # What enrich_events produces for a conspicuity-squawk emergency
+        # status: confidence capped to WAARSCHIJNLIJK, squawk 1000.
+        return Event(hex="cap3", callsign="TSTC", event_type="emergency", confidence="WAARSCHIJNLIJK",
+                     message=f"m{i}", squawk="1000")
+
+    def status_emergency(i):
+        return Event(hex="cap4", callsign="TSTC", event_type="emergency", confidence="BEVESTIGD",
+                     message=f"m{i}", squawk="2451")
+
+    def real_squawk(i):
+        return Event(hex="cap5", callsign="TSTC", event_type="emergency", confidence="BEVESTIGD",
+                     message=f"m{i}", squawk="7700")
+
+    for label, hex_id, factory, want_cap, want_state in (
+        ("holding_non_destination", "cap1", hold_nd, 70.0, incidents_module.LIKELY),
+        ("premature_descent", "cap2", descent, 60.0, incidents_module.LIKELY),
+        ("emergency_status_low_trust", "cap3", low_trust_emergency, 24.0, incidents_module.WATCHING),
+        ("emergency_status", "cap4", status_emergency, 55.0, incidents_module.LIKELY),
+    ):
+        score, state = sustain(hex_id, factory)
+        ok = abs(score - want_cap) < 0.01 and state == want_state and score < confirmed
+        all_ok = all_ok and ok
+        print(f"  30x achtereen {label}: score {score:.0f} (plafond {want_cap:.0f}), state {state} "
+              f"— blijft onder BEVESTIGD ({confirmed}): {'OK' if ok else 'FAIL'}")
+
+    # The low-trust tier is deliberately capped just UNDER the dashboard
+    # visibility threshold: a documented decode artifact should not surface
+    # on its own at all, however long it persists.
+    score3, _ = sustain("cap3", low_trust_emergency)
+    ok = score3 < possible
+    all_ok = all_ok and ok
+    print(f"  het gedocumenteerde conspicuity-decodeartefact komt zelfs na 30 cycli niet op het "
+          f"dashboard (score {score3:.0f} < MOGELIJK-drempel {possible}): {'OK' if ok else 'FAIL'}")
+
+    # Regression guard in the other direction: the caps must not blunt a real
+    # declared emergency.
+    score5, state5 = sustain("cap5", real_squawk, cycles=3)
+    ok = state5 == incidents_module.CONFIRMED
+    all_ok = all_ok and ok
+    print(f"  een echte noodsquawk raakt dit niet: nog steeds direct BEVESTIGD "
+          f"(score {score5:.0f}, state {state5}): {'OK' if ok else 'FAIL'}")
+
+    # Every PROVISIONAL cap must sit under the CONFIRMED threshold — a
+    # structural invariant, so a future cap can't be added above it by
+    # accident. Exempt are exactly the sources _confirmed_bar_met can confirm
+    # on by themselves: the route-independent ones (emergency squawk,
+    # self-observed early return) and wrong_airport (physically observed
+    # landing, on a corroborated route). Derived from those sets rather than
+    # hardcoded, so the invariant and the gate can never drift apart.
+    may_confirm_alone = incidents_module._ROUTE_INDEPENDENT_SOURCES | {"wrong_airport"}
+    over = {s: c for s, c in incidents_module._SOURCE_SCORE_CAP.items()
+            if c >= confirmed and s not in may_confirm_alone}
+    ok = not over
+    all_ok = all_ok and ok
+    print(f"  alle provisionele plafonds liggen onder de BEVESTIGD-drempel "
+          f"(vrijgesteld: {sorted(may_confirm_alone)}): {'OK' if ok else f'FAIL ({over})'}")
+
+    # The per-source contribution decays along with the score, so a source
+    # that saturated and then decayed can contribute again while the
+    # underlying signal is still going — the cap bounds the score
+    # attributable to a source at any MOMENT, not the total it ever earned.
+    mgr = incidents_module.IncidentManager(db_module.connect(":memory:"), cfg, airport_db)
+    t = 1000.0
+    for i in range(30):
+        mgr.step("cap6", "TSTC", classify.AIRLINER, [
+            Event(hex="cap6", callsign="TSTC", event_type="holding_pattern", confidence="MOGELIJK",
+                  message=f"m{i}", origin_icao="EHAM", dest_icao="EGLL", at_destination=False)], {"squawk": "1200"}, t)
+        t += 60.0
+    saturated = mgr._open["cap6"]["score"]
+    for _ in range(4):  # aircraft briefly missing from the snapshot -> decay
+        t += 60.0
+        mgr.step("cap6", "TSTC", classify.AIRLINER, [], {"squawk": "1200"}, t)
+    decayed = mgr._open["cap6"]["score"]
+    t += 60.0
+    mgr.step("cap6", "TSTC", classify.AIRLINER, [
+        Event(hex="cap6", callsign="TSTC", event_type="holding_pattern", confidence="MOGELIJK",
+              message="back", origin_icao="EHAM", dest_icao="EGLL", at_destination=False)], {"squawk": "1200"}, t)
+    resumed = mgr._open["cap6"]["score"]
+    ok = decayed < saturated and resumed > decayed and resumed <= saturated + 0.01
+    all_ok = all_ok and ok
+    print(f"  een verzadigde bron kan na verval weer bijdragen, tot hetzelfde plafond "
+          f"(verzadigd {saturated:.0f} -> vervallen {decayed:.0f} -> hervat {resumed:.0f}): {'OK' if ok else 'FAIL'}")
+
+    return all_ok
+
+
+def check_route_corroboration(airport_db: AirportDB) -> bool:
+    """CHECKPOINT.md bevinding 2. Second-source checks only ever downgraded on
+    ACTIVE disagreement, so 'hexdb.io has no data' counted exactly the same as
+    'hexdb.io confirms it'. For the lower levels that's right (don't lose a
+    real diversion because a free source is thin). For BEVESTIGD it is exactly
+    backwards: 'the filed destination is wrong' is not a theoretical worry
+    here but the MEASURED dominant failure mode (24/25 uncorroborated live
+    wrong_airport hits, ronde 18; 6/8 hexdb lookups naming a different
+    destination, ronde 24). Treating unverified as verified there makes the
+    top label rest on the single assumption most likely to be false.
+
+    route_corroborated_by_progress is the positive counterpart of
+    route_plausible: not 'not demonstrably wrong' but 'demonstrably flown'."""
+    import classify
+    import db as db_module
+    import incidents as incidents_module
+    from airports import route_corroborated_by_progress
+    from detector import Event
+
+    print("\n=== route-corroboratie (bevestigd vs. slechts onweersproken) ===")
+    all_ok = True
+
+    # Real geometry, EK225's own case: DXB->SFO, at the point over Nyagan
+    # where it actually turned back. It had genuinely flown most of the way
+    # toward SFO, so the filed route is corroborated by our own observation.
+    dxb, sfo = airport_db.get("OMDB"), airport_db.get("KSFO")
+    ok = route_corroborated_by_progress(dxb["lat"], dxb["lon"], sfo["lat"], sfo["lon"], 62.1, 65.4)
+    all_ok = all_ok and ok
+    print(f"  EK225 boven Nyagan op de gefilede OMDB->KSFO-route: gecorroboreerd: {'OK' if ok else 'FAIL'}")
+
+    # Same function, the schedule-mismatch shape that drives the live false
+    # positives (DLH8NK: adsbdb filed EDDF->LEMG, aircraft actually near
+    # EDDM). The distance to the filed destination never goes down, so this
+    # can never corroborate — which is the whole point.
+    eddf, lemg, eddm = airport_db.get("EDDF"), airport_db.get("LEMG"), airport_db.get("EDDM")
+    ok = not route_corroborated_by_progress(eddf["lat"], eddf["lon"], lemg["lat"], lemg["lon"],
+                                            eddm["lat"], eddm["lon"])
+    all_ok = all_ok and ok
+    print(f"  DLH8NK-vorm (gefiled EDDF->LEMG, werkelijk bij EDDM): NIET gecorroboreerd: {'OK' if ok else 'FAIL'}")
+
+    # End-to-end: the same wrong_airport evidence, with and without route
+    # corroboration. Before this finding both reached BEVESTIGD.
+    cfg = dict(CONFIG)
+    for label, corroborated, want in (("zonder corroboratie", False, incidents_module.LIKELY),
+                                      ("met corroboratie", True, incidents_module.CONFIRMED)):
+        mgr = incidents_module.IncidentManager(db_module.connect(":memory:"), cfg, airport_db)
+        ev = Event(hex="rc1", callsign="TSTR", event_type="wrong_airport", confidence="BEVESTIGD",
+                   message="test", origin_icao="EHAM", dest_icao="EGLL", route_corroborated=corroborated)
+        mgr.step("rc1", "TSTR", classify.AIRLINER, [ev], {"squawk": "1200"}, 100.0)
+        inc = mgr._open["rc1"]
+        ok = inc["state"] == want
+        all_ok = all_ok and ok
+        print(f"  wrong_airport {label}: score {inc['score']:.0f}, state {inc['state']} "
+              f"(verwacht {want}): {'OK' if ok else 'FAIL'}")
+
+    # The corroboration is persisted as a zero-delta evidence row, so it
+    # survives a restart and shows up in the incident's own timeline rather
+    # than living only in memory.
+    mgr = incidents_module.IncidentManager(db_module.connect(":memory:"), cfg, airport_db)
+    ev = Event(hex="rc2", callsign="TSTR", event_type="corridor_deviation", confidence="MOGELIJK",
+               message="test", origin_icao="EHAM", dest_icao="EGLL", route_corroborated=True)
+    mgr.step("rc2", "TSTR", classify.AIRLINER, [ev], {"squawk": "1200"}, 100.0)
+    rows = db_module.get_incident_evidence(mgr.db, mgr._open["rc2"]["id"])
+    marker = [r for r in rows if r["source"] == "route_corroborated"]
+    ok = len(marker) == 1 and marker[0]["delta"] == 0.0
+    all_ok = all_ok and ok
+    print(f"  route-corroboratie staat als delta-0 evidence-rij in de tijdlijn (niet alleen in geheugen): "
+          f"{'OK' if ok else f'FAIL ({marker})'}")
+    # CHECKPOINT.md bevinding 9: watching an aircraft DEPART the filed origin
+    # confirms the wrong half of the route. It rules out the wrong-LEG error
+    # (callsign flies A->B and later B->A while adsbdb only knows A->B), but
+    # not the wrong-DESTINATION error — and wrong_airport is entirely about
+    # the destination. The live case that motivated this whole round is
+    # exactly that shape: DLH8NK filed EDDF->LEMG, actually flew EDDF->EDDM.
+    # The origin matches, so an origin-based corroboration would have waved
+    # it straight through to BEVESTIGD again.
+    mgr = incidents_module.IncidentManager(db_module.connect(":memory:"), cfg, airport_db)
+    ev = Event(hex="rc3", callsign="DLH8NK", event_type="wrong_airport", confidence="BEVESTIGD",
+               message="geland op EDDM i.p.v. LEMG", origin_icao="EDDF", dest_icao="LEMG")
+    mgr.step("rc3", "DLH8NK", classify.AIRLINER, [ev], {"squawk": "1200"}, 100.0)
+    state = mgr._open["rc3"]["state"]
+    ok = state != incidents_module.CONFIRMED
+    all_ok = all_ok and ok
+    print(f"  DLH8NK-scenario: kloppende origin maakt de BESTEMMING niet gecorroboreerd "
+          f"(state={state}): {'OK' if ok else 'FAIL'}")
+
+    # The early-return observation, by contrast, genuinely does not depend on
+    # the filed destination: we watched this aircraft take off from airport X
+    # and land back at that same airport X within the early-return window.
+    # That is abnormal whatever the schedule said, so it confirms on its own.
+    mgr = incidents_module.IncidentManager(db_module.connect(":memory:"), cfg, airport_db)
+    ev = Event(hex="rc4", callsign="TVF3510", event_type="wrong_airport", confidence="BEVESTIGD",
+               message="teruggekeerd naar LFPO", origin_icao="LFPO", dest_icao="LGMK",
+               early_return=True)
+    mgr.step("rc4", "TVF3510", classify.AIRLINER, [ev], {"squawk": "1200"}, 100.0)
+    state = mgr._open["rc4"]["state"]
+    ok = state == incidents_module.CONFIRMED
+    all_ok = all_ok and ok
+    print(f"  vroege terugkeer naar het zelf waargenomen vertrekveld bevestigt zonder "
+          f"route-corroboratie (state={state}): {'OK' if ok else 'FAIL'}")
+
+    # ...and only once, however often it is re-asserted.
+    for i in range(3):
+        mgr.step("rc2", "TSTR", classify.AIRLINER, [
+            Event(hex="rc2", callsign="TSTR", event_type="corridor_deviation", confidence="MOGELIJK",
+                  message=f"again{i}", origin_icao="EHAM", dest_icao="EGLL", route_corroborated=True)],
+            {"squawk": "1200"}, 200.0 + i * 60)
+    rows = db_module.get_incident_evidence(mgr.db, mgr._open["rc2"]["id"])
+    ok = sum(1 for r in rows if r["source"] == "route_corroborated") == 1
+    all_ok = all_ok and ok
+    print(f"  ...en precies één keer, hoe vaak hij ook opnieuw wordt vastgesteld: {'OK' if ok else 'FAIL'}")
+
+    return all_ok
+
+
+def check_confirmed_bar_structure(airport_db: AirportDB) -> bool:
+    """CHECKPOINT.md bevinding 4 (en 7). The old gate tested only whether the
+    SET of source names happened to fall entirely inside {course_deviation,
+    corridor_deviation}. But the problem was never those two names — it is
+    that every detector except detect_emergency measures against
+    track.route["destination_*"], so ONE wrong filed destination makes several
+    of them fire at once and the sum reads it as independent corroboration.
+
+    Adding evidence is only justified when the pieces are conditionally
+    independent. Here a single alternative hypothesis ('the filed route is
+    wrong') predicts all of them simultaneously, so more different detectors
+    do not make it less likely — they are all predictions OF it."""
+    import classify
+    import db as db_module
+    import incidents as incidents_module
+    from detector import Event
+
+    print("\n=== structuur van de BEVESTIGD-poort ===")
+    all_ok = True
+    cfg = dict(CONFIG)
+
+    def build(hex_id, specs, corroborated):
+        mgr = incidents_module.IncidentManager(db_module.connect(":memory:"), cfg, airport_db)
+        t = 1000.0
+        for et, kwargs in specs:
+            mgr.step(hex_id, "TSTS", classify.AIRLINER, [
+                Event(hex=hex_id, callsign="TSTS", event_type=et, confidence=kwargs.pop("confidence", "MOGELIJK"),
+                      message="m", origin_icao="EHAM", dest_icao="EGLL",
+                      route_corroborated=corroborated, **kwargs)], {"squawk": kwargs.get("squawk") or "1200"}, t)
+            t += 60.0
+        return mgr._open.get(hex_id) or {"state": "GESLOTEN", "score": 0.0}
+
+    # The literal scenario from the finding: one stale schedule, three
+    # detectors. Each is a prediction of the same single error.
+    stale_schedule = [("corridor_deviation", {}), ("premature_descent", {}),
+                      ("holding_pattern", {"at_destination": False})]
+    inc = build("cb1", [(et, dict(kw)) for et, kw in stale_schedule], corroborated=False)
+    ok = inc["state"] != incidents_module.CONFIRMED
+    all_ok = all_ok and ok
+    print(f"  drie route-afhankelijke detectoren, route NIET gecorroboreerd (het verouderde-schedule-"
+          f"scenario): score {inc['score']:.0f}, state {inc['state']} — geen BEVESTIGD: {'OK' if ok else 'FAIL'}")
+
+    # Same evidence, route corroborated: now the one hypothesis that
+    # explained all three is off the table, and three genuinely different
+    # dimensions remain.
+    inc = build("cb2", [(et, dict(kw)) for et, kw in stale_schedule], corroborated=True)
+    ok = inc["state"] == incidents_module.CONFIRMED
+    all_ok = all_ok and ok
+    print(f"  hetzelfde bewijs mét gecorroboreerde route: score {inc['score']:.0f}, state {inc['state']} "
+          f"— wél BEVESTIGD (de poort staat niet gewoon dicht): {'OK' if ok else 'FAIL'}")
+
+    # course_deviation + corridor_deviation are two measurements of the same
+    # lateral deviation — one dimension, not two sources' worth of
+    # corroboration. This replaces the old _DEVIATION_ONLY_SOURCES assertion
+    # with the reason behind it.
+    inc = build("cb3", [("course_deviation", {}), ("corridor_deviation", {}),
+                        ("course_deviation", {}), ("corridor_deviation", {}),
+                        ("course_deviation", {}), ("corridor_deviation", {})], corroborated=True)
+    ok = inc["state"] != incidents_module.CONFIRMED
+    all_ok = all_ok and ok
+    print(f"  course_deviation + corridor_deviation zijn dezelfde dimensie (lateraal), niet twee "
+          f"onafhankelijke bronnen: score {inc['score']:.0f}, state {inc['state']}: {'OK' if ok else 'FAIL'}")
+
+    # A real emergency squawk needs nothing else at all — not even a route.
+    mgr = incidents_module.IncidentManager(db_module.connect(":memory:"), cfg, airport_db)
+    mgr.step("cb4", "TSTS", classify.AIRLINER, [
+        Event(hex="cb4", callsign="TSTS", event_type="emergency", confidence="BEVESTIGD",
+              message="squawk 7700", squawk="7700")], {"squawk": "7700"}, 1000.0)
+    ok = mgr._open["cb4"]["state"] == incidents_module.CONFIRMED
+    all_ok = all_ok and ok
+    print(f"  noodsquawk alleen, zonder route en zonder corroboratie -> BEVESTIGD: {'OK' if ok else 'FAIL'}")
+
+    # ...but the ADS-B emergency STATUS field must not open the gate on its
+    # own, even combined with a deviation and a corroborated route: that
+    # field is documented-unreliable, and DIM_DECLARED deliberately does not
+    # count toward the 'two different kinds of abnormality' test.
+    inc = build("cb5", [("emergency", {"confidence": "BEVESTIGD", "squawk": "2451"})] * 3
+                       + [("corridor_deviation", {})] * 3, corroborated=True)
+    ok = inc["state"] != incidents_module.CONFIRMED
+    all_ok = all_ok and ok
+    print(f"  emergency-STATUSveld + laterale afwijking + gecorroboreerde route -> nog steeds geen "
+          f"BEVESTIGD (score {inc['score']:.0f}, state {inc['state']}): {'OK' if ok else 'FAIL'}")
+
+    return all_ok
+
+
 def check_incident_engine_regressions(airport_db: AirportDB) -> bool:
     """Standalone smoke test for incidents.py (MASTERPLAN.md sectie 3),
     wired into main.py's tier0_loop/tier1_loop as of BACKTEST_LOG.md ronde
@@ -1125,33 +1566,73 @@ def check_incident_engine_regressions(airport_db: AirportDB) -> bool:
     # long, entirely routine reroute around contested/restricted airspace
     # or weather can keep a heading pointed away from the filed destination
     # for a long time at stable cruise without ever looking like anything
-    # but a deviation — see incidents.py's _DEVIATION_ONLY_SOURCES.
+    # but a deviation — see incidents.py's
+    # _DIMENSION_FOR_SOURCE/_SOFT_DIMENSIONS and the rewritten
+    # _confirmed_bar_met.
+    # Route corroborated throughout: this test is about what REPETITION and
+    # CORROBORATION do, not about route trust (that's
+    # check_confirmed_bar_structure). Without it every assertion below would
+    # be capped by the route gate instead, hiding what's being tested.
     now_t3 = 8000.0
     for i in range(9):
         ev11 = Event(hex="inc_test_8", callsign="TST800", event_type="course_deviation",
-                     confidence="MOGELIJK", message=f"test{i}", origin_icao="EHAM", dest_icao="EGLL")
+                     confidence="MOGELIJK", message=f"test{i}", origin_icao="EHAM", dest_icao="EGLL",
+                     route_corroborated=True)
         mgr.step("inc_test_8", "TST800", classify.AIRLINER, [ev11], {"squawk": "1200"}, now_t3)
         now_t3 += 60.0
     score11 = mgr._open["inc_test_8"]["score"]
     state11 = mgr._open["inc_test_8"]["state"]
-    ok = score11 >= cfg["incident_score_confirmed_threshold"] and state11 == incidents_module.LIKELY
+    # CHECKPOINT.md bevinding 3/7: this used to assert score >= 85 with the
+    # state held down to WAARSCHIJNLIJK by the source-name gate — i.e. the
+    # score was allowed to run away and only the LABEL was corrected. That
+    # left the runaway score sitting there as a loaded spring: a single
+    # token hit from any other source lifted the gate and the state jumped
+    # straight to BEVESTIGD off a score that was ~85% one damped source
+    # (assertion 12 below). The score itself now saturates at
+    # _SOURCE_SCORE_CAP["course_deviation"] = 55, so there is no spring left
+    # to release.
+    cap11 = incidents_module._SOURCE_SCORE_CAP["course_deviation"]
+    ok = (abs(score11 - cap11) < 0.01 and state11 == incidents_module.LIKELY
+          and score11 < cfg["incident_score_confirmed_threshold"])
     all_ok = all_ok and ok
-    print(f"  sustained course_deviation ALONE caps at WAARSCHIJNLIJK even once its score crosses "
-          f"BEVESTIGD's threshold (score={score11:.0f}, state={state11}): {'OK' if ok else 'FAIL'}")
+    print(f"  sustained course_deviation ALONE verzadigt op zijn plafond en blijft WAARSCHIJNLIJK "
+          f"(score={score11:.0f}, plafond={cap11:.0f}, BEVESTIGD-drempel={cfg['incident_score_confirmed_threshold']}, "
+          f"state={state11}): {'OK' if ok else 'FAIL'}")
 
-    # 12. The SAME incident, once genuinely different evidence corroborates
-    # it (here: premature_descent — the aircraft is now ALSO descending,
-    # not just pointed off-course at cruise), is allowed through to
-    # BEVESTIGD — proving the cap above is about corroboration, not a
-    # blanket ceiling on every course_deviation incident.
+    # 12. One token hit from a second source must NOT be enough to unlock
+    # BEVESTIGD (CHECKPOINT.md bevinding 7). Adding a single
+    # premature_descent gives a genuinely different dimension (vertical vs
+    # lateral) but only 25 points: 55 + 25 = 80, still under the threshold.
+    # The qualitative requirement and the quantitative one now have to be
+    # met independently, instead of the qualitative one acting as a switch
+    # on an already-inflated score.
     ev12 = Event(hex="inc_test_8", callsign="TST800", event_type="premature_descent",
-                 confidence="MOGELIJK", message="also descending now", origin_icao="EHAM", dest_icao="EGLL")
+                 confidence="MOGELIJK", message="also descending now", origin_icao="EHAM", dest_icao="EGLL",
+                 route_corroborated=True)
     mgr.step("inc_test_8", "TST800", classify.AIRLINER, [ev12], {"squawk": "1200"}, now_t3)
+    now_t3 += 60.0
+    score12 = mgr._open["inc_test_8"]["score"]
     state12 = mgr._open["inc_test_8"]["state"]
-    ok = state12 == incidents_module.CONFIRMED
+    ok = state12 == incidents_module.LIKELY and score12 < cfg["incident_score_confirmed_threshold"]
     all_ok = all_ok and ok
-    print(f"  same incident reaches BEVESTIGD once genuinely different evidence (premature_descent) "
-          f"corroborates it: {'OK' if ok else f'FAIL (state={state12})'}")
+    print(f"  één losse hit uit een tweede bron ontgrendelt BEVESTIGD niet "
+          f"(score={score12:.0f}, state={state12}): {'OK' if ok else 'FAIL'}")
+
+    # 13. Once that second dimension carries real weight — a second descent
+    # hit, so the aircraft is demonstrably off its (corroborated) route AND
+    # demonstrably descending far from it — the bar is genuinely met and
+    # BEVESTIGD follows. Proves the gate is about the structure of the
+    # evidence, not a blanket ceiling.
+    ev13 = Event(hex="inc_test_8", callsign="TST800", event_type="premature_descent",
+                 confidence="MOGELIJK", message="still descending", origin_icao="EHAM", dest_icao="EGLL",
+                 route_corroborated=True)
+    mgr.step("inc_test_8", "TST800", classify.AIRLINER, [ev13], {"squawk": "1200"}, now_t3)
+    score13 = mgr._open["inc_test_8"]["score"]
+    state13 = mgr._open["inc_test_8"]["state"]
+    ok = state13 == incidents_module.CONFIRMED
+    all_ok = all_ok and ok
+    print(f"  twee wezenlijk verschillende bewijsdimensies met echt gewicht, route gecorroboreerd "
+          f"-> BEVESTIGD (score={score13:.0f}, state={state13}): {'OK' if ok else 'FAIL'}")
 
     return all_ok
 
@@ -1248,17 +1729,47 @@ def check_incident_engine_real_case_escalation(airport_db: AirportDB) -> bool:
     print(f"  sustained hold contributes multiple damped evidence rows, not one jump "
           f"({hold_sources.count('holding_destination')} holding_destination rows): {'OK' if ok else 'FAIL'}")
 
-    # peak_score reached BEVESTIGD before the incident eventually went idle
-    # (no more holding evidence once the aircraft leaves the hold) and
-    # timed out — state itself is GESLOTEN_TIMEOUT by the time we read it
-    # back, peak_score is what shows it actually escalated all the way.
-    ok = (hold_incident["peak_score"] >= cfg["incident_score_confirmed_threshold"]
+    # The hold-driven incident escalates to WAARSCHIJNLIJK — and stops there
+    # — before eventually going idle (no more holding evidence once the
+    # aircraft leaves the hold) and timing out. state itself is
+    # GESLOTEN_TIMEOUT by the time we read it back; peak_score is what shows
+    # how far it actually escalated.
+    #
+    # Changed from "escalates all the way to BEVESTIGD (peak_score 150)"
+    # (CHECKPOINT.md bevinding 3). The old behaviour came from the repeat
+    # dampening being a fixed fraction: 25 + 8 per cycle diverges, so a
+    # sustained hold reached the BEVESTIGD threshold ~9 cycles past the
+    # 20-cycle streak gate and then ran to the score cap. But an hours-long
+    # hold at one's own filed destination has ordinary explanations that do
+    # not go away by waiting longer — arrival congestion, weather at the
+    # field, ATC flow control. Repetition rules out sensor noise, not a
+    # systematic cause, so "it kept holding" cannot be what carries an
+    # incident to a level that is supposed to mean no reasonable alternative
+    # remains. holding_destination now saturates at 65 (WAARSCHIJNLIJK).
+    #
+    # Costs no early warning: WAARSCHIJNLIJK is already a notifying state
+    # (_maybe_notify), so the Telegram fires at exactly the same moment it
+    # did before — see the lead-time assertion further down. BEVESTIGD for
+    # AI850 arrives with the MAYDAY squawk, on the second incident, which is
+    # when it genuinely became certain.
+    ok = (cfg["incident_score_likely_threshold"] <= hold_incident["peak_score"] < cfg["incident_score_confirmed_threshold"]
           and hold_incident["state"] == "GESLOTEN_TIMEOUT"
           and hold_incident["resolution_reason"] and "eerdere escalatie" in hold_incident["resolution_reason"])
     all_ok = all_ok and ok
-    print(f"  hold-driven incident escalates all the way to BEVESTIGD (peak_score={hold_incident['peak_score']:.0f}), "
-          f"then times out honestly (state={hold_incident['state']}, reason={hold_incident['resolution_reason']!r}): "
+    print(f"  hold-driven incident escalates to WAARSCHIJNLIJK and verzadigt daar (peak_score={hold_incident['peak_score']:.0f}, "
+          f"BEVESTIGD-drempel={cfg['incident_score_confirmed_threshold']}), then times out honestly "
+          f"(state={hold_incident['state']}, reason={hold_incident['resolution_reason']!r}): "
           f"{'OK' if ok else 'FAIL'}")
+
+    # A sustained hold at the aircraft's OWN filed destination is a single
+    # dimension of evidence (loiter). Even with the route corroborated by our
+    # own observation of the flight, that alone must not read as BEVESTIGD —
+    # this is the structural half of the same finding, independent of where
+    # the score happens to land.
+    hold_dims_ok = not mgr._confirmed_bar_met(hold_incident["id"], route_corroborated_now=True)
+    all_ok = all_ok and hold_dims_ok
+    print(f"  ...en ook structureel niet BEVESTIGD-waardig: één bewijsdimensie (loiter), zelfs met "
+          f"gecorroboreerde route: {'OK' if hold_dims_ok else 'FAIL'}")
 
     # This incident was never notified as a false alarm — the round-15 fix
     # (GESLOTEN_TIMEOUT vs GESLOTEN_VALS_ALARM) exercised against real data
@@ -1277,24 +1788,117 @@ def check_incident_engine_real_case_escalation(airport_db: AirportDB) -> bool:
 
     # The early-warning property round 1 found for the raw detector
     # (holding_pattern fires 1h26m before the crew's real divert decision)
-    # should hold at the INCIDENT level too: BEVESTIGD reached well before
-    # AI850's real MAYDAY declaration (t=189min).
-    # Find the ts of the evidence row whose cumulative score first reached
-    # the CONFIRMED threshold — reconstruct cumulative score from deltas.
+    # must hold at the INCIDENT level too. Measured against the NOTIFYING
+    # threshold (WAARSCHIJNLIJK), not BEVESTIGD: _maybe_notify dispatches on
+    # first reaching either, so WAARSCHIJNLIJK is the moment the operator
+    # actually hears about it — which is what "early warning" means. Before
+    # CHECKPOINT.md bevinding 3 this was asserted against the BEVESTIGD
+    # threshold; that measured the same alert one label too confidently, not
+    # any earlier.
+    # Reconstruct the cumulative score from the evidence deltas to find the ts.
     cum = 0.0
-    confirmed_ts = None
+    likely_ts = None
     for row in db_module.get_incident_evidence(conn, hold_incident["id"]):
         cum += row["delta"]
-        if cum >= cfg["incident_score_confirmed_threshold"]:
-            confirmed_ts = row["ts"]
+        if cum >= cfg["incident_score_likely_threshold"]:
+            likely_ts = row["ts"]
             break
     real_mayday_t = 189 * 60.0
-    ok = confirmed_ts is not None and confirmed_ts < real_mayday_t
+    ok = likely_ts is not None and likely_ts < real_mayday_t
     all_ok = all_ok and ok
-    lead_min = (real_mayday_t - confirmed_ts) / 60.0 if confirmed_ts is not None else None
-    print(f"  incident reaches BEVESTIGD well before the real MAYDAY declaration "
-          f"({fmt_t(real_mayday_t - confirmed_ts) if confirmed_ts is not None else 'n/a'} early): "
+    print(f"  incident reaches WAARSCHIJNLIJK (= het niveau dat notificeert) well before the real "
+          f"MAYDAY declaration ({fmt_t(real_mayday_t - likely_ts) if likely_ts is not None else 'n/a'} early): "
           f"{'OK' if ok else 'FAIL'}")
+
+    return all_ok
+
+
+def check_real_case_confidence_outcomes(airport_db: AirportDB) -> bool:
+    """The one guard that the tightened BEVESTIGD gate (CHECKPOINT.md
+    bevindingen 2/3/4) did not simply make the top level unreachable.
+
+    Every other check in this file verifies that something is now correctly
+    NOT confirmed. That is only half the job: a rule that never says
+    BEVESTIGD is exactly as useless as one that always does. So this runs
+    EVERY real, sourced case in backtest_cases.py through the full incident
+    engine and asserts, per case, the confidence level the evidence actually
+    warrants — the balance, in one table, so a future tuning round can see
+    immediately if it has broken either side.
+
+    Expectations, and why:
+      - real diversions that LANDED somewhere unplanned, on a route we
+        watched them fly -> BEVESTIGD (physical ground truth + corroborated
+        reference data: nothing benign left);
+      - real diversions confirmed by a MAYDAY squawk -> BEVESTIGD (a
+        deliberate 4-digit pilot action needs no support);
+      - a real, genuine deviation still in progress -> not BEVESTIGD; it is
+        real, it is reported (WAARSCHIJNLIJK notifies), but it is not yet
+        certain, and saying otherwise would be a guess dressed as a fact;
+      - a real diversion we only INFERRED from a signal dropping out ->
+        also not BEVESTIGD, for the same reason: signal_lost_near_airport
+        reasons from the ABSENCE of data, and the ordinary explanation for
+        absent data — an ADS-B coverage gap — is exactly what the detector's
+        own docstring says is common near the small/military fields it
+        watches. A real alternative explanation therefore survives, however
+        right the inference turns out to be;
+      - a real weather detour that landed normally -> never escalates."""
+    import classify
+    import db as db_module
+    import incidents as incidents_module
+    from backtest_cases import CASES
+
+    print("\n=== zekerheidsuitkomst per echte case (eind-tot-eind) ===")
+    all_ok = True
+
+    # Per case: does ANY incident for this aircraft deserve to reach
+    # BEVESTIGD by the end of the replay? Keyed on case name prefix.
+    EXPECT_CONFIRMED = {
+        "Air India AI850": True,           # MAYDAY squawk + landing at Gwalior
+        "Air France AF9": True,            # emergency squawk on the turnback
+        # The two United 2078 variants are the same real diversion observed
+        # two different ways, and they land on different levels ON PURPOSE:
+        # the first ends in an observed touchdown at Luke AFB (ground truth),
+        # the second only in the signal dropping out nearby. Same event,
+        # different quality of evidence — so a different confidence.
+        "United 2078 Houston-Phoenix-Luke AFB": True,
+        "United 2078 Houston-Phoenix, signal lost": False,
+        "Emirates EK225": True,            # landed LHR after a corroborated DXB->SFO leg
+        "Transavia France TO3510": True,   # early return, departure observed from the filed origin
+        "Synthetic ATL-MCO": True,         # overflew MCO, landed FLL
+        "Turkish Airlines TK17": True,     # landed Manchester instead of Toronto
+        "Delta 2778": False,               # real storm detour that landed normally
+    }
+
+    for case in CASES:
+        expected = None
+        for prefix, want in EXPECT_CONFIRMED.items():
+            if case.name.startswith(prefix):
+                expected = want
+                break
+        if expected is None:
+            print(f"  {case.name[:60]}: GEEN VERWACHTING GEDEFINIEERD — voeg toe aan EXPECT_CONFIRMED")
+            all_ok = False
+            continue
+
+        conn = db_module.connect(":memory:")
+        mgr = incidents_module.IncidentManager(conn, dict(CONFIG), airport_db)
+        run_case(case, airport_db, dict(CONFIG), incident_mgr=mgr, aircraft_class=classify.AIRLINER)
+        rows = conn.execute(
+            "SELECT id, peak_score, state FROM incidents WHERE hex = ? ORDER BY id", (case.hex_id,)
+        ).fetchall()
+
+        # An incident that reached BEVESTIGD either still reads BEVESTIGD or
+        # has since closed as a confirmed diversion (GESLOTEN_GELAND) — both
+        # mean "the system said certain". notified_state would be the purest
+        # signal but is only set when a transition fires, so read the states.
+        reached = any(state in (incidents_module.CONFIRMED, incidents_module.CLOSED_LANDED)
+                      for _id, _peak, state in rows)
+        detail = ", ".join(f"{state}(peak {peak:.0f})" for _id, peak, state in rows) or "geen incident"
+        ok = reached == expected
+        all_ok = all_ok and ok
+        verdict = "BEVESTIGD bereikt" if reached else "niet BEVESTIGD"
+        print(f"  {case.name[:58]:58} {verdict:18} (verwacht {'wel' if expected else 'niet':4}) "
+              f"[{detail}]: {'OK' if ok else 'FAIL'}")
 
     return all_ok
 
@@ -1450,13 +2054,82 @@ def check_airspace_regressions(airport_db: AirportDB) -> bool:
     all_ok = all_ok and ok
     print(f"  peer-consensus grid clustering (clustered={clustered_count}, expected 2; far={far_count}, expected 0): {'OK' if ok else 'FAIL'}")
 
-    # Reassess should now apply peer_consensus evidence for a clustered
-    # incident (3 total in-cell >= peer_consensus_min_aircraft default 3).
-    mgr.reassess("peer_test_0", {"squawk": "1200"}, 5060.0)
+    # Peer consensus applies to a clustered incident (3 total in-cell >=
+    # peer_consensus_min_aircraft default 3). Entry point moved from
+    # reassess() to apply_context_checks() — CHECKPOINT.md bevinding 5.
+    mgr.apply_context_checks("peer_test_0", 5060.0)
     evidence_sources = {e["source"] for e in db_module.get_incident_evidence(conn, mgr._open["peer_test_0"]["id"])}
     ok = "peer_consensus" in evidence_sources
     all_ok = all_ok and ok
-    print(f"  reassess() applies peer_consensus evidence for a clustered incident: {'OK' if ok else 'FAIL'}")
+    print(f"  apply_context_checks() applies peer_consensus evidence for a clustered incident: {'OK' if ok else 'FAIL'}")
+
+    # CHECKPOINT.md bevinding 5: the whole point of the entry-point move.
+    # An incident that receives FRESH EVIDENCE EVERY CYCLE is the scenario
+    # in which an incident actually climbs — and it used to be exactly the
+    # scenario in which the weather check never ran, because reassess() only
+    # ran in cycles with no events. main.py fetched the hazard polygons
+    # every cycle and passed them in, and they were thrown away unread.
+    hazard_cfg = dict(CONFIG)
+    mgr2 = incidents_module.IncidentManager(db_module.connect(":memory:"), hazard_cfg, airport_db)
+    hazards = [{"hazard": "CONVECTIVE", "id": "TEST2", "alt_lo_ft": None, "alt_hi_ft": None, "polygon": square}]
+    t = 6000.0
+    for i in range(5):
+        ev = Event(hex="wx_test", callsign="WXT", event_type="corridor_deviation", confidence="MOGELIJK",
+                    message=f"m{i}", lat=10.5, lon=10.5, alt=25000, origin_icao="EHAM", dest_icao="EGLL")
+        mgr2.step("wx_test", "WXT", classify.AIRLINER, [ev], {"squawk": "1200"}, t, hazards)
+        t += 60.0
+    wx_sources = {e["source"] for e in db_module.get_incident_evidence(mgr2.db, mgr2._open["wx_test"]["id"])}
+    ok = "weather_explains" in wx_sources
+    all_ok = all_ok and ok
+    print(f"  incident dat ELKE cyclus vers bewijs krijgt, binnen een actieve hazard-polygoon, "
+          f"krijgt tóch de weerverklaring: {'OK' if ok else 'FAIL'}")
+
+    # ...and that explanation persists as a structural block on BEVESTIGD,
+    # not just as a one-off score discount that the next few repeat hits
+    # erase (CHECKPOINT.md bevinding 6a).
+    ok = not mgr2._confirmed_bar_met(mgr2._open["wx_test"]["id"], route_corroborated_now=True)
+    all_ok = all_ok and ok
+    print(f"  ...en die verklaring blokkeert BEVESTIGD structureel, ook met gecorroboreerde route: "
+          f"{'OK' if ok else 'FAIL'}")
+
+    # CHECKPOINT.md bevinding 6b: bad weather does NOT explain landing at
+    # another airport — it is the most common cause of a REAL diversion. The
+    # unscoped check used to hand such an incident -50, dropping it from
+    # BEVESTIGD to MOGELIJK: lowering confidence in precisely the case it
+    # should have raised it.
+    mgr3 = incidents_module.IncidentManager(db_module.connect(":memory:"), hazard_cfg, airport_db)
+    ev_landed = Event(hex="wx_landed", callsign="WXL", event_type="wrong_airport", confidence="BEVESTIGD",
+                      message="m", lat=10.5, lon=10.5, alt=0, origin_icao="EHAM", dest_icao="EGLL",
+                      route_corroborated=True)
+    mgr3.step("wx_landed", "WXL", classify.AIRLINER, [ev_landed], {"squawk": "1200"}, 7000.0, hazards)
+    inc3 = mgr3._open["wx_landed"]
+    wx_sources3 = {e["source"] for e in db_module.get_incident_evidence(mgr3.db, inc3["id"])}
+    ok = "weather_explains" not in wx_sources3 and inc3["state"] == incidents_module.CONFIRMED
+    all_ok = all_ok and ok
+    print(f"  een waargenomen landing elders binnen dezelfde polygoon wordt NIET wegverklaard door weer "
+          f"(score {inc3['score']:.0f}, state {inc3['state']}): {'OK' if ok else 'FAIL'}")
+
+    # Same inversion for peer consensus: an airport closing and several
+    # aircraft each diverting to their alternate is several REAL diversions
+    # — the most newsworthy thing this system can see — and the unscoped
+    # rule suppressed every one of them, since each one's peers are the
+    # others.
+    mgr4 = incidents_module.IncidentManager(db_module.connect(":memory:"), hazard_cfg, airport_db)
+    for i, (lat, lon) in enumerate([(50.01, 10.01), (50.05, 10.08), (50.09, 10.02)]):
+        ev = Event(hex=f"mass_{i}", callsign=f"MD{i}", event_type="wrong_airport", confidence="BEVESTIGD",
+                    message="m", lat=lat, lon=lon, origin_icao="EHAM", dest_icao="EGLL",
+                    route_corroborated=True)
+        mgr4.step(f"mass_{i}", f"MD{i}", classify.AIRLINER, [ev], {"squawk": "1200"}, 8000.0)
+    for i in range(3):
+        mgr4.apply_context_checks(f"mass_{i}", 8060.0)
+    suppressed = [i for i in range(3)
+                  if "peer_consensus" in {e["source"] for e in
+                                          db_module.get_incident_evidence(mgr4.db, mgr4._open[f"mass_{i}"]["id"])}]
+    states = [mgr4._open[f"mass_{i}"]["state"] for i in range(3)]
+    ok = not suppressed and all(s == incidents_module.CONFIRMED for s in states)
+    all_ok = all_ok and ok
+    print(f"  massale diversie (3 toestellen die elk elders landen in dezelfde cel) wordt NIET door "
+          f"peer-consensus onderdrukt (states={states}): {'OK' if ok else f'FAIL (onderdrukt: {suppressed})'}")
 
     return all_ok
 
@@ -1475,10 +2148,15 @@ def main():
     classification_ok = check_classification_regressions()
     route_widening_ok = check_route_widening_regressions()
     wrong_airport_crosscheck_ok = check_wrong_airport_route_crosscheck()
+    wrong_airport_weight_ok = check_wrong_airport_evidence_weight(airport_db)
     pd_sl_crosscheck_ok = check_premature_descent_signal_lost_route_crosscheck(airport_db)
+    saturation_caps_ok = check_saturation_caps(airport_db)
+    route_corroboration_ok = check_route_corroboration(airport_db)
+    confirmed_bar_ok = check_confirmed_bar_structure(airport_db)
     incident_engine_ok = check_incident_engine_regressions(airport_db)
     incident_engine_real_case_ok = check_incident_engine_real_case_escalation(airport_db)
     incident_engine_recovery_ok = check_incident_engine_real_case_recovery(airport_db)
+    real_case_outcomes_ok = check_real_case_confidence_outcomes(airport_db)
     airspace_ok = check_airspace_regressions(airport_db)
 
     print("\n=== summary ===")
@@ -1499,10 +2177,15 @@ def main():
     print(f"aircraft classification: {'OK' if classification_ok else 'FAIL — see above'}")
     print(f"route widening (hexdb.io + negative-retry): {'OK' if route_widening_ok else 'FAIL — see above'}")
     print(f"wrong_airport route-source cross-check: {'OK' if wrong_airport_crosscheck_ok else 'FAIL — see above'}")
+    print(f"wrong_airport evidence weight: {'OK' if wrong_airport_weight_ok else 'FAIL — see above'}")
     print(f"premature_descent/signal_lost route-source cross-check: {'OK' if pd_sl_crosscheck_ok else 'FAIL — see above'}")
+    print(f"verzadigingsplafonds per bewijsbron: {'OK' if saturation_caps_ok else 'FAIL — see above'}")
+    print(f"route-corroboratie: {'OK' if route_corroboration_ok else 'FAIL — see above'}")
+    print(f"structuur van de BEVESTIGD-poort: {'OK' if confirmed_bar_ok else 'FAIL — see above'}")
     print(f"incident engine: {'OK' if incident_engine_ok else 'FAIL — see above'}")
     print(f"incident engine (real-case escalation, AI850): {'OK' if incident_engine_real_case_ok else 'FAIL — see above'}")
     print(f"incident engine (real-case recovery, DAL2778): {'OK' if incident_engine_recovery_ok else 'FAIL — see above'}")
+    print(f"zekerheidsuitkomst per echte case: {'OK' if real_case_outcomes_ok else 'FAIL — see above'}")
     print(f"airspace (weather + peer-consensus): {'OK' if airspace_ok else 'FAIL — see above'}")
 
 

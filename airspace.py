@@ -167,8 +167,8 @@ async def get_active_hazards(session: aiohttp.ClientSession, cfg: dict) -> list[
     polygons, refreshed at most every weather_sigmet_refresh_seconds (these
     don't change nearly as fast as aircraft positions, unlike METAR/aircraft
     data). Meant to be fetched once per tier1 cycle in main.py and passed
-    into IncidentManager.step()/reassess() — kept synchronous there so
-    incidents.py doesn't need its own network layer."""
+    into IncidentManager.step()/apply_context_checks() — kept synchronous
+    there so incidents.py doesn't need its own network layer."""
     ttl = cfg["weather_sigmet_refresh_seconds"]
     sigmets = await _fetch_hazards(session, AIRSIGMET_URL, "airsigmet", ttl)
     isigmets = await _fetch_hazards(session, ISIGMET_URL, "isigmet", ttl)

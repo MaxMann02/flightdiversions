@@ -34,6 +34,19 @@ class AircraftTrack:
     # main.py's ROUTE_REVALIDATION_WINDOW_S and airports.route_plausible's
     # docstring for why a single fixed threshold can't do both jobs at once.
     route_resolved_ts: float | None = None
+    # Of de gefilede route van deze track ONAFHANKELIJK bevestigd is: zelf
+    # waargenomen vertrek vanaf het gefilede vertrekpunt, of zelf waargenomen
+    # voortgang langs de gefilede route (airports.route_corroborated_by_
+    # progress), of een tweede routebron die dezelfde bestemming noemt
+    # (main.py's enrich_events). Wordt met de route mee gereset.
+    #
+    # Bestaat omdat vrijwel elke detector tegen track.route["destination_*"]
+    # meet: één foute route laat er meerdere tegelijk afgaan, wat er in de
+    # score uitziet als onafhankelijke corroboratie terwijl het één fout is
+    # die meerdere keren wordt waargenomen. incidents.py eist deze vlag
+    # daarom voordat route-afhankelijk bewijs BEVESTIGD mag halen. Zie
+    # CHECKPOINT.md bevinding 2/4.
+    route_corroborated: bool = False
     history: deque = field(default_factory=lambda: deque(maxlen=HISTORY_MAXLEN))
     last_seen: float = 0.0
     # None = never observed yet (distinct from False = "was airborne last

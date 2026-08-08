@@ -35,18 +35,54 @@ class Event:
     at_destination: bool = False
     # Same "structured flag, not message-text pattern-matching" convention
     # as at_destination above. Set by main.py's enrich_events for
-    # premature_descent/signal_lost_near_airport when a second, independent
-    # route source (hexdb.io) names a DIFFERENT destination than the one
-    # this Event's dest_icao/message were built from (adsbdb's filed
-    # route) — see BACKTEST_LOG.md ronde 24 and the comment in enrich_events
-    # for the live-data justification. Both detectors already fire at the
-    # lowest confidence tier (MOGELIJK) by design, so unlike wrong_airport
-    # (which falls from BEVESTIGD to WAARSCHIJNLIJK on the same
-    # disagreement) there is no lower confidence label to downgrade INTO —
-    # this flag is the mechanism incidents.py's score_for_event uses
-    # instead, to give a disputed hit reduced evidence weight rather than
-    # relabeling confidence.
+    # wrong_airport/premature_descent/signal_lost_near_airport when a
+    # second, independent route source (hexdb.io) names a DIFFERENT
+    # destination than the one this Event's dest_icao/message were built
+    # from (adsbdb's filed route) — see BACKTEST_LOG.md ronde 24 and the
+    # comment in enrich_events for the live-data justification.
+    # premature_descent/signal_lost already fire at the lowest confidence
+    # tier (MOGELIJK) by design, so for those two there is no lower
+    # confidence label to downgrade INTO and this flag is the ONLY
+    # mechanism available. wrong_airport was added later (CHECKPOINT.md
+    # bevinding 1): it does have a confidence label to lower, but
+    # incidents.py's score_for_event never read ev.confidence outside the
+    # emergency branch, so that relabeling turned out to be equally inert —
+    # the flag is what actually reduces the evidence weight.
     route_source_disputed: bool = False
+    # The affirmative counterpart of route_source_disputed: this Event's
+    # filed route has been corroborated INDEPENDENTLY of the single
+    # crowdsourced schedule lookup it came from — either because a second
+    # route source (hexdb.io) names the SAME destination, or because we
+    # personally watched this aircraft depart the filed origin / fly a
+    # substantial part of the filed route (main.py's tier1_loop, see
+    # airports.route_corroborated_by_progress).
+    #
+    # Needed because almost every detector in this file measures against
+    # track.route["destination_*"], so ONE wrong route makes several of them
+    # fire at once and look like independent corroboration. incidents.py's
+    # _confirmed_bar_met therefore requires this flag before any
+    # route-dependent evidence may reach BEVESTIGD: without it, "the filed
+    # destination is simply wrong" — measured as the dominant live failure
+    # mode, see BACKTEST_LOG.md ronde 18/24 — remains an entirely
+    # reasonable alternative explanation, and BEVESTIGD is supposed to mean
+    # there isn't one. See CHECKPOINT.md bevinding 2/4.
+    route_corroborated: bool = False
+    # Set by detect_landed_wrong_airport when this landing is a genuine
+    # early return: we personally watched this aircraft take off from an
+    # airport and land back at THAT SAME airport within
+    # early_return_max_minutes.
+    #
+    # Its own flag rather than part of route_corroborated (CHECKPOINT.md
+    # bevinding 9) because it is the one wrong_airport case whose evidence
+    # does not depend on the filed route at all — both ends of the
+    # observation are ours. "Took off from X and came straight back to X" is
+    # abnormal whatever the schedule claimed the destination was, so
+    # incidents.py lets it confirm without destination corroboration, next to
+    # the emergency squawk. Note this deliberately requires the observed
+    # DEPARTURE airport to match, not merely the filed origin_icao: matching
+    # the filed origin only rules out the wrong-LEG error, not the
+    # wrong-DESTINATION error that wrong_airport actually hinges on.
+    early_return: bool = False
     # Set by main.py's enrich_events when a second route source's
     # alternate destination doesn't just disagree but actually explains
     # the observation geometrically (e.g. the observed descent is a
@@ -105,6 +141,7 @@ def detect_landed_wrong_airport(track: AircraftTrack, ac: dict, airport_db, cfg:
     dest_icao = track.route["destination_icao"]
     origin = track.route["origin_icao"]
     early_return_note = ""
+    early_return = False
     if nearest["icao"] == origin:
         # Live-tested: small regional/commuter operators (observed on Alaska
         # bush routes, callsigns like BRGxxx/AERxxx) reuse one callsign across
@@ -126,6 +163,12 @@ def detect_landed_wrong_airport(track: AircraftTrack, ac: dict, airport_db, cfg:
         if time_since_takeoff_s is None or time_since_takeoff_s > cfg["early_return_max_minutes"] * 60:
             return None
         early_return_note = f", {int(time_since_takeoff_s / 60)}min na takeoff"
+        # Only claim route-independence (see Event.early_return) when BOTH
+        # ends of the round trip are our own observation: the airport we
+        # watched it leave has to be the airport it just landed at. Comparing
+        # against the filed origin_icao instead would put us right back on
+        # the reference data this flag exists to be independent of.
+        early_return = bool(track.pending_origin) and track.pending_origin["icao"] == nearest["icao"]
     if nearest["icao"] != dest_icao:
         if db_conn and track.callsign:
             # We may have personally watched this callsign land here before —
@@ -143,6 +186,7 @@ def detect_landed_wrong_airport(track: AircraftTrack, ac: dict, airport_db, cfg:
             ),
             weather_icao=dest_icao, lat=landing_point.lat, lon=landing_point.lon,
             squawk=ac.get("squawk"), alt=0, origin_icao=origin, dest_icao=dest_icao,
+            early_return=early_return,
         )
     return None
 
@@ -674,4 +718,13 @@ def evaluate(track: AircraftTrack, ac: dict, airport_db, cfg: dict, db_conn=None
     ev = detect_holding_pattern(track, ac, airport_db, cfg)
     if ev:
         events.append(ev)
+    # Every detector above except detect_emergency measures against
+    # track.route, so they all inherit whatever confidence we have in that
+    # route. Stamped centrally here rather than in each detector: it's a
+    # property of the reference data they share, not of any one geometry
+    # check. detect_signal_lost_near_airport is stamped at its own call site
+    # in main.py (it runs outside evaluate()). See Event.route_corroborated.
+    for ev in events:
+        if not ev.route_corroborated:
+            ev.route_corroborated = bool(track.route_corroborated)
     return events

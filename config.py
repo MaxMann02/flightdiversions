@@ -143,12 +143,19 @@ _DEFAULTS = {
     # 5, punt 4.
     "route_lookup_negative_retry_hours": 12,
 
-    # Incident-levenscyclus (MASTERPLAN.md sectie 3/9, incidents.py — fase
-    # 3, groundwork laid 2026-08-06 but NOT YET wired into main.py/
-    # notifier.py/server.py, see BACKTEST_LOG.md ronde 10). Starting
-    # values, not measured against real data yet — same "begin
-    # beargumenteerd, tune met echte data" discipline as every other
-    # threshold in this file.
+    # Incident-levenscyclus (MASTERPLAN.md sectie 3/9, incidents.py — fase 3,
+    # groundwork laid 2026-08-06, wired into main.py/notifier.py/server.py
+    # since BACKTEST_LOG.md ronde 10). Starting values, not measured against
+    # real data yet — same "begin beargumenteerd, tune met echte data"
+    # discipline as every other threshold in this file.
+    #
+    # Let op (BACKTEST_LOG.md ronde 26): deze drie drempels bepalen sinds die
+    # ronde niet meer in hun eentje het niveau. De score bepaalt hooguit het
+    # plafond; of BEVESTIGD daadwerkelijk bereikbaar is hangt af van de
+    # STRUCTUUR van het bewijs — zie incidents.py's _confirmed_bar_met
+    # (bewijs-dimensies, route-corroboratie) en _SOURCE_SCORE_CAP (per-bron
+    # verzadiging). Alleen aan deze getallen draaien verandert dus minder dan
+    # het lijkt.
     "incident_score_possible_threshold": 25,
     "incident_score_likely_threshold": 55,
     "incident_score_confirmed_threshold": 85,
