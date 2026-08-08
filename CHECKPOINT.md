@@ -17,6 +17,21 @@ zonder exceptions en ving een echte 7700 die correct direct BEVESTIGD werd.
 Een volgende sessie hoeft fase 1 dus niet over te doen; wat nog openstaat, staat
 onderaan dit bestand onder "Nog niet uitgewerkt".
 
+**STAND VAN ZAKEN SESSIE 2 (2026-08-08):** bevindingen 10-13 zijn erbij gekomen,
+alle vier geïmplementeerd en gevalideerd (`python backtest.py`: 10/10 cases,
+**153** assertions, geen FAIL — 33 nieuwe). Ze zitten alle vier in de
+BEVESTIGD-poort en volgen uit één observatie: die poort beslist sinds ronde 1 op
+de STRUCTUUR van het bewijs, maar las die structuur af uit een verzameling
+bronnamen die (a) alleen groeit, (b) betwist niet van onbetwist bewijs
+onderscheidt, en (c) op één moment bevroren werd. Nieuw in de code:
+`_ROUTE_DISPUTED_SOURCES` (punt 2b: bij onenigheid tussen routebronnen geen
+BEVESTIGD), `DIM_GROUND_TRUTH_PROVISIONAL`, `_benign_explanation_scope` +
+`_release_benign_deduction` (vastleggen/aftrekken/poorten uit elkaar),
+`_active_dimensions` + `_REFUTES_DIMENSION` (weerlegging op tijdstempel) en
+`_check_signal_lost_refuted`. Van de vier resterende punten onder "Nog niet
+uitgewerkt" is daarmee het eerste (geen disconfirmatie-mechanisme) gedeeltelijk
+afgehandeld — zie bevinding 12 punt 5 voor wat er bewust van over is.
+
 **Statuslegenda:** `open` → nog niet geïmplementeerd · `geïmplementeerd` → code
 aangepast · `gevalideerd` → `python backtest.py` bevestigt het verwachte gedrag.
 
@@ -991,6 +1006,13 @@ vallen:
   course/corridor_deviation ligt. Een toestel dat na een `premature_descent`
   gewoon weer naar cruise klimt levert positieve tegenbewijs op dat nergens
   geconsumeerd wordt; de enige uitweg is 0.85-verval.
+  → **Sessie 2, bevinding 12: gedeeltelijk opgelost.** Het raamwerk bestaat nu
+  (`_REFUTES_DIMENSION` + `_active_dimensions`, weerlegging op tijdstempel zodat
+  niets permanent uitgeschakeld raakt) en `DIM_VANISHED` wordt daadwerkelijk
+  weerlegd zodra het toestel weer gevolgd wordt. `DIM_VERTICAL`/`DIM_LOITER`
+  bewust nog niet: daarvoor is per-bewijsrij bijgehouden hoogte/positie nodig
+  die er niet is (`inc["last_alt"]` wordt door elke volgende rij overschreven).
+  Zie bevinding 12 punt 5.
 - **`peer_consensus_radius_deg` is een harde rastercel** (2° ≈ 120nm): twee
   toestellen 1nm uit elkaar maar aan weerszijden van een celgrens tellen niet
   mee, twee toestellen 160nm uit elkaar in dezelfde cel wel. MASTERPLAN sectie
@@ -1166,3 +1188,734 @@ _ROUTE_INDEPENDENT_SOURCES = {"emergency_squawk", "wrong_airport_early_return"}
 - `check_real_case_confidence_outcomes` moet ongewijzigd groen blijven: TO3510
   haalt BEVESTIGD via de nieuwe early-return-bron in plaats van via de
   verwijderde corroboratieweg.
+
+---
+
+# SESSIE 2 (2026-08-08) — tweede ronde, voortbouwend op bevindingen 1-9
+
+Bevindingen 1-9 zijn als vaststaand behandeld en niet opnieuw afgeleid. Deze
+ronde is begonnen bij de vraag die na ronde 1 openbleef: de zekerheidspoort
+`_confirmed_bar_met` beslist nu op de STRUCTUUR van het bewijs, maar die
+structuur wordt afgelezen uit een verzameling bronnamen die (a) alleen groeit,
+(b) geen onderscheid maakt tussen bewijs waarvan de premisse vaststaat en
+bewijs waarvan de premisse betwist is, en (c) op één moment wordt bevroren.
+Alle vier de bevindingen hieronder komen daaruit voort.
+
+**Empirisch vastgesteld vóór het schrijven**, niet uit lezing afgeleid — zie de
+probe-uitvoer per bevinding.
+
+---
+
+## Bevinding 10 — Betwist bewijs opent dezelfde poort als onbetwist bewijs
+
+**Status:** gevalideerd (2026-08-08) — `check_disputed_evidence_gate` in
+`backtest.py`, 5 assertions. Gemeten: het disputed-scenario zakt van
+121/BEVESTIGD naar 121/WAARSCHIJNLIJK, een onbevestigde grondstatus levert
+`ground_truth_provisional` in plaats van `ground_truth`, en onbetwist
+grondbewijs blijft BEVESTIGD (140).
+
+### 1. Wat er precies mis is
+
+Twee losse plekken, één onderliggende fout.
+
+**10a. `incidents.py:420` (`_confirmed_bar_met`, punt 2).**
+```python
+        if not (route_corroborated_now or "route_corroborated" in sources):
+            return False
+```
+Dit is een kale OR op "is er corroboratie". Er staat nergens een test op
+tegenspraak. Corroboratie en tegenspraak sluiten elkaar echter niet uit:
+`track.route_corroborated` wordt gezet door `main.py:538-547` op grond van onze
+EIGEN waargenomen voortgang, terwijl `ev.route_source_disputed` los daarvan
+wordt gezet door `main.py:91` / `main.py:209` als hexdb.io een ANDERE
+bestemming noemt. `detector.py:726-729` stempelt vervolgens
+`track.route_corroborated` op élk Event, inclusief het betwiste. Beide vlaggen
+staan dan tegelijk aan, en de poort leest dat als "de route staat vast".
+
+**10b. `incidents.py:141-144` + `incidents.py:436-437` (punt 4).**
+```python
+    "wrong_airport": DIM_GROUND_TRUTH,
+    "wrong_airport_disputed": DIM_GROUND_TRUTH,
+    "wrong_airport_unconfirmed": DIM_GROUND_TRUTH,
+```
+```python
+        if DIM_GROUND_TRUTH in dims:
+            return True
+```
+Punt 4 is de sterkste kortsluiting in het hele model: één bewijsrij, geen
+tweede dimensie nodig. Zijn premisse staat er letterlijk boven — "een
+waargenomen landing ... is fysiek grondbewijs". Maar `wrong_airport_unconfirmed`
+betekent per definitie dat de tweede ADS-B-provider de GRONDSTATUS níét
+bevestigde (`main.py:47-52`), dus dat de waarneming waar punt 4 op steunt juist
+niet vaststaat. Bevinding 1 heeft die twijfel alleen in de SCORE verwerkt
+(90 → 25), niet in de structuur — en de score is precies wat door andere
+bronnen weer aangevuld kan worden.
+
+### 2. Waarom dit een probleem is
+
+Dit is dezelfde fout als bevinding 4, één niveau hoger. Bevinding 4 stelde vast
+dat meerdere detectoren die allemaal tegen dezelfde gefilede bestemming meten
+geen onafhankelijke corroboratie zijn. De reparatie was: eis dat die bestemming
+onafhankelijk bevestigd is. Maar "onafhankelijk bevestigd" is geïmplementeerd
+als "er bestaat ergens een bevestiging", niet als "de bronnen zijn het eens".
+Zodra twee referentiebronnen elkaar tegenspreken is de eerlijke toestand
+*onbeslist*, niet *bevestigd* — en onbeslist is exact de hypothese ("de
+gefilede bestemming klopt niet") die élk route-afhankelijk signaal tegelijk
+verklaart.
+
+Let op wat hier NIET beweerd wordt: hexdb.io is niet betrouwbaarder dan adsbdb.
+Ronde 24 heeft live vastgesteld dat het omgekeerde ook voorkomt (UAL1601's
+hexdb-route was 8 jaar oud). Juist daarom is "hexdb wint" verkeerd — maar
+"adsbdb wint zolang wij zelf voortgang zagen" is even ongefundeerd. Bij
+onenigheid hoort het hoogste zekerheidsniveau dicht te blijven, meer niet.
+WAARSCHIJNLIJK blijft bereikbaar en notificeert al (`_maybe_notify`), dus dit
+kost geen melding.
+
+**Concreet scenario (gemeten, niet bedacht).** Een toestel met gefilede route
+EHAM→EGLL waarvan wij de voortgang richting EGLL zelf hebben gezien
+(`route_corroborated_by_progress` → `track.route_corroborated = True`), wijkt af
+en landt elders. hexdb.io noemt een andere bestemming → `route_source_disputed`
+→ `wrong_airport_disputed` (30 punten). Probe-uitvoer:
+
+```
+  betwiste-route-variant bronnen: ['corridor_deviation', 'premature_descent',
+                                   'route_corroborated', 'wrong_airport_disputed']
+  score 121  state BEVESTIGD
+```
+
+Twee bronnen spreken elkaar tegen over de bestemming, en het systeem meldt
+BEVESTIGD met een 🚨. En voor 10b, dezelfde opzet met een onbevestigde
+grondstatus:
+
+```
+  bronnen: ['corridor_deviation', 'premature_descent',
+            'route_corroborated', 'wrong_airport_unconfirmed']
+  dims:    ['ground_truth', 'lateral', 'vertical']
+  score 116  state BEVESTIGD
+```
+
+### 3. De exacte fix
+
+**a. `incidents.py`, bij de dimensie-constanten, drie nieuwe:**
+
+```python
+# Bronnamen die alleen ontstaan wanneer een TWEEDE routebron (hexdb.io) een
+# ANDERE bestemming noemt dan de gefilede — zie main.py's enrich_events. Hun
+# aanwezigheid is de persistente vastlegging dat de referentiedata achter dit
+# incident BETWIST is; er is geen apart schemaveld voor nodig.
+_ROUTE_DISPUTED_SOURCES = {"wrong_airport_disputed", "signal_lost_disputed",
+                           "premature_descent_disputed"}
+
+# De gedegradeerde wrong_airport-varianten als bronnamen (voor _check_landed).
+_PROVISIONAL_GROUND_TRUTH_SOURCES = {"wrong_airport_disputed", "wrong_airport_unconfirmed"}
+
+# Grondbewijs waarvan de PREMISSE van punt 4 niet vaststaat. Punt 4 zegt: "een
+# waargenomen landing elders IS de diversie". Dat rust op twee dingen die
+# allebei moeten kloppen — de grondwaarneming zelf, en de bestemming waar we
+# hem tegen afmeten. Bij deze twee bronnen is precies één van die twee actief
+# betwist door een tweede bron. Ze houden hun (al gedempte) score en tellen
+# gewoon mee als soft-dimensie voor punt 5, maar ze mogen punt 4's
+# kortsluiting-op-één-bewijsrij niet omzetten.
+DIM_GROUND_TRUTH_PROVISIONAL = "ground_truth_provisional"
+```
+
+**b. `_DIMENSION_FOR_SOURCE` aanpassen:**
+```python
+    "wrong_airport_disputed": DIM_GROUND_TRUTH_PROVISIONAL,
+    "wrong_airport_unconfirmed": DIM_GROUND_TRUTH_PROVISIONAL,
+```
+(`wrong_airport` en `wrong_airport_early_return` blijven `DIM_GROUND_TRUTH`.)
+
+**c. `_SOFT_DIMENSIONS` uitbreiden:**
+```python
+_SOFT_DIMENSIONS = {DIM_VANISHED, DIM_VERTICAL, DIM_LATERAL, DIM_LOITER,
+                    DIM_GROUND_TRUTH_PROVISIONAL}
+```
+
+**d. `_confirmed_bar_met`, direct ná de bestaande punt-2-test, een punt 2b:**
+```python
+        # 2b. Corroboratie en tegenspraak sluiten elkaar niet uit: de
+        #     corroboratie kan uit onze EIGEN waargenomen voortgang komen
+        #     (main.py's route_corroborated_by_progress) terwijl hexdb.io
+        #     tegelijk een andere bestemming noemt. Punt 2 was een kale OR en
+        #     las dat als "de route staat vast". Bij onenigheid tussen twee
+        #     referentiebronnen is de eerlijke toestand onbeslist — en
+        #     onbeslist is precies de hypothese die élk route-afhankelijk
+        #     signaal tegelijk verklaart. Niet "hexdb wint" (ronde 24 mat dat
+        #     hexdb even goed fout kan zijn), maar "bij onenigheid geen
+        #     BEVESTIGD". Zie CHECKPOINT.md bevinding 10.
+        if sources & _ROUTE_DISPUTED_SOURCES:
+            return False
+```
+
+### 4. Validatie
+
+Nieuwe check `check_disputed_evidence_gate` in `backtest.py`:
+- `corridor_deviation` ×3 + `premature_descent` ×3 + `wrong_airport` met
+  `route_source_disputed=True`, route gecorroboreerd. *Vóór:* score 121,
+  BEVESTIGD. *Na:* score 121, WAARSCHIJNLIJK.
+- Idem met `confidence="WAARSCHIJNLIJK"` (onbevestigde grondstatus) en zónder
+  de verticale dimensie, zodat punt 4 het enige is dat kan bevestigen.
+  *Vóór:* punt 4 ontgrendelt op één bewijsrij. *Na:* punt 4 blijft dicht,
+  punt 5 vereist een tweede dimensie.
+- Regressie: onbetwist `wrong_airport` + gecorroboreerde route blijft
+  BEVESTIGD (punt 4 moet niet gewoon dicht komen te staan).
+- `check_real_case_confidence_outcomes` moet ongewijzigd blijven — geen enkele
+  echte case zet `route_source_disputed` (dat gebeurt in `enrich_events`, die
+  netwerk nodig heeft).
+
+---
+
+## Bevinding 11 — Of de weersverklaring wordt vastgelegd hangt af van de VOLGORDE waarin detectoren vuurden
+
+**Status:** gevalideerd (2026-08-08) — `check_benign_explanation_scope` in
+`backtest.py`, 7 assertions. Gemeten: beide volgordes komen nu uit op exact
+91.0/WAARSCHIJNLIJK mét `weather_explains`-rij (vóór: 61/WAARSCHIJNLIJK vs
+91/BEVESTIGD), idem voor peer-consensus, en het "vliegt de polygoon pas later
+in"-scenario zakt van 88/BEVESTIGD naar 88/WAARSCHIJNLIJK.
+
+### 1. Wat er precies mis is
+
+`incidents.py:363-368`:
+```python
+    def _evidence_within_dimensions(self, incident_id: int, dims: set) -> bool:
+        own = self._evidence_dimensions(self._evidence_sources_seen(incident_id))
+        return bool(own) and own.issubset(dims)
+```
+gebruikt door `_check_weather_explains` (`incidents.py:732`) en
+`_check_peer_consensus` (`incidents.py:773`) als toegangsvoorwaarde:
+
+```python
+        if not self._evidence_within_dimensions(inc["id"], _BENIGN_EXPLAINABLE_DIMENSIONS):
+            return None
+```
+
+Deze subset-test wordt geëvalueerd op het moment dat de check draait, en het
+resultaat wordt permanent: beide checks zijn eenmalig per incident
+(`if "weather_explains" in self._evidence_sources_seen(...)`). Slaagt de test
+niet, dan wordt er niets vastgelegd — en de volgende cyclus is de bewijsset
+alleen maar verder gegroeid, dus slaagt hij nóóit meer.
+
+Gevolg: of een incident ooit een `weather_explains`-rij krijgt, hangt af van of
+de laterale detector toevallig vóór of ná de verticale vuurde.
+
+### 2. Waarom dit een probleem is
+
+Twee dingen die niets met elkaar te maken hebben zijn in één test gepropt:
+*mag deze verklaring worden vastgelegd* en *hoeveel score trekt zij af*.
+Bevinding 6 heeft terecht vastgesteld dat de aftrek niet mag gelden voor bewijs
+dat de verklaring niet dekt (een landing elders wordt niet door weer verklaard).
+Maar dat is als een subset-test op de HELE bewijsverzameling geïmplementeerd, en
+daarmee is de verklaring ook uit de ADMINISTRATIE verdwenen zodra er één
+bewijsrij bijkomt die zij niet dekt.
+
+Dat compoundeert precies de verkeerde kant op:
+1. de tweede dimensie schakelt de benigne verklaring uit (punt 3 van
+   `_confirmed_bar_met` vuurt nooit, want `weather_explains` staat er niet), en
+2. diezelfde tweede dimensie ontgrendelt punt 5 (`len(dims & _SOFT_DIMENSIONS)
+   >= 2`).
+
+Eén extra signaal verwijdert dus de ontlastende verklaring én levert de
+bevestigende voorwaarde. Terwijl een toestel dat om een onweersgebied heen
+vliegt én daarbij daalt (ATC-daling, uit ijsvorming zakken, onder de bui door)
+de meest doodgewone waarneming is die er bestaat.
+
+**Concreet scenario (gemeten).** Identiek bewijs, identiek SIGMET-gebied,
+identieke positie — alleen de volgorde verschilt:
+
+```
+lateraal EERST, daarna daling    weather_explains=True    score  61  WAARSCHIJNLIJK
+daling EERST, daarna lateraal    weather_explains=False   score  91  BEVESTIGD
+afwisselend, daling begint       weather_explains=False   score  91  BEVESTIGD
+```
+
+En de realistische variant — het toestel wijkt eerst af en vliegt de polygoon
+pás daarna in, wat de normale gang van zaken is omdat `main.py` de polygonen
+tegen de HUIDIGE positie meet:
+
+```
+  bronnen ['corridor_deviation', 'premature_descent', 'route_corroborated']
+  weather_explains=False  score 88  state BEVESTIGD
+```
+
+Hetzelfde geldt één-op-één voor `_check_peer_consensus` (gemeten: 61/
+WAARSCHIJNLIJK vs 91/BEVESTIGD op dezelfde volgordewissel).
+
+### 3. De exacte fix
+
+Drie taken uit elkaar trekken: **vastleggen**, **aftrekken**, **poorten**.
+
+**a. `incidents.py`: `_evidence_within_dimensions` vervangen door**
+```python
+    def _benign_explanation_scope(self, incident_id: int) -> tuple[bool, bool]:
+        """(mag er een benigne-verklaringrij komen, dekt zij ALLES).
+
+        Twee losse vragen die vroeger één subset-test waren — en dat maakte de
+        uitkomst afhankelijk van de VOLGORDE waarin de detectoren vuurden (zie
+        CHECKPOINT.md bevinding 11), omdat de test op één moment werd
+        geëvalueerd en het resultaat daarna permanent was:
+
+          - VASTLEGGEN mag zodra dit incident ÉÉN bewijsrij heeft die de
+            verklaring dekt (lateraal/wachtpatroon). Dat de polygoon actief is
+            op deze positie is dan een feit over dit incident, ongeacht wat er
+            verder nog aan bewijs ligt — en het hoort niet verloren te gaan
+            doordat er later een dimensie bijkomt die zij niet dekt.
+          - AFTREKKEN mag alleen als de verklaring ALLES dekt wat het incident
+            draagt. Dekt zij maar een deel, dan houdt de rest zijn score
+            (bevinding 6: weer verklaart geen landing elders) en doet de rij
+            alleen mee als poortvoorwaarde in _confirmed_bar_met.
+        """
+        dims = self._evidence_dimensions(self._evidence_sources_seen(incident_id))
+        if not (dims & _BENIGN_EXPLAINABLE_DIMENSIONS):
+            return False, False
+        return True, dims <= _BENIGN_EXPLAINABLE_DIMENSIONS
+```
+
+**b. `_check_weather_explains`: de gate-regel vervangen door**
+```python
+        applies, covers_all = self._benign_explanation_scope(inc["id"])
+        if not applies:
+            return None
+```
+en de `_apply_delta`-aanroep krijgt `-50.0 if covers_all else 0.0` in plaats
+van het vaste `-50.0`. De beschrijving blijft ongewijzigd — een rij met delta
+0.0 is nog steeds de vastlegging dat de verklaring geldt, alleen zonder aftrek.
+
+**c. `_check_peer_consensus`: idem**, met `-55.0 if covers_all else 0.0`. De
+volgorde van de bestaande gates (eenmaligheid, dan scope, dan het
+`peer_consensus_min_aircraft`-quorum) blijft zoals hij is.
+
+**d. `_confirmed_bar_met`, punt 3 vervangen.** De harde blokkade wordt een
+dimensie-aftrek, zodat de verklaring precies neutraliseert wat zij verklaart en
+de rest het op eigen kracht moet halen:
+```python
+        # 3. Een benigne verklaring (actief SIGMET/CWA/TFR op deze positie, of
+        #    meerdere toestellen die tegelijk hetzelfde doen) verloopt niet en
+        #    verzwakt niet door herhaling. Zij NEUTRALISEERT de dimensies die
+        #    zij daadwerkelijk verklaart — eromheen vliegen en wachten — en wat
+        #    daarna overblijft moet de poort op eigen kracht halen. Vroeger was
+        #    dit een harde blokkade op het hele incident; dat blokkeerde ook
+        #    bewijs waar het weer niets mee te maken heeft (laag verdwijnen bij
+        #    een andere luchthaven) en is nu preciezer.
+        if sources & _BENIGN_EXPLANATION_SOURCES:
+            dims = dims - _BENIGN_EXPLAINABLE_DIMENSIONS
+```
+Punt 4 en punt 5 draaien daarna ongewijzigd op de zo verkleinde `dims`.
+
+Uitkomsten die hiermee vastliggen (alle vijf bewust):
+
+| bewijs | benigne verklaring | resterende dims | BEVESTIGD |
+|---|---|---|---|
+| lateraal | weer | leeg | nee (ongewijzigd) |
+| lateraal + wachtpatroon | weer | leeg | nee (ongewijzigd) |
+| lateraal + daling | weer | {verticaal} | **nee (was: ja)** |
+| lateraal + daling + verdwenen | weer | {verticaal, verdwenen} | **ja (was: nee)** |
+| lateraal + landing elders | weer | {grondbewijs} | ja (ongewijzigd, bevinding 6) |
+
+De vierde rij is een bewuste versoepeling: weersvermijding verklaart eromheen
+vliegen, niet laag verdwijnen bij een andere luchthaven terwijl je daalt. De
+oude blokkade gooide dat op één hoop.
+
+### 4. Validatie
+
+Nieuwe check `check_benign_explanation_scope` in `backtest.py`:
+- Dezelfde zes Events in beide volgordes, dezelfde hand-gebouwde
+  hazard-polygoon. *Vóór:* 61/WAARSCHIJNLIJK vs 91/BEVESTIGD. *Na:* beide
+  61/WAARSCHIJNLIJK, en beide met een `weather_explains`-rij.
+- Idem voor peer-consensus. *Vóór:* 61 vs 91. *Na:* beide gelijk.
+- Het "vliegt de polygoon pas later in"-scenario. *Vóór:* 88/BEVESTIGD zonder
+  `weather_explains`-rij. *Na:* `weather_explains` aanwezig, geen BEVESTIGD.
+- Aftrek-regressie (bevinding 6 mag niet terugdraaien): een incident met
+  `wrong_airport`-bewijs binnen dezelfde polygoon houdt zijn score (de nieuwe
+  rij heeft delta 0.0) en blijft BEVESTIGD.
+- Uitbreidingsassertie: lateraal + daling + `signal_lost` binnen een polygoon
+  bereikt wél BEVESTIGD (rij 4 van de tabel).
+- `check_airspace_regressions` moet ongewijzigd groen blijven.
+
+---
+
+## Bevinding 12 — Weerlegd bewijs blijft als dimensie meetellen
+
+**Status:** gevalideerd (2026-08-08) — `check_evidence_refutation` in
+`backtest.py`, 6 assertions over één doorlopende incident-levensloop. Gemeten:
+90/BEVESTIGD → weerlegd naar 42.5/MOGELIJK zodra het toestel weer gevolgd wordt
+→ nieuw lateraal bewijs komt niet verder dan 55/WAARSCHIJNLIJK → opnieuw
+verdwijnen laat de dimensie weer meetellen (95/BEVESTIGD).
+
+### 1. Wat er precies mis is
+
+`incidents.py:423` (`_confirmed_bar_met`):
+```python
+        dims = self._evidence_dimensions(sources)
+```
+`sources` komt uit `_evidence_sources_seen`, dat alle ooit weggeschreven
+evidence-rijen van dit incident leest. Die verzameling groeit alleen. Punt 5
+stelt vervolgens een vraag in de tegenwoordige tijd — "zijn er nu minstens twee
+wezenlijk verschillende soorten abnormaliteit" — op een verzameling die alleen
+geschiedenis kent.
+
+Het scherpste geval is `signal_lost_near_airport`. Dat is de enige bewijsbron
+die uit AFWEZIGHEID van data redeneert: het toestel is van de radar verdwenen,
+laag en dicht bij een andere luchthaven dan de gefilede, dús zal het daar wel
+geland zijn. Zodra hetzelfde toestel weer gewoon getrackt wordt is die
+gevolgtrekking niet zwakker geworden maar **weerlegd** — het is niet geland, het
+zat in een dekkingsgat. `main.py:581` zet `track.missing_cycles = 0` en verder
+gebeurt er niets: de incident-engine hoort er nooit van.
+
+Er is überhaupt maar één weg terug in dit systeem
+(`_check_deviation_recovered`), en die weigert te draaien zodra er ander bewijs
+dan course/corridor_deviation ligt (`incidents.py:693`). Positief tegenbewijs
+wordt dus nergens geconsumeerd; de enige uitweg is 0.85-verval per cyclus.
+
+### 2. Waarom dit een probleem is
+
+Verval en weerlegging zijn niet hetzelfde. Verval zegt "we hebben al een tijdje
+niets meer gehoord". Weerlegging zegt "we hebben nu iets gehoord dat de eerdere
+gevolgtrekking onmogelijk maakt". Een systeem dat alleen het eerste kent, houdt
+een weerlegde gevolgtrekking gewoon in het dossier tot de klok hem heeft
+uitgewist — en tot die tijd blijft zij als volwaardige dimensie meetellen voor
+het hoogste zekerheidsniveau.
+
+Dit raakt precies de dimensie waarvan het project zelf al heeft vastgesteld dat
+zij het zwakst is: de UA2078-signaalverliesvariant staat in de uitkomsttabel
+hierboven expliciet als "redeneert uit afwezigheid van data; een dekkingsgat is
+een gewone verklaring". Die conclusie is één keer per case getrokken, maar er is
+geen mechanisme dat hem uitvoert zodra het dekkingsgat zich daadwerkelijk als
+dekkingsgat openbaart.
+
+**Concreet scenario (gemeten).** Een toestel verdwijnt laag bij een
+niet-bestemming (`signal_lost`, 40 punten, dimensie `vanished`) terwijl er ook
+laterale afwijking ligt. Twee dimensies → BEVESTIGD, 🚨 verstuurd. Drie cycli
+later wordt het toestel weer gevolgd, op 35.000 voet, koers richting bestemming:
+
+```
+  bronnen: ['corridor_deviation', 'route_corroborated', 'signal_lost']
+  score 90 state BEVESTIGD
+  na 3 cycli waarin het toestel WEER GETRACKT wordt:
+    bronnen ['corridor_deviation', 'route_corroborated', 'signal_lost']
+    score 55 state WAARSCHIJNLIJK
+    signal_lost nog steeds bezwarend bewijs: JA
+```
+
+De score zakt alleen door tijdsverval; `signal_lost` staat er nog, de dimensie
+`vanished` telt nog mee, en één nieuw `corridor_deviation`-hitje tilt het
+incident meteen terug naar BEVESTIGD — op grond van een landing die aantoonbaar
+niet heeft plaatsgevonden.
+
+### 3. De exacte fix
+
+Een algemeen weerleggingsmechanisme, plus één concrete weerlegger. Bewust
+gescheiden, zodat latere weerleggers (zie punt 5 hieronder) mechanisch zijn.
+
+**a. `incidents.py`, bij de dimensie-constanten:**
+```python
+# Bronnen die een eerder vastgestelde dimensie WEERLEGGEN in plaats van hem te
+# verzwakken. Verval zegt "we hebben al een tijd niets gehoord"; weerlegging
+# zegt "we hebben nu iets gehoord dat de eerdere gevolgtrekking onmogelijk
+# maakt". Alleen het tweede hoort de dimensie uit de BEVESTIGD-poort te halen.
+#
+# Een weerlegging geldt alleen zolang er daarna geen NIEUW bewijs in diezelfde
+# dimensie is binnengekomen — anders zou één herstel de dimensie permanent
+# uitschakelen, precies de zelfuitschakelende-subsettest-fout die ronde 15 in
+# _check_deviation_recovered heeft opgelost. Daarom wordt er op TIJDSTEMPEL
+# vergeleken, niet op aanwezigheid.
+_REFUTES_DIMENSION = {
+    "signal_lost_refuted": DIM_VANISHED,
+    "deviation_resolved": DIM_LATERAL,
+}
+
+# Bronnen die de "verdwenen, dus vermoedelijk geland"-gevolgtrekking dragen.
+_VANISHED_SOURCES = {"signal_lost", "signal_lost_disputed"}
+```
+en `"signal_lost_refuted"` toevoegen aan `_NON_REINFORCING_SOURCES`.
+
+**b. `incidents.py`, nieuwe methode naast `_evidence_dimensions`:**
+```python
+    def _active_dimensions(self, incident_id: int | None, extra_source: str | None = None) -> set:
+        """De bewijs-dimensies die op DIT MOMENT nog overeind staan.
+
+        _evidence_dimensions leest een verzameling bronnamen die alleen groeit;
+        deze methode leest de rijen mét tijdstempel en laat een dimensie
+        vervallen zodra de laatste weerlegging ervan NIEUWER is dan het laatste
+        bezwarende bewijs erin. Zie CHECKPOINT.md bevinding 12."""
+        rows = db_module.get_incident_evidence(self.db, incident_id) if incident_id is not None else []
+        latest_evidence: dict[str, float] = {}
+        latest_refutation: dict[str, float] = {}
+        for row in rows:
+            src, ts = row["source"], row["ts"]
+            refuted_dim = _REFUTES_DIMENSION.get(src)
+            if refuted_dim is not None:
+                latest_refutation[refuted_dim] = max(latest_refutation.get(refuted_dim, ts), ts)
+                continue
+            if src in _NON_REINFORCING_SOURCES:
+                continue
+            dim = _DIMENSION_FOR_SOURCE.get(src, src)
+            latest_evidence[dim] = max(latest_evidence.get(dim, ts), ts)
+        if (extra_source is not None and extra_source not in _NON_REINFORCING_SOURCES
+                and extra_source not in _REFUTES_DIMENSION):
+            # Staat op het punt weggeschreven te worden, dus per definitie het
+            # nieuwste bewijs — zelfde not-yet-persisted timing als
+            # _confirmed_bar_met's current_source.
+            latest_evidence[_DIMENSION_FOR_SOURCE.get(extra_source, extra_source)] = float("inf")
+        return {dim for dim, ts in latest_evidence.items()
+                if ts > latest_refutation.get(dim, float("-inf"))}
+```
+
+**c. `_confirmed_bar_met`: `dims = self._evidence_dimensions(sources)` vervangen
+door**
+```python
+        dims = self._active_dimensions(incident_id, current_source)
+```
+
+**d. `incidents.py`, nieuwe check:**
+```python
+    def _check_signal_lost_refuted(self, inc: dict, ac: dict | None, now: float):
+        """signal_lost_near_airport is de enige bewijsbron die uit AFWEZIGHEID
+        van data redeneert: het toestel is van de radar, laag en dicht bij een
+        andere luchthaven dan de gefilede, dus zal het daar wel geland zijn.
+        Wordt hetzelfde toestel daarna gewoon weer gevolgd en is het niet aan de
+        grond, dan is die gevolgtrekking niet zwakker geworden maar weerlegd:
+        het is niet geland, het zat in een dekkingsgat — de meest alledaagse
+        verklaring die er voor deze waarneming bestaat.
+
+        Bewust ook geldig als het toestel laag terugkomt: weerlegd wordt de
+        GEVOLGTREKKING dat het al geland is, niet de mogelijkheid dat het straks
+        alsnog ergens anders landt. Gebeurt dat, dan levert detect_landed_wrong_
+        airport echt grondbewijs op in plaats van een gevolgtrekking uit stilte.
+
+        Niet eenmalig-per-incident (anders dan weer/peer-consensus): verdwijnt
+        het toestel later opnieuw, dan hoort die nieuwe ronde opnieuw weerlegd
+        te kunnen worden. De tijdstempelvergelijking hieronder zorgt dat er
+        alleen een rij bijkomt als er sindsdien nieuw verdwijnbewijs was.
+
+        Zie CHECKPOINT.md bevinding 12."""
+        if ac is None or ac.get("on_ground"):
+            return None
+        rows = db_module.get_incident_evidence(self.db, inc["id"])
+        last_vanished = max((r["ts"] for r in rows if r["source"] in _VANISHED_SOURCES), default=None)
+        if last_vanished is None:
+            return None
+        last_refuted = max((r["ts"] for r in rows if r["source"] == "signal_lost_refuted"), default=None)
+        if last_refuted is not None and last_refuted >= last_vanished:
+            return None
+        contrib = self._source_contrib(inc)
+        removed = 0.0
+        for src in _VANISHED_SOURCES:
+            removed += contrib.get(src, 0.0)
+            contrib[src] = 0.0
+        return self._apply_delta(
+            inc["hex"], now, -removed, "signal_lost_refuted",
+            "toestel wordt weer gevolgd — de veronderstelde landing heeft niet plaatsgevonden", None,
+        )
+```
+De bijdrage wordt op 0 gezet in plaats van geblokkeerd: verdwijnt het toestel
+later opnieuw, dan mag een nieuw `signal_lost`-Event gewoon weer scoren.
+
+**e. `step()`: de weerlegging draait elke cyclus**, direct vóór
+`apply_context_checks`:
+```python
+        refuted = self._check_signal_lost_refuted(self._open[hex_id], ac, now)
+        if refuted:
+            t = self._maybe_notify(refuted[0], refuted[1], refuted[2], now)
+            if t:
+                transitions.append(t)
+        if hex_id not in self._open:
+            return transitions
+```
+Bewust NIET in `reassess()`: dat is precies de fout uit bevinding 5 — een
+toestel dat terugkomt en meteen weer bewijs oplevert, is het geval waarin de
+weerlegging het hardst nodig is en waarin `reassess` nooit draait.
+
+### 4. Validatie
+
+Nieuwe check `check_evidence_refutation` in `backtest.py`:
+- `signal_lost` + `corridor_deviation` ×3, route gecorroboreerd, daarna cycli
+  mét live `ac`-data (airborne, 35.000ft). *Vóór:* 90/BEVESTIGD, daarna
+  55/WAARSCHIJNLIJK met `signal_lost` nog als bezwarend bewijs. *Na:* de
+  `signal_lost_refuted`-rij staat er en de dimensie `vanished` telt niet meer
+  mee.
+- Vervolgassertie: een nieuw `corridor_deviation`-Event ná de weerlegging
+  brengt het incident **niet** terug naar BEVESTIGD. *Vóór:* wel.
+- Terugkeerassertie (geen zelfuitschakeling): na de weerlegging een nieuw
+  `signal_lost`-Event → `vanished` telt weer mee, BEVESTIGD weer bereikbaar.
+- Regressie: een toestel dat verdwijnt en verdwenen blijft (`ac=None`) houdt
+  zijn `signal_lost`-bewijs volledig — `check_real_case_confidence_outcomes`
+  moet voor de UA2078-signaalverliesvariant ongewijzigd `nee` blijven en voor
+  alle andere cases ongewijzigd.
+
+### 5. Bewust NIET in deze bevinding meegenomen
+
+`DIM_VERTICAL` en `DIM_LOITER` zijn even goed weerlegbaar (het toestel klimt
+terug naar kruishoogte; het verlaat het wachtpatroon richting bestemming), maar
+daarvoor is per-bewijsrij bijgehouden hoogte/positie nodig die er nu niet is —
+`inc["last_alt"]` wordt door élke volgende evidence-rij overschreven, dus daar
+valt geen betrouwbare "terug naar het niveau van vóór de daling"-test op te
+bouwen. Het raamwerk hierboven (`_REFUTES_DIMENSION` + tijdstempelvergelijking)
+maakt het toevoegen ervan mechanisch zodra die bookkeeping er is. Bewust niet
+half gedaan.
+
+---
+
+## Bevinding 13 — Een nooit-bevestigd incident wordt bij afsluiting alsnog "bevestigde diversie" genoemd
+
+**Status:** gevalideerd (2026-08-08) — assertions (d) en (e) van
+`check_disputed_evidence_gate`. Gemeten: een MOGELIJK-incident met onbevestigde
+grondstatus sluit nu als `GESLOTEN_GELAND` met "niet bevestigd" in de reden;
+onbetwist grondbewijs houdt "bevestigde diversie".
+
+### 1. Wat er precies mis is
+
+`incidents.py:660-664` (`_check_landed`):
+```python
+        if _WRONG_AIRPORT_SOURCES & self._evidence_sources_seen(inc["id"]):
+            return self._resolve(
+                hex_id, now, CLOSED_LANDED,
+                f"geland op {nearest['icao']}, niet de verwachte bestemming — bevestigde diversie",
+            )
+```
+`_WRONG_AIRPORT_SOURCES` bevat óók `wrong_airport_disputed` en
+`wrong_airport_unconfirmed` (`incidents.py:90-91`) — precies de twee varianten
+die bevinding 1 heeft gedegradeerd omdat de waarneming of de referentie betwist
+is.
+
+### 2. Waarom dit een probleem is
+
+Het hele project draait om het verschil tussen "mogelijk", "waarschijnlijk" en
+"bevestigd". Hier zet de afsluitregel dat onderscheid in één zin overboord: een
+incident dat de zekerheidspoort bewust nooit heeft laten passeren, wordt in het
+dossier en op het dashboard weggeschreven met het woord "bevestigde".
+
+Dat is niet cosmetisch. `resolution_reason` is wat er van dit incident overblijft
+zodra het gesloten is — het is de enige zin die een latere lezer (en een latere
+tuningronde die naar historische uitkomsten kijkt) nog ziet. Een archief waarin
+betwiste en onbetwiste diversies allebei "bevestigd" heten, is precies het
+soort meetfout waar dit project zich verder juist tegen wapent.
+
+**Concreet scenario (gemeten).** Eén `wrong_airport`-Event met onbevestigde
+grondstatus, daarna het toestel aan de grond bij EGKK:
+
+```
+  vóór landing: score 25 state MOGELIJK
+  na landing: state='GESLOTEN_GELAND'
+    reden: 'geland op EGKK, niet de verwachte bestemming — bevestigde diversie'
+```
+
+MOGELIJK in, "bevestigde diversie" uit.
+
+### 3. De exacte fix
+
+`incidents.py`, `_check_landed`, het `_WRONG_AIRPORT_SOURCES`-blok vervangen
+door:
+```python
+        landed_sources = _WRONG_AIRPORT_SOURCES & self._evidence_sources_seen(inc["id"])
+        if landed_sources:
+            # De afsluitzin is het enige dat van dit incident overblijft. Een
+            # incident waarvan de grondwaarneming óf de gefilede bestemming
+            # door een tweede bron betwist is, heeft de BEVESTIGD-poort bewust
+            # nooit gehaald (zie _confirmed_bar_met punt 2b/4 en CHECKPOINT.md
+            # bevinding 10) — dan hoort er ook geen "bevestigde" in de
+            # afsluitreden te staan. GESLOTEN_GELAND blijft wel de juiste
+            # state: het toestel is hier daadwerkelijk geland, alleen de
+            # duiding ervan is onzeker.
+            if landed_sources - _PROVISIONAL_GROUND_TRUTH_SOURCES:
+                reden = f"geland op {nearest['icao']}, niet de verwachte bestemming — bevestigde diversie"
+            else:
+                reden = (f"geland op {nearest['icao']}, niet de verwachte bestemming — niet bevestigd "
+                         f"(grondstatus of bestemming betwist door een tweede bron)")
+            return self._resolve(hex_id, now, CLOSED_LANDED, reden)
+```
+(`_PROVISIONAL_GROUND_TRUTH_SOURCES` komt uit bevinding 10.)
+
+### 4. Validatie
+
+Assertie toegevoegd aan `check_disputed_evidence_gate`:
+- `wrong_airport` met `confidence="WAARSCHIJNLIJK"`, daarna aan de grond bij een
+  niet-bestemming. *Vóór:* `resolution_reason` bevat "bevestigde diversie".
+  *Na:* bevat "niet bevestigd", state blijft `GESLOTEN_GELAND`.
+- Regressie: onbetwist `wrong_airport` sluit nog steeds met "bevestigde
+  diversie".
+
+---
+
+## Extra tijdens implementatie van sessie 2 gevonden
+
+### D. De benigne AFTREK bleef volgorde-afhankelijk nadat de VASTLEGGING het niet meer was
+Bevinding 11's fix maakte het vastleggen van de verklaring volgorde-onafhankelijk,
+maar niet de aftrek: vuurde de laterale detector eerst, dan dekte de verklaring
+op dat moment álles en werd er -50 afgetrokken; kwam de daling daarna, dan bleef
+die aftrek staan. Vuurde de daling eerst, dan werd er nooit afgetrokken. Gemeten
+ná de eerste helft van de fix: hetzelfde bewijs kwam uit op score 61 of 91 —
+beide WAARSCHIJNLIJK, dus het oordeel was al gerepareerd, maar bij een derde
+dimensie gaat de score weer langs de BEVESTIGD-drempel en kan dat verschil
+alsnog kantelen.
+
+Opgelost met `_release_benign_deduction` (draait elke cyclus vanuit
+`apply_context_checks`): zodra het incident bewijs draagt dat de verklaring niet
+dekt, wordt exact de eerder toegekende aftrek teruggegeven. Daarvoor moest de
+aftrek zelf ook exact worden: `-min(50.0, inc["score"])` in plaats van een vaste
+`-50.0`, want `_apply_delta` klemt de score op 0 en een vaste -50 verwijdert dan
+een onbekend deel dat naderhand niet meer precies terug te draaien is. De
+verklaringrij zelf blijft staan — zij is nog steeds waar voor de dimensies die
+zij dekt en blijft die in punt 3 neutraliseren; alleen haar score-effect op het
+incident als geheel vervalt. Gemeten na deze toevoeging: beide volgordes exact
+91.0/WAARSCHIJNLIJK.
+
+### E. `_check_landed` sloot een incident soms zonder dat `step()` dat merkte
+`step()` deed:
+```python
+        landed_t = self._check_landed(hex_id, ac, now)
+        if landed_t:
+            transitions.append(landed_t)
+            return transitions
+```
+Maar `_check_landed` sluit het incident via `_resolve()`, en die geeft alléén een
+transition terug als er ook genotificeerd moet worden (`_maybe_notify`). Een
+landing die stilletjes afsluit — een incident dat nooit boven MOGELIJK is
+gekomen, precies het geval dat bevinding 13 aanwijst — leverde dus `None` op
+terwijl het incident wél uit `self._open` verdwenen was, waarna de rest van
+`step()` doorliep op een gesloten incident. Dat viel niet op zolang alles
+daaronder `self._open.get()` gebruikte; de eerste directe `self._open[hex_id]`
+(de weerleggingscheck van bevinding 12) sloeg er meteen op stuk met een
+`KeyError`. Nu test `step()` op `hex_id not in self._open` in plaats van op de
+returnwaarde.
+
+### F. `signal_lost` mét live positie wordt onmiddellijk weerlegd — en dat hoort zo
+Bij het schrijven van `check_benign_explanation_scope` assertion (e) bleek de
+eerste opzet te falen: `dims` bevatte geen `vanished`. Oorzaak was de testopzet,
+niet de code — de helper voedde élke stap een live `ac`, en dan weerlegt de
+engine de "verdwenen, dus geland"-gevolgtrekking terecht in dezelfde cyclus.
+
+In productie kan dat niet: `detect_signal_lost_near_airport` draait in
+`main.py`'s lus over toestellen die juist NIET in de snapshot zitten, en die
+`step()`-aanroep geeft `ac=None` mee (`main.py:647`). `backtest.py`'s `run_case`
+spiegelt dat al expliciet. Vastgelegd door de test nu ook met `ac=None` te
+voeren, met die reden erbij — en tegelijk is dit de bevestiging dat de
+weerlegging niet alleen bij verval maar meteen bij het eerste levensteken
+aangrijpt.
+
+Bijkomend gevolg dat de moeite van vermelden waard is: ná een verdwijning kan er
+geen nieuw lateraal/verticaal bewijs meer bijkomen, want die detectoren hebben
+live posities nodig. `vanished` kan dus alleen samen met andere dimensies
+bestaan als het verdwijnen het LAATSTE is wat er gebeurt — wat het risico van
+bevinding 12 juist scherper maakt: dat is precies de toestand waarin het
+incident blijft hangen tot het vervalt.
+
+### G. Wat bevinding 10b in de praktijk wél en niet verandert (eerlijke afbakening)
+Punt 4's kortsluiting-op-één-bewijsrij was voor de gedegradeerde varianten al
+moeilijk uitbuitbaar via de SCORE alleen: `wrong_airport_unconfirmed` zit op
+plafond 25 en `wrong_airport_disputed` op 30, dus in hun eentje halen ze de
+BEVESTIGD-drempel (85) nooit. De structurele fix verandert daarom vooral twee
+dingen, en dat is minder spectaculair dan de gemeten 116/BEVESTIGD uit de probe
+suggereert (die score kwam in werkelijkheid vooral uit lateraal + verticaal, dus
+uit punt 5, niet uit punt 4):
+
+1. Een benigne verklaring (weer/peer-consensus) is niet langer uitgeschakeld
+   door een betwiste grondwaarneming — punt 3 zonderde alleen `DIM_GROUND_TRUTH`
+   uit, en dat is nu terecht beperkt tot onbetwist grondbewijs.
+2. De poort hangt niet meer af van de vraag of de verzadigingsplafonds op hun
+   huidige waarden blijven staan. Dat is precies het soort verborgen koppeling
+   waar deze hele ronde over gaat: een tuningronde die `_SOURCE_SCORE_CAP`
+   verhoogt, hoort daarmee niet ongemerkt een structurele poort te openen.
+
+Het echte werk tegen betwist bewijs doet 10a (punt 2b): dat blokkeert het
+disputed-scenario ongeacht hoe hoog de score komt.

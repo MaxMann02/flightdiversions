@@ -80,7 +80,8 @@ REPEATABLE_EVENT_TYPES = DEVIATION_EVENT_TYPES + ("holding_pattern", "premature_
 # permanently disable recovery detection for the rest of the incident's
 # life. See that method's docstring / BACKTEST_LOG.md ronde 15.
 _NON_REINFORCING_SOURCES = {"deviation_resolved", "weather_explains", "peer_consensus",
-                            "route_corroborated"}
+                            "route_corroborated", "benign_explanation_released",
+                            "signal_lost_refuted"}
 
 # Alle bronnamen die score_for_event voor een wrong_airport-Event kan
 # produceren (vol vertrouwen / betwiste routebron / onbevestigde grondstatus).
@@ -109,6 +110,19 @@ _WRONG_AIRPORT_SOURCES = {"wrong_airport", "wrong_airport_disputed", "wrong_airp
 #    precies het DLH8NK-scenario (kloppende origin, foute bestemming) weer door.
 _ROUTE_INDEPENDENT_SOURCES = {"emergency_squawk", "wrong_airport_early_return"}
 
+# Bronnamen die alleen ontstaan wanneer een TWEEDE routebron (hexdb.io) een
+# ANDERE bestemming noemt dan de gefilede — zie main.py's enrich_events. Hun
+# aanwezigheid in de evidence-tabel is de persistente vastlegging dat de
+# referentiedata achter dit incident BETWIST is; daar is geen apart schemaveld
+# voor nodig. Zie _confirmed_bar_met punt 2b en CHECKPOINT.md bevinding 10.
+_ROUTE_DISPUTED_SOURCES = {"wrong_airport_disputed", "signal_lost_disputed",
+                           "premature_descent_disputed"}
+
+# De twee gedegradeerde wrong_airport-varianten, als bronnamen. Gebruikt door
+# _check_landed om de afsluitreden eerlijk te houden (CHECKPOINT.md bevinding
+# 13); _DIMENSION_FOR_SOURCE mapt ze daarnaast op DIM_GROUND_TRUTH_PROVISIONAL.
+_PROVISIONAL_GROUND_TRUTH_SOURCES = {"wrong_airport_disputed", "wrong_airport_unconfirmed"}
+
 # ---------------------------------------------------------------------------
 # Bewijs-DIMENSIES (CHECKPOINT.md bevinding 4)
 #
@@ -134,13 +148,24 @@ DIM_VERTICAL = "vertical"          # hoogteprofiel klopt niet met de bestemming
 DIM_LATERAL = "lateral"            # laterale koers-/corridorafwijking
 DIM_LOITER = "loiter"              # wachtpatroon
 
+# Grondbewijs waarvan de PREMISSE van _confirmed_bar_met punt 4 niet vaststaat.
+# Punt 4 zegt: "een waargenomen landing elders IS de diversie". Dat rust op twee
+# dingen die allebei moeten kloppen — de grondwaarneming zelf, en de bestemming
+# waar we hem tegen afmeten. Bij wrong_airport_unconfirmed is de eerste actief
+# betwist (de tweede ADS-B-provider bevestigde de grondstatus niet), bij
+# wrong_airport_disputed de tweede (hexdb.io noemt een andere bestemming). Ze
+# houden hun al gedempte score en tellen gewoon mee als soft-dimensie voor punt
+# 5, maar ze mogen punt 4's kortsluiting-op-één-bewijsrij niet omzetten — zie
+# CHECKPOINT.md bevinding 10.
+DIM_GROUND_TRUTH_PROVISIONAL = "ground_truth_provisional"
+
 _DIMENSION_FOR_SOURCE = {
     "emergency_squawk": DIM_DECLARED,
     "emergency_status": DIM_DECLARED,
     "emergency_status_low_trust": DIM_DECLARED,
     "wrong_airport": DIM_GROUND_TRUTH,
-    "wrong_airport_disputed": DIM_GROUND_TRUTH,
-    "wrong_airport_unconfirmed": DIM_GROUND_TRUTH,
+    "wrong_airport_disputed": DIM_GROUND_TRUTH_PROVISIONAL,
+    "wrong_airport_unconfirmed": DIM_GROUND_TRUTH_PROVISIONAL,
     "wrong_airport_early_return": DIM_GROUND_TRUTH,
     "signal_lost": DIM_VANISHED,
     "signal_lost_disputed": DIM_VANISHED,
@@ -154,7 +179,11 @@ _DIMENSION_FOR_SOURCE = {
 # Dimensies die "één soort abnormaliteit" vertegenwoordigen: twee daarvan
 # tegelijk is het kwalitatieve verschil dat _confirmed_bar_met zoekt. DECLARED
 # staat er bewust NIET in — zie punt 1/5 van _confirmed_bar_met.
-_SOFT_DIMENSIONS = {DIM_VANISHED, DIM_VERTICAL, DIM_LATERAL, DIM_LOITER}
+# DIM_GROUND_TRUTH_PROVISIONAL staat er wél in: een betwiste grondwaarneming is
+# nog steeds een ANDERE soort waarneming dan een koersafwijking, ze mag alleen
+# niet in haar eentje bevestigen (CHECKPOINT.md bevinding 10).
+_SOFT_DIMENSIONS = {DIM_VANISHED, DIM_VERTICAL, DIM_LATERAL, DIM_LOITER,
+                    DIM_GROUND_TRUTH_PROVISIONAL}
 
 # Dimensies die een actieve weers-/luchtruimverklaring of een gedeelde
 # regionale oorzaak daadwerkelijk kán verklaren: eromheen vliegen en wachten.
@@ -164,6 +193,38 @@ _SOFT_DIMENSIONS = {DIM_VANISHED, DIM_VERTICAL, DIM_LATERAL, DIM_LOITER}
 # ver van de bestemming. Zie CHECKPOINT.md bevinding 6.
 _BENIGN_EXPLAINABLE_DIMENSIONS = {DIM_LATERAL, DIM_LOITER}
 _BENIGN_EXPLANATION_SOURCES = {"weather_explains", "peer_consensus"}
+
+# De aftrek van een benigne verklaring codeert de uitspraak "dit incident is
+# waarschijnlijk gewoon weer/een gedeelde oorzaak". Komt er daarna bewijs bij
+# dat die verklaring niet dekt, dan is die uitspraak over het incident als
+# geheel niet meer waar en hoort de aftrek terug — anders scoort een incident
+# dat er een ONVERKLAARDE abnormaliteit bij kreeg lager dan een identiek
+# incident waar hetzelfde bewijs in de andere volgorde binnenkwam, precies de
+# volgorde-afhankelijkheid van CHECKPOINT.md bevinding 11.
+_BENIGN_RELEASE_SOURCE = "benign_explanation_released"
+
+# ---------------------------------------------------------------------------
+# Weerlegging (CHECKPOINT.md bevinding 12)
+#
+# Verval en weerlegging zijn niet hetzelfde. Verval zegt "we hebben al een tijd
+# niets meer gehoord"; weerlegging zegt "we hebben nu iets gehoord dat de
+# eerdere gevolgtrekking onmogelijk maakt". Alleen het tweede hoort een
+# dimensie uit de BEVESTIGD-poort te halen. Tot deze ronde kende dit systeem
+# alleen het eerste: _confirmed_bar_met las een bronnenverzameling die alleen
+# groeit, en stelde daarop een vraag in de tegenwoordige tijd.
+#
+# Een weerlegging geldt alleen zolang er daarna geen NIEUW bewijs in diezelfde
+# dimensie is binnengekomen — anders zou één herstel de dimensie permanent
+# uitschakelen, precies de zelfuitschakelende-subsettest-fout die ronde 15 in
+# _check_deviation_recovered heeft opgelost. Daarom vergelijkt
+# _active_dimensions TIJDSTEMPELS, niet aanwezigheid.
+_REFUTES_DIMENSION = {
+    "signal_lost_refuted": DIM_VANISHED,
+    "deviation_resolved": DIM_LATERAL,
+}
+
+# Bronnen die de "verdwenen, dus vermoedelijk geland"-gevolgtrekking dragen.
+_VANISHED_SOURCES = {"signal_lost", "signal_lost_disputed"}
 
 # ---------------------------------------------------------------------------
 # Verzadigingsplafonds per bewijsbron (CHECKPOINT.md bevinding 3 en 8)
@@ -360,12 +421,69 @@ class IncidentManager:
         reinforcing = sources - _NON_REINFORCING_SOURCES
         return {_DIMENSION_FOR_SOURCE.get(s, s) for s in reinforcing}
 
-    def _evidence_within_dimensions(self, incident_id: int, dims: set) -> bool:
-        """True als ALLE bezwarende evidence van dit incident binnen `dims`
-        valt. Gebruikt om een benigne verklaring (weer/peer-consensus) alleen
-        toe te passen op bewijs dat zij daadwerkelijk kán verklaren."""
-        own = self._evidence_dimensions(self._evidence_sources_seen(incident_id))
-        return bool(own) and own.issubset(dims)
+    def _active_dimensions(self, incident_id: int | None, extra_source: str | None = None) -> set:
+        """De bewijs-dimensies die op DIT MOMENT nog overeind staan.
+
+        _evidence_dimensions leest een verzameling bronnamen die alleen groeit;
+        deze methode leest de evidence-rijen mét tijdstempel en laat een
+        dimensie vervallen zodra de laatste WEERLEGGING ervan nieuwer is dan het
+        laatste bezwarende bewijs erin. Komt er daarna opnieuw bewijs in die
+        dimensie binnen, dan telt zij vanzelf weer mee — geen enkele weerlegging
+        schakelt een dimensie permanent uit. Zie CHECKPOINT.md bevinding 12.
+
+        extra_source: een bron die op het punt staat weggeschreven te worden
+        maar nog niet persistent is — zelfde not-yet-persisted timing als
+        _confirmed_bar_met's current_source, en per definitie het nieuwste
+        bewijs."""
+        rows = db_module.get_incident_evidence(self.db, incident_id) if incident_id is not None else []
+        latest_evidence: dict[str, float] = {}
+        latest_refutation: dict[str, float] = {}
+        for row in rows:
+            src, ts = row["source"], row["ts"]
+            refuted_dim = _REFUTES_DIMENSION.get(src)
+            if refuted_dim is not None:
+                latest_refutation[refuted_dim] = max(latest_refutation.get(refuted_dim, ts), ts)
+                continue
+            if src in _NON_REINFORCING_SOURCES:
+                continue
+            dim = _DIMENSION_FOR_SOURCE.get(src, src)
+            latest_evidence[dim] = max(latest_evidence.get(dim, ts), ts)
+        if (extra_source is not None and extra_source not in _NON_REINFORCING_SOURCES
+                and extra_source not in _REFUTES_DIMENSION):
+            latest_evidence[_DIMENSION_FOR_SOURCE.get(extra_source, extra_source)] = float("inf")
+        return {dim for dim, ts in latest_evidence.items()
+                if ts > latest_refutation.get(dim, float("-inf"))}
+
+    def _benign_explanation_scope(self, incident_id: int) -> tuple[bool, bool]:
+        """(mag er een benigne-verklaringrij komen, dekt zij ALLES).
+
+        Twee losse vragen die vroeger één subset-test waren
+        (_evidence_within_dimensions) — en dat maakte de uitkomst afhankelijk
+        van de VOLGORDE waarin de detectoren toevallig vuurden, zie
+        CHECKPOINT.md bevinding 11: de test werd op één moment geëvalueerd en
+        het resultaat was daarna permanent, want beide checks zijn eenmalig per
+        incident. Vuurde de laterale detector eerst, dan slaagde de subset-test
+        en werd de weersverklaring vastgelegd; vuurde de daling eerst, dan
+        faalde hij en werd hij daarna nooit meer waar, omdat de bewijsset
+        alleen groeit. Identiek bewijs in dezelfde SIGMET-polygoon kwam zo uit
+        op WAARSCHIJNLIJK of op BEVESTIGD, puur op volgorde.
+
+          - VASTLEGGEN mag zodra dit incident ÉÉN bewijsrij heeft die de
+            verklaring dekt (lateraal/wachtpatroon). Dat er een actieve
+            hazard-polygoon op deze positie ligt is dan een feit over dit
+            incident, ongeacht wat er verder nog aan bewijs ligt — en dat feit
+            hoort niet te verdwijnen doordat er later een dimensie bijkomt die
+            de verklaring niet dekt.
+          - AFTREKKEN mag alleen als de verklaring ALLES dekt wat het incident
+            draagt. Dekt zij maar een deel, dan houdt de rest zijn score
+            (bevinding 6: weer verklaart geen landing elders — dat is juist de
+            meest voorkomende oorzaak van een ECHTE diversie) en doet de rij
+            alleen mee als poortvoorwaarde in _confirmed_bar_met punt 3.
+        """
+        dims = self._active_dimensions(incident_id)
+        if not (dims & _BENIGN_EXPLAINABLE_DIMENSIONS):
+            return False, False
+        return True, dims <= _BENIGN_EXPLAINABLE_DIMENSIONS
 
     def _confirmed_bar_met(self, incident_id: int | None, current_source: str | None = None,
                             route_corroborated_now: bool = False) -> bool:
@@ -381,7 +499,8 @@ class IncidentManager:
           - sensorruis / decodeartefact          -> herhaling (zit al in de
             score, en convergeert nu netjes via _SOURCE_SCORE_CAP);
           - de gefilede route is verouderd/fout  -> route-corroboratie
-            (punt 2 hieronder). Dit is bij dit systeem niet theoretisch maar
+            (punt 2) EN geen actieve tegenspraak van een tweede routebron
+            (punt 2b). Dit is bij dit systeem niet theoretisch maar
             de GEMETEN hoofdfoutbron: 24/25 live wrong_airport/BEVESTIGD-hits
             zonder corroboratie (ronde 18) en 6/8 hexdb-lookups die een andere
             bestemming noemden (ronde 24);
@@ -420,16 +539,45 @@ class IncidentManager:
         if not (route_corroborated_now or "route_corroborated" in sources):
             return False
 
-        dims = self._evidence_dimensions(sources)
+        # 2b. Corroboratie en tegenspraak sluiten elkaar niet uit: de
+        #     corroboratie kan uit onze EIGEN waargenomen voortgang komen
+        #     (main.py's route_corroborated_by_progress) terwijl hexdb.io
+        #     tegelijk een ANDERE bestemming noemt, en detector.py stempelt
+        #     track.route_corroborated vervolgens op élk Event — ook op het
+        #     betwiste. Punt 2 was een kale OR en las dat als "de route staat
+        #     vast". Bij onenigheid tussen twee referentiebronnen is de
+        #     eerlijke toestand onbeslist, en onbeslist is precies de
+        #     hypothese die élk route-afhankelijk signaal tegelijk verklaart.
+        #     Dit is nadrukkelijk niet "hexdb wint" — ronde 24 mat dat hexdb
+        #     even goed jaren oude data kan hebben (UAL1601) — maar "bij
+        #     onenigheid geen BEVESTIGD". Zie CHECKPOINT.md bevinding 10.
+        if sources & _ROUTE_DISPUTED_SOURCES:
+            return False
+
+        # Bewust _active_dimensions en niet _evidence_dimensions: punten 4 en 5
+        # stellen een vraag in de tegenwoordige tijd ("wat voor soorten
+        # abnormaliteit zien we NU"), dus mogen ze niet lezen uit een
+        # verzameling die alleen geschiedenis kent. Zie bevinding 12.
+        dims = self._active_dimensions(incident_id, current_source)
 
         # 3. Een benigne verklaring (actief SIGMET/CWA/TFR op deze positie, of
-        #    meerdere toestellen die tegelijk hetzelfde doen) verloopt niet:
-        #    zolang het bewijs binnen de dimensies valt die zij verklaart,
-        #    blijft zij een redelijk alternatief — hoe lang het gedrag ook
-        #    aanhoudt. Grondbewijs valt daarbuiten: een landing elders wordt
-        #    door weersvermijding niet verklaard.
-        if (sources & _BENIGN_EXPLANATION_SOURCES) and DIM_GROUND_TRUTH not in dims:
-            return False
+        #    meerdere toestellen die tegelijk hetzelfde doen) verloopt niet en
+        #    verzwakt niet door herhaling: zolang zij geldt, blijft zij een
+        #    redelijk alternatief, hoe lang het gedrag ook aanhoudt. Zij
+        #    NEUTRALISEERT daarom de dimensies die zij daadwerkelijk verklaart
+        #    — eromheen vliegen en wachten — en wat daarna overblijft moet de
+        #    poort op eigen kracht halen.
+        #
+        #    Was een harde blokkade op het hele incident. Dat was tegelijk te
+        #    grof en, door bevinding 11, te vaak afwezig: het blokkeerde ook
+        #    bewijs waar weer niets mee te maken heeft (laag verdwijnen bij een
+        #    andere luchthaven terwijl je daalt), terwijl het in het scenario
+        #    waar het om ging vaak helemaal niet werd vastgelegd. De aftrek per
+        #    dimensie doet allebei preciezer. Grondbewijs valt hier sowieso
+        #    buiten: een landing elders wordt door weersvermijding niet
+        #    verklaard (bevinding 6).
+        if sources & _BENIGN_EXPLANATION_SOURCES:
+            dims = dims - _BENIGN_EXPLAINABLE_DIMENSIONS
 
         # 4. Een waargenomen landing op een andere dan de (nu gecorroboreerde)
         #    gefilede bestemming is fysiek grondbewijs — dat ís de diversie.
@@ -657,11 +805,23 @@ class IncidentManager:
             return None
         if inc.get("dest_icao") and nearest["icao"] == inc["dest_icao"]:
             return self._resolve(hex_id, now, CLOSED_NORMAL, "geland op verwachte bestemming")
-        if _WRONG_AIRPORT_SOURCES & self._evidence_sources_seen(inc["id"]):
-            return self._resolve(
-                hex_id, now, CLOSED_LANDED,
-                f"geland op {nearest['icao']}, niet de verwachte bestemming — bevestigde diversie",
-            )
+        landed_sources = _WRONG_AIRPORT_SOURCES & self._evidence_sources_seen(inc["id"])
+        if landed_sources:
+            # De afsluitzin is het enige dat van dit incident overblijft zodra
+            # het gesloten is — voor een latere lezer én voor een latere
+            # tuningronde die naar historische uitkomsten kijkt. Een incident
+            # waarvan de grondwaarneming óf de gefilede bestemming door een
+            # tweede bron betwist is, heeft de BEVESTIGD-poort bewust nooit
+            # gehaald (zie _confirmed_bar_met punt 2b/4); dan hoort er ook geen
+            # "bevestigde" in de afsluitreden te staan. GESLOTEN_GELAND blijft
+            # wel de juiste state: het toestel is hier daadwerkelijk geland,
+            # alleen de duiding ervan is onzeker. Zie CHECKPOINT.md bevinding 13.
+            if landed_sources - _PROVISIONAL_GROUND_TRUTH_SOURCES:
+                reden = f"geland op {nearest['icao']}, niet de verwachte bestemming — bevestigde diversie"
+            else:
+                reden = (f"geland op {nearest['icao']}, niet de verwachte bestemming — niet bevestigd "
+                         f"(grondstatus of bestemming betwist door een tweede bron)")
+            return self._resolve(hex_id, now, CLOSED_LANDED, reden)
         return None
 
     def _check_deviation_recovered(self, inc: dict, ac: dict | None, now: float):
@@ -729,13 +889,24 @@ class IncidentManager:
             return None
         if "weather_explains" in self._evidence_sources_seen(inc["id"]):
             return None
-        if not self._evidence_within_dimensions(inc["id"], _BENIGN_EXPLAINABLE_DIMENSIONS):
+        applies, covers_all = self._benign_explanation_scope(inc["id"])
+        if not applies:
             return None
         hazard = explain_position(inc["last_lat"], inc["last_lon"], inc.get("last_alt"), hazards)
         if not hazard:
             return None
+        # Dekt de verklaring niet alles wat dit incident draagt, dan wordt zij
+        # wél vastgelegd (delta 0.0) maar trekt zij niets af — zie
+        # _benign_explanation_scope. De rij telt dan alleen mee als
+        # poortvoorwaarde in _confirmed_bar_met punt 3.
+        # -min(50, score) in plaats van een vaste -50: _apply_delta klemt de
+        # score op 0, dus een vaste -50 verwijdert een onbekend deel ervan en
+        # is daarna niet meer precies terug te draaien. Door de aftrek nooit
+        # groter te maken dan wat er staat, is de weggeschreven delta exact wat
+        # er is weggehaald — en dat is wat _release_benign_deduction eventueel
+        # weer teruggeeft.
         return self._apply_delta(
-            inc["hex"], now, -50.0, "weather_explains",
+            inc["hex"], now, -min(50.0, inc["score"]) if covers_all else 0.0, "weather_explains",
             f"actief weer ({hazard['hazard']}, {hazard['id']}) op deze positie — verklaart mogelijk de afwijking", None,
         )
 
@@ -770,15 +941,101 @@ class IncidentManager:
         each one's peers are the other nine)."""
         if "peer_consensus" in self._evidence_sources_seen(inc["id"]):
             return None
-        if not self._evidence_within_dimensions(inc["id"], _BENIGN_EXPLAINABLE_DIMENSIONS):
+        applies, covers_all = self._benign_explanation_scope(inc["id"])
+        if not applies:
             return None
         # -1: peer count already excludes this incident itself, so N-1
         # others in the same cell means N total including this one.
         if self._peer_consensus_count(inc) < self.cfg["peer_consensus_min_aircraft"] - 1:
             return None
+        # Zelfde -min(cap, score)-reden als in _check_weather_explains.
         return self._apply_delta(
-            inc["hex"], now, -55.0, "peer_consensus",
+            inc["hex"], now, -min(55.0, inc["score"]) if covers_all else 0.0, "peer_consensus",
             "meerdere andere toestellen wijken tegelijk op vergelijkbare wijze uit in dit gebied — mogelijk gedeelde oorzaak, geen individuele diversie", None,
+        )
+
+    def _check_signal_lost_refuted(self, inc: dict, ac: dict | None, now: float):
+        """signal_lost_near_airport is de enige bewijsbron die uit AFWEZIGHEID
+        van data redeneert: het toestel is van de radar, laag en dicht bij een
+        andere luchthaven dan de gefilede, dús zal het daar wel geland zijn.
+        Wordt hetzelfde toestel daarna gewoon weer gevolgd en is het niet aan de
+        grond, dan is die gevolgtrekking niet zwakker geworden maar WEERLEGD:
+        het is niet geland, het zat in een dekkingsgat — de meest alledaagse
+        verklaring die er voor deze waarneming bestaat, en precies de reden dat
+        deze bron in de uitkomsttabel van CHECKPOINT.md al als de zwakste
+        stond.
+
+        Bewust ook geldig als het toestel laag terugkomt: weerlegd wordt de
+        GEVOLGTREKKING dat het al geland is, niet de mogelijkheid dat het straks
+        alsnog ergens anders landt. Gebeurt dat, dan levert
+        detect_landed_wrong_airport echt grondbewijs op in plaats van een
+        gevolgtrekking uit stilte — een sterker signaal, geen zwakker.
+
+        Niet eenmalig-per-incident (anders dan weer/peer-consensus): verdwijnt
+        het toestel later opnieuw, dan hoort die nieuwe ronde opnieuw weerlegd
+        te kunnen worden. De tijdstempelvergelijking hieronder zorgt dat er
+        alleen een rij bijkomt als er sinds de vorige weerlegging nieuw
+        verdwijnbewijs is geweest.
+
+        Zie CHECKPOINT.md bevinding 12."""
+        if ac is None or ac.get("on_ground"):
+            return None
+        rows = db_module.get_incident_evidence(self.db, inc["id"])
+        last_vanished = max((r["ts"] for r in rows if r["source"] in _VANISHED_SOURCES), default=None)
+        if last_vanished is None:
+            return None
+        last_refuted = max((r["ts"] for r in rows if r["source"] == "signal_lost_refuted"), default=None)
+        if last_refuted is not None and last_refuted >= last_vanished:
+            return None
+        # De bijdrage wordt op 0 gezet in plaats van geblokkeerd: verdwijnt het
+        # toestel later opnieuw, dan mag een nieuw signal_lost-Event gewoon weer
+        # scoren onder zijn eigen verzadigingsplafond.
+        contrib = self._source_contrib(inc)
+        removed = 0.0
+        for src in _VANISHED_SOURCES:
+            removed += contrib.get(src, 0.0)
+            contrib[src] = 0.0
+        return self._apply_delta(
+            inc["hex"], now, -removed, "signal_lost_refuted",
+            "toestel wordt weer gevolgd — de veronderstelde landing heeft niet plaatsgevonden", None,
+        )
+
+    def _release_benign_deduction(self, inc: dict, now: float):
+        """Geeft een eerder toegekende benigne aftrek terug zodra dit incident
+        bewijs is gaan dragen dat die verklaring niet dekt.
+
+        Zonder dit blijft er een rest-volgorde-afhankelijkheid over na
+        CHECKPOINT.md bevinding 11: de VASTLEGGING van de verklaring is nu
+        volgorde-onafhankelijk, maar de AFTREK niet. Vuurt de laterale detector
+        eerst, dan dekt de verklaring op dat moment alles en wordt er
+        afgetrokken; komt daarna een daling binnen, dan blijft die aftrek
+        staan. Vuurt de daling eerst, dan wordt er nooit afgetrokken. Zelfde
+        bewijs, zelfde weer, verschil in score (gemeten: 61 vs 91) — en dat
+        verschil kan bij drie dimensies alsnog het oordeel kantelen, omdat de
+        score dan weer langs de BEVESTIGD-drempel gaat.
+
+        Teruggegeven wordt exact wat er is afgetrokken (de negatieve deltas van
+        de benigne bronnen, die dankzij het -min(cap, score)-patroon precies de
+        werkelijke verwijdering zijn), verminderd met wat er al eerder is
+        teruggegeven. De verklaringrij zelf blijft staan: zij is nog steeds
+        waar voor de dimensies die zij dekt, en blijft die in
+        _confirmed_bar_met punt 3 neutraliseren. Alleen haar score-effect op
+        het incident als geheel vervalt."""
+        rows = db_module.get_incident_evidence(self.db, inc["id"])
+        deducted = -sum(r["delta"] for r in rows
+                        if r["source"] in _BENIGN_EXPLANATION_SOURCES and r["delta"] and r["delta"] < 0)
+        if deducted <= 0:
+            return None
+        released = sum(r["delta"] for r in rows if r["source"] == _BENIGN_RELEASE_SOURCE and r["delta"])
+        outstanding = deducted - released
+        if outstanding <= 0:
+            return None
+        _applies, covers_all = self._benign_explanation_scope(inc["id"])
+        if covers_all:
+            return None
+        return self._apply_delta(
+            inc["hex"], now, outstanding, _BENIGN_RELEASE_SOURCE,
+            "eerdere benigne verklaring dekt niet meer al het bewijs — aftrek teruggedraaid", None,
         )
 
     def apply_context_checks(self, hex_id: str, now: float, hazards: list | None = None) -> list[dict]:
@@ -799,6 +1056,11 @@ class IncidentManager:
         for enabled, check in (
             (self.cfg.get("weather_sigmet_enabled"), lambda i: self._check_weather_explains(i, hazards, now)),
             (self.cfg.get("peer_consensus_enabled"), lambda i: self._check_peer_consensus(i, now)),
+            # Draait ná beide checks en altijd (los van welke vlag de aftrek
+            # ooit heeft opgeleverd): een aftrek die niet meer klopt hoort ook
+            # teruggedraaid te worden als de bijbehorende bron intussen is
+            # uitgezet. Zie _release_benign_deduction.
+            (True, lambda i: self._release_benign_deduction(i, now)),
         ):
             if not enabled:
                 continue
@@ -922,7 +1184,27 @@ class IncidentManager:
         landed_t = self._check_landed(hex_id, ac, now)
         if landed_t:
             transitions.append(landed_t)
+        # Op _open testen en niet op `landed_t`: _check_landed sluit het
+        # incident via _resolve(), en dat geeft alléén een transition terug als
+        # er ook genotificeerd moet worden. Een landing die stilletjes afsluit
+        # (nooit boven MOGELIJK geweest) leverde dus None op terwijl het
+        # incident wél weg was, waarna de rest van step() doorliep op een
+        # gesloten incident. Dat viel niet op zolang alles daaronder
+        # self._open.get() gebruikte.
+        if hex_id not in self._open:
             return transitions
+
+        # Weerlegging draait ELKE cyclus, net als de context-checks en om
+        # dezelfde reden (bevinding 5): een toestel dat terugkomt en meteen weer
+        # bewijs oplevert is het geval waarin de weerlegging het hardst nodig is
+        # én het geval waarin reassess() nooit draait. Zie bevinding 12.
+        refuted = self._check_signal_lost_refuted(self._open[hex_id], ac, now)
+        if refuted:
+            t = self._maybe_notify(refuted[0], refuted[1], refuted[2], now)
+            if t:
+                transitions.append(t)
+            if hex_id not in self._open:
+                return transitions
 
         transitions.extend(self.apply_context_checks(hex_id, now, hazards))
 
