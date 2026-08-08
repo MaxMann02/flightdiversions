@@ -32,6 +32,13 @@ BEVESTIGD), `DIM_GROUND_TRUTH_PROVISIONAL`, `_benign_explanation_scope` +
 uitgewerkt" is daarmee het eerste (geen disconfirmatie-mechanisme) gedeeltelijk
 afgehandeld — zie bevinding 12 punt 5 voor wat er bewust van over is.
 
+**Bevinding 14 (aangewezen door de gebruiker)** kwam daarna: de regel "noemt één
+van twee conflicterende routebronnen wél de luchthaven waar het toestel
+feitelijk naartoe ging, dan is het geen uitwijking" was maar voor één van de drie
+detectoren doorgevoerd. Nu ook voor `wrong_airport` en
+`signal_lost_near_airport`, de twee gevallen waar de waarneming juist het
+sterkst is. Totaal na deze toevoeging: 10/10 cases, **157** assertions.
+
 **Statuslegenda:** `open` → nog niet geïmplementeerd · `geïmplementeerd` → code
 aangepast · `gevalideerd` → `python backtest.py` bevestigt het verwachte gedrag.
 
@@ -1919,3 +1926,130 @@ uit punt 5, niet uit punt 4):
 
 Het echte werk tegen betwist bewijs doet 10a (punt 2b): dat blokkeert het
 disputed-scenario ongeacht hoe hoog de score komt.
+
+---
+
+## Bevinding 14 — De "één bron noemt wél de juiste bestemming"-regel was maar half doorgevoerd
+
+**Status:** gevalideerd (2026-08-08) — 5 nieuwe assertions in
+`check_wrong_airport_route_crosscheck`. Aangewezen door de gebruiker: de regel
+was in een eerdere sessie als opdracht gegeven, maar bleek alleen voor
+`premature_descent` te bestaan.
+
+### 1. Wat er precies mis is
+
+De regel hoort te zijn: **spreken twee routebronnen elkaar tegen en noemt één van
+de twee precies de luchthaven waar het toestel feitelijk naartoe ging, dan is er
+geen uitwijking** — dan had de andere bron simpelweg verouderde scheduledata.
+Pas als géén van beide bronnen de waargenomen luchthaven noemt, blijft een
+uitwijking de aannemelijke verklaring.
+
+Die regel was geïmplementeerd voor precies één van de drie detectoren die er
+gebruik van kunnen maken: `premature_descent`, via de dalingsgeometrie in
+`main.py` (`geometry_confirms_alt_dest`). Voor de twee gevallen waar het bewijs
+juist het STERKST is, bestond hij niet:
+
+- `wrong_airport` (`main.py:80-97`) — wij hebben het toestel zien LANDEN. Er is
+  geen sterkere vaststelling van "waar ging het feitelijk naartoe" denkbaar.
+  Toch werd hexdb.io's bestemming er nooit tegen afgezet; het Event werd alleen
+  gedegradeerd naar `wrong_airport_disputed` (30 punten i.p.v. 90).
+- `signal_lost_near_airport` (`main.py:165-215`) — het Event vuurt juist omdát
+  het toestel laag verdween bij luchthaven Y. Ook hier: alleen degradatie.
+  De code zei hierover expliciet "Deliberately NOT extended to
+  signal_lost_near_airport", met ronde 21's teruggedraaide
+  zelfde-metropool-uitsluiting als precedent.
+
+Bovendien kón de regel er niet eens staan: geen van beide Events droeg de
+waargenomen luchthaven als structureel veld. `nearest["icao"]` stond alleen in
+`ev.message` als tekst.
+
+### 2. Waarom dit een probleem is
+
+Dit is precies de gemeten hoofdfoutbron van dit systeem, en de degradatie pakt
+hem maar half aan. Ronde 24 stelde live vast dat 6 van de 8 hexdb-lookups een
+andere bestemming noemden, **en dat die bestemming in alle zes gevallen exact de
+"onverwachte" luchthaven was waarop het Event vuurde** — RYR49MG (gefiled
+LROP→EGGD, signaal verloren bij LIRA, hexdb: EYVI→LIRA), SAS80M, MEA307. Dat is
+geen twijfel over de referentiedata, dat is een sluitende verklaring: het toestel
+vloog naar LIRA, hexdb wist dat, adsbdb had een verouderde match. Zulke gevallen
+kwamen tot nu toe als MOGELIJK op het dashboard in plaats van helemaal niet.
+
+Het tegenargument dat in de code stond is terecht maar niet van toepassing:
+hexdb.io is niet uniform betrouwbaarder (ronde 24 mat UAL1601's hexdb-route als
+8 jaar oud). Daarom wordt hexdb hier ook niet geloofd omdát het hexdb is, maar
+omdat zijn bewering **samenvalt met onze eigen fysieke waarneming** van waar het
+toestel daadwerkelijk naartoe ging. Dat is onafhankelijke verificatie, niet
+voorkeursbehandeling — dezelfde logica waarop `route_corroborated` al rust, maar
+dan omgekeerd toegepast.
+
+Ronde 21's precedent geldt hier evenmin: dat was een botte geografische regel
+("dezelfde metropool") die UA2078's echte diversie zou hebben opgeslokt, want die
+landde 15nm van zijn gefilede bestemming. Deze toets vereist een **exacte
+ICAO-match uit een onafhankelijke bron** met de luchthaven die wij zelf hebben
+waargenomen. Bij UA2078 noemt hexdb KPHX (net als adsbdb), niet KLUF, dus de
+tegenspraak-tak wordt daar niet eens bereikt — de route wordt juist
+gecorroboreerd. Vastgelegd als assertie.
+
+### 3. De exacte fix
+
+**a. `detector.py`, nieuw veld op `Event`:**
+```python
+    observed_icao: str | None = None
+```
+gezet door `detect_landed_wrong_airport` (`observed_icao=nearest["icao"]`, het
+veld waar het geland is) en door `detect_signal_lost_near_airport`
+(`observed_icao=nearest["icao"]`, het veld waar het signaal verloren ging).
+
+**b. `main.py`, `enrich_events`, de `wrong_airport`-tak:** binnen
+`if hexdb_pair is not None and hexdb_pair[1] != ev.dest_icao:` een voorrangstak
+vóór de degradatie:
+```python
+                if ev.observed_icao and hexdb_pair[1] == ev.observed_icao:
+                    ev.suppressed = True
+                    log.info(...)
+                else:
+                    # ongewijzigd: confidence -> WAARSCHIJNLIJK,
+                    # route_source_disputed = True, message += ...
+```
+
+**c. `main.py`, de gedeelde `premature_descent`/`signal_lost`-tak:**
+```python
+                observed_matches_alt_dest = bool(
+                    ev.event_type == "signal_lost_near_airport"
+                    and ev.observed_icao and hexdb_pair[1] == ev.observed_icao
+                )
+
+                if geometry_confirms_alt_dest:
+                    ev.suppressed = True
+                    log.info(... bestaande premature_descent-tekst ...)
+                elif observed_matches_alt_dest:
+                    ev.suppressed = True
+                    log.info(... eigen tekst ...)
+                else:
+                    ev.route_source_disputed = True
+                    ...
+```
+De `if`/`elif`-splitsing is noodzakelijk en geen stijlkeuze: de bestaande
+log-regel gebruikt `dist_to_alt_dest` en `expected_tod_nm`, die alleen binnen de
+`premature_descent`-tak bestaan. Ze in één `if` samenvoegen levert een
+`NameError` op zodra de suppressie via de signal_lost-weg komt.
+
+`suppressed` is het bestaande mechanisme (`main.py:610-612` filtert die events
+weg vóór `db_module.save_event`/`IncidentManager.step`), dus dit gedraagt zich
+identiek aan de al bestaande `premature_descent`-suppressie: het Event bestaat
+nooit, in plaats van laag te scoren.
+
+### 4. Validatie
+
+5 nieuwe assertions in `check_wrong_airport_route_crosscheck` (mocked
+`providers.lookup_route_hexdb`):
+
+| scenario | verwacht |
+|---|---|
+| DLH8NK: gefiled LEMG, geland EDDM, hexdb noemt EDDM | **onderdrukt** (was: gedegradeerd naar 30 punten) |
+| gefiled LEMG, geland EDDM, hexdb noemt een derde veld (EDDK) | niet onderdrukt, wel `route_source_disputed` |
+| RYR49MG: gefiled EGGD, signaal verloren bij LIRA, hexdb noemt LIRA | **onderdrukt** (was: MOGELIJK op het dashboard) |
+| gefiled EGGD, verloren bij LIRA, hexdb noemt LIRF | niet onderdrukt, wel `route_source_disputed` |
+| UA2078: gefiled KPHX, verloren bij KLUF, hexdb noemt KPHX | niet onderdrukt, `route_corroborated` — de echte diversie blijft staan |
+
+Volledige run: 10/10 cases, **157** assertions, geen FAIL.

@@ -80,21 +80,47 @@ async def enrich_events(session, cfg: dict, events: list, airport_db=None) -> li
         if ev.event_type == "wrong_airport" and cfg.get("route_secondary_source_enabled") and ev.callsign:
             hexdb_pair = await providers.lookup_route_hexdb(session, ev.callsign)
             if hexdb_pair is not None and hexdb_pair[1] != ev.dest_icao:
-                ev.confidence = "WAARSCHIJNLIJK"
-                # CHECKPOINT.md bevinding 1: ev.confidence alléén was hier
-                # volledig inert — incidents.py's score_for_event las het
-                # buiten de emergency-tak nergens, dus een betwiste landing
-                # kreeg dezelfde 90 punten (en dus BEVESTIGD + 🚨) als een
-                # onbetwiste. De structurele vlag is wat het gewicht echt
-                # verlaagt; ev.confidence blijft staan voor de events-tabel/
-                # dashboard.
-                ev.route_source_disputed = True
-                ev.message += (
-                    f" (tweede routebron (hexdb.io) noemt {hexdb_pair[1]} als bestemming i.p.v. "
-                    f"{ev.dest_icao} — mogelijk verouderde/foute scheduledata bij de eerste bron)"
-                )
-                log.warning("wrong_airport voor %s: hexdb.io route disagreement (%s vs adsbdb's %s), gedegradeerd",
-                            ev.callsign, hexdb_pair[1], ev.dest_icao)
+                if ev.observed_icao and hexdb_pair[1] == ev.observed_icao:
+                    # De twee routebronnen zijn het oneens, en één van de twee
+                    # noemt precies de luchthaven waar wij dit toestel ZELF
+                    # hebben zien landen. Dan is er geen uitwijking: de eerste
+                    # bron had verouderde scheduledata en de tweede had het
+                    # goed. Dit is het gedocumenteerde DLH8NK-patroon (adsbdb
+                    # zei EDDF->LEMG, geland EDDM — een doodgewone
+                    # Lufthansa-shuttlehop).
+                    #
+                    # Bewust géén blind vertrouwen in hexdb.io: ronde 24 mat
+                    # dat hexdb's eigen route 8 jaar oud kon zijn (UAL1601).
+                    # Hier wordt hexdb niet geloofd omdát het hexdb is, maar
+                    # omdat zijn bewering samenvalt met onze eigen fysieke
+                    # waarneming van waar het toestel daadwerkelijk naartoe
+                    # ging. Dat is onafhankelijke verificatie, niet
+                    # voorkeursbehandeling. Pas als GEEN van beide bronnen de
+                    # waargenomen luchthaven noemt, blijft een uitwijking de
+                    # aannemelijke verklaring — zie CHECKPOINT.md bevinding 14.
+                    ev.suppressed = True
+                    log.info(
+                        "wrong_airport voor %s onderdrukt: tweede routebron (hexdb.io) noemt %s als "
+                        "bestemming, en dat is precies waar het toestel geland is — verouderde/foute "
+                        "scheduledata bij de eerste bron (%s), geen diversie",
+                        ev.callsign, hexdb_pair[1], ev.dest_icao,
+                    )
+                else:
+                    ev.confidence = "WAARSCHIJNLIJK"
+                    # CHECKPOINT.md bevinding 1: ev.confidence alléén was hier
+                    # volledig inert — incidents.py's score_for_event las het
+                    # buiten de emergency-tak nergens, dus een betwiste landing
+                    # kreeg dezelfde 90 punten (en dus BEVESTIGD + 🚨) als een
+                    # onbetwiste. De structurele vlag is wat het gewicht echt
+                    # verlaagt; ev.confidence blijft staan voor de events-tabel/
+                    # dashboard.
+                    ev.route_source_disputed = True
+                    ev.message += (
+                        f" (tweede routebron (hexdb.io) noemt {hexdb_pair[1]} als bestemming i.p.v. "
+                        f"{ev.dest_icao} — mogelijk verouderde/foute scheduledata bij de eerste bron)"
+                    )
+                    log.warning("wrong_airport voor %s: hexdb.io route disagreement (%s vs adsbdb's %s), gedegradeerd",
+                                ev.callsign, hexdb_pair[1], ev.dest_icao)
             elif hexdb_pair is not None:
                 # hexdb.io noemt DEZELFDE bestemming: dat is positieve
                 # corroboratie van de referentiedata, niet slechts "geen
@@ -196,6 +222,30 @@ async def enrich_events(session, cfg: dict, events: list, airport_db=None) -> li
                     expected_tod_nm = (ev.alt / 1000.0) * 3.0 * cfg["premature_descent_multiplier"]
                     geometry_confirms_alt_dest = dist_to_alt_dest < expected_tod_nm
 
+                # Voor signal_lost_near_airport bestaat er een directere en
+                # sterkere toets dan dalingsgeometrie: het Event vuurde juist
+                # omdát het toestel laag verdween bij luchthaven Y. Noemt de
+                # tweede routebron precies die Y als bestemming, dan is dit een
+                # gewone aankomst en had de eerste bron verouderde
+                # scheduledata. Dat is exact de vorm die ronde 24 live 6 van de
+                # 8 keer aantrof (RYR49MG: gefiled LROP->EGGD, signaal
+                # verloren bij LIRA, hexdb.io's route EYVI->LIRA; idem SAS80M,
+                # MEA307).
+                #
+                # Dit is NIET de in ronde 21 teruggedraaide
+                # zelfde-metropool-uitsluiting. Die was een botte
+                # geografische regel die UA2078's echte diversie zou hebben
+                # opgeslokt (die landde 15nm van zijn gefilede bestemming).
+                # Deze toets vereist een exacte ICAO-match uit een
+                # ONAFHANKELIJKE bron met wat wij zelf hebben waargenomen.
+                # UA2078 blijft daar buiten: hexdb noemt daar KPHX (of niets),
+                # niet KLUF, dus deze tak wordt niet eens bereikt. Zie
+                # CHECKPOINT.md bevinding 14.
+                observed_matches_alt_dest = bool(
+                    ev.event_type == "signal_lost_near_airport"
+                    and ev.observed_icao and hexdb_pair[1] == ev.observed_icao
+                )
+
                 if geometry_confirms_alt_dest:
                     ev.suppressed = True
                     log.info(
@@ -204,6 +254,15 @@ async def enrich_events(session, cfg: dict, events: list, airport_db=None) -> li
                         "gerapporteerde bestemming %s — vals alarm door foute/verouderde eerste bron",
                         ev.callsign, hexdb_pair[1], dist_to_alt_dest,
                         expected_tod_nm / cfg["premature_descent_multiplier"], ev.dest_icao,
+                    )
+                elif observed_matches_alt_dest:
+                    ev.suppressed = True
+                    log.info(
+                        "signal_lost_near_airport voor %s onderdrukt: tweede routebron (hexdb.io) "
+                        "noemt %s als bestemming, en dat is precies de luchthaven waar het signaal "
+                        "verloren ging — verouderde/foute scheduledata bij de eerste bron (%s), "
+                        "geen diversie",
+                        ev.callsign, hexdb_pair[1], ev.dest_icao,
                     )
                 else:
                     ev.route_source_disputed = True
