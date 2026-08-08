@@ -91,6 +91,13 @@ class Event:
     # rather than a real diversion, dropped before it ever reaches
     # db_module.save_event/IncidentManager rather than merely scored low.
     suppressed: bool = False
+    # De luchthaven die wij ZELF hebben waargenomen als waar dit toestel
+    # feitelijk naartoe ging: het veld waar het geland is
+    # (detect_landed_wrong_airport) of het veld waar het laag van de radar
+    # verdween (detect_signal_lost_near_airport). Structureel veld en niet
+    # alleen tekst in ev.message, zodat main.py's enrich_events een tweede
+    # routebron ertegen kan afzetten — zie CHECKPOINT.md bevinding 14.
+    observed_icao: str | None = None
 
 
 def _probable_destination_note(airport_db, lat: float, lon: float, heading: float) -> str:
@@ -186,7 +193,7 @@ def detect_landed_wrong_airport(track: AircraftTrack, ac: dict, airport_db, cfg:
             ),
             weather_icao=dest_icao, lat=landing_point.lat, lon=landing_point.lon,
             squawk=ac.get("squawk"), alt=0, origin_icao=origin, dest_icao=dest_icao,
-            early_return=early_return,
+            early_return=early_return, observed_icao=nearest["icao"],
         )
     return None
 
@@ -573,6 +580,7 @@ def detect_signal_lost_near_airport(track: AircraftTrack, airport_db, cfg: dict)
         ),
         weather_icao=nearest["icao"], lat=last.lat, lon=last.lon,
         alt=last.alt_baro, origin_icao=track.route["origin_icao"], dest_icao=track.route["destination_icao"],
+        observed_icao=nearest["icao"],
     )
 
 

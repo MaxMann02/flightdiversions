@@ -755,13 +755,69 @@ def check_wrong_airport_route_crosscheck() -> bool:
 
     async def run():
         nonlocal all_ok
+        # CHECKPOINT.md bevinding 14: dit IS het DLH8NK-geval. adsbdb zei
+        # EDDF->LEMG, het toestel landde op EDDM, en hexdb.io noemt EDDM als
+        # bestemming. Eén van de twee bronnen noemt dus precies waar het
+        # toestel feitelijk naartoe ging -> geen uitwijking, alleen verouderde
+        # scheduledata bij de eerste bron.
         providers.lookup_route_hexdb = mock_hexdb(("EDDF", "EDDM"))
         ev1 = Event(hex="t1", callsign="DLH8NK", event_type="wrong_airport", confidence="BEVESTIGD",
-                    message="test", origin_icao="EDDF", dest_icao="LEMG")
+                    message="test", origin_icao="EDDF", dest_icao="LEMG", observed_icao="EDDM")
         await main_module.enrich_events(None, cfg, [ev1])
-        ok1 = ev1.confidence == "WAARSCHIJNLIJK" and "hexdb.io" in ev1.message
+        ok1 = ev1.suppressed
         all_ok = all_ok and ok1
-        print(f"  hexdb.io disagrees with adsbdb's filed destination -> downgraded: {'OK' if ok1 else f'FAIL (confidence={ev1.confidence})'}")
+        print(f"  hexdb.io noemt precies de luchthaven waar het toestel geland is -> onderdrukt, "
+              f"geen diversie: {'OK' if ok1 else f'FAIL (suppressed={ev1.suppressed})'}")
+
+        # Maar noemt GEEN van beide bronnen de waargenomen luchthaven, dan
+        # blijft een uitwijking de aannemelijke verklaring — wel met verlaagd
+        # gewicht, want de referentiedata is dan nog steeds betwist.
+        providers.lookup_route_hexdb = mock_hexdb(("EDDF", "EDDK"))
+        ev1b = Event(hex="t1b", callsign="DLH9XX", event_type="wrong_airport", confidence="BEVESTIGD",
+                     message="test", origin_icao="EDDF", dest_icao="LEMG", observed_icao="EDDM")
+        await main_module.enrich_events(None, cfg, [ev1b])
+        ok1b = (not ev1b.suppressed and ev1b.route_source_disputed
+                and ev1b.confidence == "WAARSCHIJNLIJK" and "hexdb.io" in ev1b.message)
+        all_ok = all_ok and ok1b
+        print(f"  geen van beide bronnen noemt de waargenomen luchthaven -> blijft een uitwijking, "
+              f"gedegradeerd: {'OK' if ok1b else f'FAIL (suppressed={ev1b.suppressed}, disputed={ev1b.route_source_disputed})'}")
+
+        # Zelfde regel voor signal_lost_near_airport. Dit is de vorm die ronde
+        # 24 live 6 van de 8 keer aantrof (RYR49MG: gefiled LROP->EGGD,
+        # signaal verloren bij LIRA, hexdb.io's route EYVI->LIRA).
+        providers.lookup_route_hexdb = mock_hexdb(("EYVI", "LIRA"))
+        ev1c = Event(hex="t1c", callsign="RYR49MG", event_type="signal_lost_near_airport",
+                     confidence="MOGELIJK", message="test", origin_icao="LROP", dest_icao="EGGD",
+                     observed_icao="LIRA")
+        await main_module.enrich_events(None, cfg, [ev1c])
+        ok1c = ev1c.suppressed
+        all_ok = all_ok and ok1c
+        print(f"  signal_lost: hexdb.io noemt precies de luchthaven waar het signaal verloren ging "
+              f"-> onderdrukt: {'OK' if ok1c else f'FAIL (suppressed={ev1c.suppressed})'}")
+
+        providers.lookup_route_hexdb = mock_hexdb(("LROP", "LIRF"))
+        ev1d = Event(hex="t1d", callsign="RYR50MG", event_type="signal_lost_near_airport",
+                     confidence="MOGELIJK", message="test", origin_icao="LROP", dest_icao="EGGD",
+                     observed_icao="LIRA")
+        await main_module.enrich_events(None, cfg, [ev1d])
+        ok1d = not ev1d.suppressed and ev1d.route_source_disputed
+        all_ok = all_ok and ok1d
+        print(f"  signal_lost: derde luchthaven bij de tweede bron -> niet onderdrukt, alleen "
+              f"gedegradeerd: {'OK' if ok1d else f'FAIL (suppressed={ev1d.suppressed})'}")
+
+        # Regressie op de in ronde 21 teruggedraaide zelfde-metropool-regel:
+        # UA2078's echte diversie landde ~15nm van zijn gefilede bestemming.
+        # hexdb noemt daar KPHX, gelijk aan adsbdb, dus de onderdrukkingstak
+        # wordt niet eens bereikt en de route wordt juist gecorroboreerd.
+        providers.lookup_route_hexdb = mock_hexdb(("KIAH", "KPHX"))
+        ev1e = Event(hex="t1e", callsign="UAL2078", event_type="signal_lost_near_airport",
+                     confidence="MOGELIJK", message="test", origin_icao="KIAH", dest_icao="KPHX",
+                     observed_icao="KLUF")
+        await main_module.enrich_events(None, cfg, [ev1e])
+        ok1e = not ev1e.suppressed and ev1e.route_corroborated
+        all_ok = all_ok and ok1e
+        print(f"  UA2078 (echte diversie 15nm van de bestemming): beide bronnen noemen KPHX, niet "
+              f"KLUF -> niet onderdrukt en route gecorroboreerd: {'OK' if ok1e else f'FAIL (suppressed={ev1e.suppressed}, corroborated={ev1e.route_corroborated})'}")
 
         providers.lookup_route_hexdb = mock_hexdb(("KIAH", "KPHX"))
         ev2 = Event(hex="t2", callsign="UAL2078", event_type="wrong_airport", confidence="BEVESTIGD",
