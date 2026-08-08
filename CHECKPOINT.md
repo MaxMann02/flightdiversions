@@ -9,6 +9,14 @@ voorgeschiedenis.
 uitgeschreven (probleem + redenering + exacte fix + validatie) vóórdat er iets
 geïmplementeerd wordt, zodat een onderbreking nooit redenering kost.
 
+**STAND VAN ZAKEN (2026-08-08):** alle 9 bevindingen zijn geïmplementeerd,
+gevalideerd (`python backtest.py`: 10/10 cases, 120 assertions, geen FAIL) en
+gemerged naar `main` (commit `be08c5b`, merge `49d82b1`, gepusht — de VM pulled
+main). Een live smoke test van 2 minuten (8222 toestellen, Telegram uit) draaide
+zonder exceptions en ving een echte 7700 die correct direct BEVESTIGD werd.
+Een volgende sessie hoeft fase 1 dus niet over te doen; wat nog openstaat, staat
+onderaan dit bestand onder "Nog niet uitgewerkt".
+
 **Statuslegenda:** `open` → nog niet geïmplementeerd · `geïmplementeerd` → code
 aangepast · `gevalideerd` → `python backtest.py` bevestigt het verwachte gedrag.
 
