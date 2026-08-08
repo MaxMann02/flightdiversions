@@ -2134,6 +2134,315 @@ def check_airspace_regressions(airport_db: AirportDB) -> bool:
     return all_ok
 
 
+def check_disputed_evidence_gate(airport_db: AirportDB) -> bool:
+    """CHECKPOINT.md bevinding 10 en 13. Bevinding 4 eiste route-corroboratie
+    voordat route-afhankelijk bewijs mag bevestigen, maar implementeerde dat als
+    "er bestaat ergens een bevestiging" in plaats van "de bronnen zijn het
+    eens". Corroboratie en tegenspraak sluiten elkaar niet uit: de corroboratie
+    kan uit onze eigen waargenomen voortgang komen terwijl hexdb.io tegelijk
+    een andere bestemming noemt. Bij onenigheid tussen twee referentiebronnen is
+    de eerlijke toestand onbeslist — en onbeslist is precies de hypothese die
+    elk route-afhankelijk signaal tegelijk verklaart.
+
+    Plus: een incident dat de BEVESTIGD-poort bewust nooit haalde mag bij
+    afsluiting niet alsnog "bevestigde diversie" heten. resolution_reason is het
+    enige dat van een gesloten incident overblijft."""
+    import classify
+    import db as db_module
+    import incidents as incidents_module
+    from detector import Event
+
+    print("\n=== betwist bewijs en het afsluitlabel ===")
+    all_ok = True
+    cfg = dict(CONFIG)
+
+    def build(hex_id, specs, corroborated):
+        mgr = incidents_module.IncidentManager(db_module.connect(":memory:"), cfg, airport_db)
+        t = 1000.0
+        for et, kwargs in specs:
+            kwargs = dict(kwargs)
+            mgr.step(hex_id, "TSTS", classify.AIRLINER, [
+                Event(hex=hex_id, callsign="TSTS", event_type=et,
+                      confidence=kwargs.pop("confidence", "MOGELIJK"),
+                      message="m", origin_icao="EHAM", dest_icao="EGLL",
+                      route_corroborated=corroborated, **kwargs)], {"squawk": "1200"}, t)
+            t += 60.0
+        return mgr, mgr._open.get(hex_id)
+
+    route_dependent = [("corridor_deviation", {})] * 3 + [("premature_descent", {})] * 3
+
+    # (a) hexdb.io noemt een ANDERE bestemming, terwijl wij het toestel zelf
+    #     richting de gefilede bestemming hebben zien vorderen. Twee
+    #     referentiebronnen in tegenspraak -> geen BEVESTIGD.
+    mgr, inc = build("dg1", route_dependent + [("wrong_airport", {"route_source_disputed": True})],
+                     corroborated=True)
+    ok = inc["state"] != incidents_module.CONFIRMED
+    all_ok = all_ok and ok
+    print(f"  betwiste routebron (hexdb.io noemt een andere bestemming) + eigen waargenomen voortgang "
+          f"-> geen BEVESTIGD (score {inc['score']:.0f}, state {inc['state']}): {'OK' if ok else 'FAIL'}")
+
+    # (b) Onbevestigde GRONDSTATUS: punt 4's premisse ("we zagen het fysiek aan
+    #     de grond") staat dan juist niet vast, dus dit mag geen volwaardig
+    #     grondbewijs zijn — wel een eigen soft-dimensie.
+    mgr, inc = build("dg2", route_dependent + [("wrong_airport", {"confidence": "WAARSCHIJNLIJK"})],
+                     corroborated=True)
+    dims = mgr._active_dimensions(inc["id"])
+    ok = (incidents_module.DIM_GROUND_TRUTH not in dims
+          and incidents_module.DIM_GROUND_TRUTH_PROVISIONAL in dims)
+    all_ok = all_ok and ok
+    print(f"  onbevestigde grondstatus telt als voorlopig grondbewijs, niet als punt-4-grondbewijs "
+          f"(dims={sorted(dims)}): {'OK' if ok else 'FAIL'}")
+
+    # (c) Regressie: de poort mag niet gewoon dicht komen te staan.
+    mgr, inc = build("dg3", [("corridor_deviation", {})] * 3
+                            + [("wrong_airport", {"confidence": "BEVESTIGD"})], corroborated=True)
+    ok = inc["state"] == incidents_module.CONFIRMED
+    all_ok = all_ok and ok
+    print(f"  onbetwiste landing elders + gecorroboreerde route -> nog steeds BEVESTIGD "
+          f"(score {inc['score']:.0f}, state {inc['state']}): {'OK' if ok else 'FAIL'}")
+
+    def land_and_read(hex_id, confidence):
+        mgr = incidents_module.IncidentManager(db_module.connect(":memory:"), cfg, airport_db)
+        mgr.step(hex_id, "TSTS", classify.AIRLINER, [
+            Event(hex=hex_id, callsign="TSTS", event_type="wrong_airport", confidence=confidence,
+                  message="m", origin_icao="EHAM", dest_icao="EGLL",
+                  lat=51.4775, lon=-0.4614, route_corroborated=False)], {"squawk": "1200"}, 1000.0)
+        mgr.step(hex_id, "TSTS", classify.AIRLINER, [],
+                 {"squawk": "1200", "on_ground": True, "lat": 51.148, "lon": -0.190}, 1100.0)
+        return mgr.db.execute(
+            "SELECT state, resolution_reason FROM incidents WHERE hex=?", (hex_id,)).fetchone()
+
+    # (d) Gedegradeerd bewijs: wel GESLOTEN_GELAND (het toestel is hier echt
+    #     geland), niet "bevestigde diversie" (de duiding is onzeker).
+    row = land_and_read("dg4", "WAARSCHIJNLIJK")
+    ok = row[0] == "GESLOTEN_GELAND" and "niet bevestigd" in row[1] and "bevestigde diversie" not in row[1]
+    all_ok = all_ok and ok
+    print(f"  betwiste landing sluit als GESLOTEN_GELAND maar NIET als \"bevestigde diversie\" "
+          f"({row[0]}): {'OK' if ok else f'FAIL — {row[1]!r}'}")
+
+    # (e) Regressie op dezelfde regel.
+    row = land_and_read("dg5", "BEVESTIGD")
+    ok = row[0] == "GESLOTEN_GELAND" and "bevestigde diversie" in row[1]
+    all_ok = all_ok and ok
+    print(f"  onbetwiste landing sluit nog steeds als \"bevestigde diversie\": "
+          f"{'OK' if ok else f'FAIL — {row[1]!r}'}")
+
+    return all_ok
+
+
+def check_benign_explanation_scope(airport_db: AirportDB) -> bool:
+    """CHECKPOINT.md bevinding 11. Of een benigne verklaring (weer/peer-
+    consensus) werd vastgelegd hing af van de VOLGORDE waarin de detectoren
+    toevallig vuurden: de oude subset-test werd op één moment geëvalueerd en het
+    resultaat was daarna permanent, want de check is eenmalig per incident en de
+    bewijsverzameling groeit alleen. Identiek bewijs op identieke positie in
+    dezelfde SIGMET-polygoon kwam zo uit op WAARSCHIJNLIJK of op BEVESTIGD.
+
+    Erger nog: dezelfde tweede dimensie die de verklaring uitschakelde,
+    ontgrendelde punt 5 van _confirmed_bar_met. Eén extra signaal verwijderde
+    dus de ontlastende verklaring én leverde de bevestigende voorwaarde —
+    terwijl om een onweersgebied heen vliegen én daarbij dalen de meest
+    doodgewone waarneming is die er bestaat."""
+    import classify
+    import db as db_module
+    import incidents as incidents_module
+    from detector import Event
+
+    print("\n=== reikwijdte van de benigne verklaring ===")
+    all_ok = True
+    cfg = dict(CONFIG)
+    HAZ = [{"id": "SIGMET-T", "hazard": "CONVECTIVE", "alt_lo_ft": 0, "alt_hi_ft": 45000,
+            "polygon": [(50.0, -5.0), (55.0, -5.0), (55.0, 5.0), (50.0, 5.0), (50.0, -5.0)]}]
+    LAT, VERT = "corridor_deviation", "premature_descent"
+
+    _NO_AC = object()  # sentinel: ac=None is een betekenisvolle waarde, geen default
+
+    def _step(mgr, hex_id, spec, t, hazards, lat, lon, ac=_NO_AC):
+        et, conf = spec if isinstance(spec, tuple) else (spec, "MOGELIJK")
+        if ac is _NO_AC:
+            ac = {"squawk": "1200", "lat": lat, "lon": lon, "alt": 30000}
+        mgr.step(hex_id, "TSTS", classify.AIRLINER, [
+            Event(hex=hex_id, callsign="TSTS", event_type=et, confidence=conf,
+                  message="m", origin_icao="EHAM", dest_icao="EGLL",
+                  lat=lat, lon=lon, alt=30000, route_corroborated=True)], ac, t, hazards)
+
+    def run(hex_id, order, hazards=HAZ, lat=52.0, lon=0.0, mgr=None, t=1000.0):
+        mgr = mgr or incidents_module.IncidentManager(db_module.connect(":memory:"), cfg, airport_db)
+        for spec in order:
+            _step(mgr, hex_id, spec, t, hazards, lat, lon)
+            t += 60.0
+        inc = mgr._open.get(hex_id)
+        return mgr, inc, mgr._evidence_sources_seen(inc["id"]), t
+
+    def run_peer(hex_id, order):
+        """Vier buren in dezelfde rastercel, daarna het onderzochte incident."""
+        mgr = incidents_module.IncidentManager(db_module.connect(":memory:"), cfg, airport_db)
+        for i in range(4):
+            mgr.step(f"{hex_id}nb{i}", "NBR", classify.AIRLINER, [
+                Event(hex=f"{hex_id}nb{i}", callsign="NBR", event_type=LAT, confidence="MOGELIJK",
+                      message="m", origin_icao="EHAM", dest_icao="EGLL",
+                      lat=52.0, lon=0.0, alt=30000, route_corroborated=True)],
+                {"squawk": "1200", "lat": 52.0, "lon": 0.0}, 1000.0)
+        return run(hex_id, order, hazards=None, mgr=mgr)
+
+    # (a) Dezelfde zes Events in beide volgordes: zowel het NIVEAU als de SCORE
+    #     moeten gelijk zijn. Vóór de fix: 61/WAARSCHIJNLIJK vs 91/BEVESTIGD.
+    _m1, inc1, src1, _t = run("be1", [LAT] * 3 + [VERT] * 3)
+    _m2, inc2, src2, _t = run("be2", [VERT] * 3 + [LAT] * 3)
+    for label, inc, src in (("lateraal eerst", inc1, src1), ("daling eerst", inc2, src2)):
+        ok = "weather_explains" in src and inc["state"] != incidents_module.CONFIRMED
+        all_ok = all_ok and ok
+        print(f"  {label}: weerverklaring vastgelegd en geen BEVESTIGD "
+              f"(score {inc['score']:.0f}, state {inc['state']}): {'OK' if ok else 'FAIL'}")
+    ok = abs(inc1["score"] - inc2["score"]) < 0.01 and inc1["state"] == inc2["state"]
+    all_ok = all_ok and ok
+    print(f"  zelfde bewijs in beide volgordes levert dezelfde score en hetzelfde niveau "
+          f"({inc1['score']:.1f} vs {inc2['score']:.1f}): {'OK' if ok else 'FAIL'}")
+
+    # (b) Idem voor peer-consensus.
+    _m3, inc3, src3, _t = run_peer("be3", [LAT] * 3 + [VERT] * 3)
+    _m4, inc4, src4, _t = run_peer("be4", [VERT] * 3 + [LAT] * 3)
+    ok = ("peer_consensus" in src3 and "peer_consensus" in src4
+          and abs(inc3["score"] - inc4["score"]) < 0.01
+          and inc3["state"] == inc4["state"]
+          and inc3["state"] != incidents_module.CONFIRMED)
+    all_ok = all_ok and ok
+    print(f"  idem voor peer-consensus ({inc3['score']:.1f}/{inc3['state']} vs "
+          f"{inc4['score']:.1f}/{inc4['state']}): {'OK' if ok else 'FAIL'}")
+
+    # (c) De realistische volgorde: het toestel wijkt eerst af en vliegt de
+    #     polygoon pás daarna in — main.py meet de polygonen immers tegen de
+    #     HUIDIGE positie. Vóór de fix: 88/BEVESTIGD zonder weather_explains.
+    mgr, _inc, _src, t = run("be5", [VERT, LAT, VERT], lat=40.0, lon=0.0)
+    mgr, inc, src, _t = run("be5", [LAT] * 3, mgr=mgr, t=t)
+    ok = "weather_explains" in src and inc["state"] != incidents_module.CONFIRMED
+    all_ok = all_ok and ok
+    print(f"  toestel dat de hazard pas later invliegt krijgt de verklaring alsnog "
+          f"(score {inc['score']:.0f}, state {inc['state']}): {'OK' if ok else 'FAIL'}")
+
+    # (d) Aftrek-regressie: bevinding 6 mag niet terugdraaien. Slecht weer is
+    #     juist de meest voorkomende oorzaak van een ECHTE diversie, dus een
+    #     waargenomen landing elders wordt er niet door wegverklaard.
+    _m, inc, src, _t = run("be6", [LAT] * 3 + [("wrong_airport", "BEVESTIGD")])
+    ok = inc["state"] == incidents_module.CONFIRMED and "weather_explains" in src
+    all_ok = all_ok and ok
+    print(f"  een waargenomen landing elders binnen dezelfde polygoon houdt zijn score en blijft "
+          f"BEVESTIGD (score {inc['score']:.0f}, state {inc['state']}): {'OK' if ok else 'FAIL'}")
+
+    # (e) Bewuste versoepeling: de oude harde blokkade gooide alles op één hoop.
+    #     Weer verklaart eromheen vliegen en wachten — niet laag verdwijnen bij
+    #     een andere luchthaven terwijl je daalt.
+    #
+    #     signal_lost_near_airport wordt hier met ac=None gevoerd, precies zoals
+    #     main.py's tier1_loop doet: dat Event ontstaat in de lus over toestellen
+    #     die NIET in de snapshot zitten, dus er is per definitie geen live
+    #     positie. Een live ac op diezelfde cyclus zou de gevolgtrekking meteen
+    #     weerleggen (en dat doet de engine dan ook, terecht — zie bevinding 12
+    #     en check_evidence_refutation). Om diezelfde reden komt er ná het
+    #     verdwijnen geen nieuw lateraal/verticaal bewijs meer: die detectoren
+    #     hebben live posities nodig.
+    _m, inc, src, t = run("be7", [LAT, VERT])
+    _step(_m, "be7", "signal_lost_near_airport", t, HAZ, 52.0, 0.0, ac=None)
+    inc, src = _m._open["be7"], _m._evidence_sources_seen(_m._open["be7"]["id"])
+    dims = _m._active_dimensions(inc["id"])
+    ok = "weather_explains" in src and inc["state"] == incidents_module.CONFIRMED
+    all_ok = all_ok and ok
+    print(f"  weer verklaart eromheen vliegen en wachten, niet laag verdwijnen bij een andere "
+          f"luchthaven -> lateraal+verticaal+verdwenen haalt wél BEVESTIGD "
+          f"(score {inc['score']:.0f}, state {inc['state']}, dims={sorted(dims)}): {'OK' if ok else 'FAIL'}")
+
+    return all_ok
+
+
+def check_evidence_refutation(airport_db: AirportDB) -> bool:
+    """CHECKPOINT.md bevinding 12. Verval zegt "we hebben al een tijd niets
+    gehoord"; weerlegging zegt "we hebben nu iets gehoord dat de eerdere
+    gevolgtrekking onmogelijk maakt". Alleen het tweede hoort een dimensie uit
+    de BEVESTIGD-poort te halen, en tot deze ronde kende dit systeem alleen het
+    eerste: _confirmed_bar_met stelde een vraag in de tegenwoordige tijd op een
+    bronnenverzameling die alleen groeit.
+
+    signal_lost_near_airport is de enige bewijsbron die uit AFWEZIGHEID van data
+    redeneert. Wordt hetzelfde toestel daarna gewoon weer gevolgd, dan is die
+    gevolgtrekking niet zwakker geworden maar weerlegd: het zat in een
+    dekkingsgat."""
+    import classify
+    import db as db_module
+    import incidents as incidents_module
+    from detector import Event
+
+    print("\n=== weerlegging van bewijs ===")
+    all_ok = True
+    cfg = dict(CONFIG)
+    AIRBORNE = {"squawk": "1200", "lat": 52.0, "lon": 0.0, "alt": 35000, "track": 270.0}
+    LAT, LOST = "corridor_deviation", "signal_lost_near_airport"
+
+    def ev(hex_id, et):
+        return Event(hex=hex_id, callsign="TSTS", event_type=et, confidence="MOGELIJK",
+                     message="m", origin_icao="EHAM", dest_icao="EGLL", route_corroborated=True)
+
+    def feed(mgr, hex_id, ets, ac, t):
+        for et in ets:
+            mgr.step(hex_id, "TSTS", classify.AIRLINER, [ev(hex_id, et)] if et else [], ac, t)
+            t += 60.0
+        return t
+
+    mgr = incidents_module.IncidentManager(db_module.connect(":memory:"), cfg, airport_db)
+    t = feed(mgr, "rf1", [LOST] + [LAT] * 3, None, 1000.0)
+    inc = mgr._open["rf1"]
+    dims = mgr._active_dimensions(inc["id"])
+    ok = (inc["state"] == incidents_module.CONFIRMED
+          and dims == {incidents_module.DIM_LATERAL, incidents_module.DIM_VANISHED})
+    all_ok = all_ok and ok
+    print(f"  verdwenen + laterale afwijking -> BEVESTIGD (twee dimensies) "
+          f"(score {inc['score']:.0f}, dims={sorted(dims)}): {'OK' if ok else 'FAIL'}")
+
+    t = feed(mgr, "rf1", [None], AIRBORNE, t)
+    dims = mgr._active_dimensions(inc["id"])
+    ok = ("signal_lost_refuted" in mgr._evidence_sources_seen(inc["id"])
+          and incidents_module.DIM_VANISHED not in dims
+          and inc["state"] != incidents_module.CONFIRMED)
+    all_ok = all_ok and ok
+    print(f"  toestel wordt weer gevolgd -> de afgeleide landing is weerlegd, niet slechts vervallen "
+          f"(score {inc['score']:.1f}, state {inc['state']}, dims={sorted(dims)}): {'OK' if ok else 'FAIL'}")
+
+    t = feed(mgr, "rf1", [LAT] * 3, AIRBORNE, t)
+    dims = mgr._active_dimensions(inc["id"])
+    ok = inc["state"] != incidents_module.CONFIRMED and dims == {incidents_module.DIM_LATERAL}
+    all_ok = all_ok and ok
+    print(f"  nieuw lateraal bewijs na de weerlegging tilt het incident niet terug naar BEVESTIGD "
+          f"(score {inc['score']:.0f}, state {inc['state']}): {'OK' if ok else 'FAIL'}")
+
+    t = feed(mgr, "rf1", [LOST], None, t)
+    dims = mgr._active_dimensions(inc["id"])
+    ok = incidents_module.DIM_VANISHED in dims and inc["state"] == incidents_module.CONFIRMED
+    all_ok = all_ok and ok
+    print(f"  opnieuw verdwijnen laat de dimensie weer meetellen — geen enkele weerlegging schakelt "
+          f"hem permanent uit (score {inc['score']:.0f}, state {inc['state']}): {'OK' if ok else 'FAIL'}")
+
+    # Regressie: verdwenen blijven is géén weerlegging.
+    mgr2 = incidents_module.IncidentManager(db_module.connect(":memory:"), cfg, airport_db)
+    feed(mgr2, "rf2", [LOST] + [LAT] * 3, None, 1000.0)
+    inc2 = mgr2._open["rf2"]
+    ok = (inc2["state"] == incidents_module.CONFIRMED
+          and incidents_module.DIM_VANISHED in mgr2._active_dimensions(inc2["id"]))
+    all_ok = all_ok and ok
+    print(f"  een toestel dat verdwenen BLIJFT houdt zijn bewijs onverkort "
+          f"(score {inc2['score']:.0f}, state {inc2['state']}): {'OK' if ok else 'FAIL'}")
+
+    # Regressie: terugkomen aan de grond is de veronderstelde landing zelf.
+    mgr3 = incidents_module.IncidentManager(db_module.connect(":memory:"), cfg, airport_db)
+    t3 = feed(mgr3, "rf3", [LOST], None, 1000.0)
+    feed(mgr3, "rf3", [None], {"squawk": "1200", "on_ground": True, "lat": 52.0, "lon": 0.0}, t3)
+    inc3 = mgr3._open.get("rf3")
+    ok = inc3 is not None and "signal_lost_refuted" not in mgr3._evidence_sources_seen(inc3["id"])
+    all_ok = all_ok and ok
+    print(f"  terugkomen AAN DE GROND weerlegt niets — dat is juist de veronderstelde landing: "
+          f"{'OK' if ok else 'FAIL'}")
+
+    return all_ok
+
+
 def main():
     from backtest_cases import CASES
     airport_db = AirportDB()
@@ -2158,6 +2467,9 @@ def main():
     incident_engine_recovery_ok = check_incident_engine_real_case_recovery(airport_db)
     real_case_outcomes_ok = check_real_case_confidence_outcomes(airport_db)
     airspace_ok = check_airspace_regressions(airport_db)
+    disputed_gate_ok = check_disputed_evidence_gate(airport_db)
+    benign_scope_ok = check_benign_explanation_scope(airport_db)
+    refutation_ok = check_evidence_refutation(airport_db)
 
     print("\n=== summary ===")
     hits = sum(1 for r in results if r["detected"])
@@ -2187,6 +2499,9 @@ def main():
     print(f"incident engine (real-case recovery, DAL2778): {'OK' if incident_engine_recovery_ok else 'FAIL — see above'}")
     print(f"zekerheidsuitkomst per echte case: {'OK' if real_case_outcomes_ok else 'FAIL — see above'}")
     print(f"airspace (weather + peer-consensus): {'OK' if airspace_ok else 'FAIL — see above'}")
+    print(f"betwist bewijs / afsluitlabel: {'OK' if disputed_gate_ok else 'FAIL — see above'}")
+    print(f"reikwijdte benigne verklaring: {'OK' if benign_scope_ok else 'FAIL — see above'}")
+    print(f"weerlegging van bewijs: {'OK' if refutation_ok else 'FAIL — see above'}")
 
 
 if __name__ == "__main__":
