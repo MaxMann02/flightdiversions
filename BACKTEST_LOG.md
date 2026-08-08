@@ -2163,3 +2163,202 @@ either smoke-test window to exercise the new path against the real
 hexdb.io API end-to-end — acceptable per round 18's established precedent,
 given the mocked test covers the logic directly and `lookup_route_hexdb`
 itself was already live-verified in round 9.
+
+---
+
+## Round 26 — 2026-08-08 — fundamentele review van de zekerheidslogica (niet symptoomgericht)
+
+Alle voorgaande rondes waren gerichte reparaties van symptomen die toevallig
+zichtbaar werden in live data. Deze ronde is het tegenovergestelde: één keer
+vanaf de grond nadenken over de vraag *hoe* dit systeem tot een zekerheidsniveau
+komt, zonder vooraf te weten waar het misgaat. De volledige analyse per
+bevinding (probleem → redenering → exacte fix → validatie) staat in
+**CHECKPOINT.md**; dit is de samenvatting.
+
+### Het onderliggende model klopte niet, niet de getallen
+
+Het model was: punten optellen, drie drempels (25/55/85) vertalen de som naar
+MOGELIJK/WAARSCHIJNLIJK/BEVESTIGD. `_confirmed_bar_met` was de enige
+niet-numerieke poort, en die keek alleen of álle bronnen toevallig
+`course_deviation`/`corridor_deviation` heetten.
+
+Drie stilzwijgende aannames daarin bleken geen van drieën houdbaar:
+
+1. **Additiviteit ⇒ onafhankelijkheid.** Op `detect_emergency` na meet *elke*
+   detector tegen `track.route["destination_*"]`. Eén foute gefilede
+   bestemming laat `corridor_deviation`, `premature_descent`,
+   `holding_pattern`, `signal_lost_near_airport` én `wrong_airport` tegelijk
+   afgaan. Het optellen las dat als "vijf detectoren zijn het eens", terwijl het
+   één fout is die vijf keer wordt waargenomen. Optellen van bewijs
+   veronderstelt conditionele onafhankelijkheid; hier voorspelt één alternatieve
+   hypothese ("de route klopt niet") ze allemáál tegelijk, dus meer detectoren
+   maken die hypothese niet onwaarschijnlijker — ze zijn er allemaal een
+   voorspelling van. Uitgerekend die hypothese is bij dit systeem de *gemeten*
+   hoofdfoutbron (ronde 18: 24/25 live wrong_airport-hits zonder corroboratie;
+   ronde 24: 6/8 hexdb-lookups noemden een andere bestemming).
+
+2. **Herhaling ⇒ zekerheid.** De repeat-demping uit ronde 16 was een vaste
+   breuk (~1/3), dus de reeks divergeerde nog steeds; de enige rem was
+   `incident_score_max` (150), ruim bóven de BEVESTIGD-drempel (85). Aanhouden
+   alléén haalde dus de top: `holding_non_destination` in 6 tier1-cycli (~6
+   minuten), `premature_descent` in 9, `emergency_status` in 3, en zelfs
+   `emergency_status_low_trust` — het als decodeartefact gedocumenteerde
+   conspicuity-squawk-geval uit ronde 7 — in 11. De redenering die wél klopt:
+   herhaling elimineert *ruis*-hypothesen (een foute fix, een decodeglitch, één
+   ATC-vector), maar niet de *systematische* onschuldige verklaringen
+   (verouderde routedata, weersomleiding, ATC-vertraging, aankomstsequencing) —
+   die voorspellen juist dat het signaal blíjft. Een zekerheidsmaat die met
+   herhaling onbeperkt doorgroeit, groeit door in een richting waar het bewijs
+   niet heen wijst.
+
+3. **Zwijgen ⇒ instemming.** Tweede bronnen konden alleen corrigeren bij
+   *actieve* tegenspraak; geen hexdb.io-data telde precies zo zwaar als
+   bevestiging. Voor de lagere niveaus is dat goed (geen echte diversie
+   verliezen omdat een gratis bron dun is). Voor het hoogste is het omgekeerd:
+   dan rust het oordeel volledig op de aanname die het vaakst fout is.
+
+### De verandering
+
+Niet andere getallen, maar: **de score bepaalt hooguit het plafond; de
+*structuur* van het bewijs bepaalt of dat plafond bereikbaar is.** Drie
+mechanismen, alle drie in `incidents.py`:
+
+- **Bewijs-dimensies** (`_DIMENSION_FOR_SOURCE`): declared / ground_truth /
+  vanished / vertical / lateral / loiter. Twee rijen in dezelfde dimensie zijn
+  dezelfde waarneming, geen corroboratie — `course_deviation` en
+  `corridor_deviation` zijn letterlijk twee metingen van dezelfde laterale
+  afwijking. Dit vervangt `_DEVIATION_ONLY_SOURCES`, dat op *namen* filterde
+  terwijl het probleem in de *gedeelde input* zat.
+- **Verzadigingsplafonds per bron** (`_SOURCE_SCORE_CAP`): elke provisionele
+  bron convergeert naar een eigen plafond onder 85 in plaats van te divergeren.
+  De bijdrage vervalt mee met de score, zodat het plafond de score begrenst die
+  op enig *moment* aan die bron is toe te schrijven, niet het totaal dat hij
+  ooit opleverde.
+- **Route-corroboratie** (`airports.route_corroborated_by_progress`,
+  `AircraftTrack.route_corroborated`, `Event.route_corroborated`): het positieve
+  spiegelbeeld van `route_plausible`. Die filtert onmogelijke routes weg ("niet
+  aantoonbaar fout"); dit bevestigt ze ("aantoonbaar gevlogen"). Drie wegen:
+  tweede routebron noemt dezelfde bestemming, wij zagen het toestel zelf
+  vertrekken vanaf het gefilede vertrekpunt, of wij zagen het ≥30% van de
+  gefilede route afleggen.
+
+De nieuwe `_confirmed_bar_met` is daarmee een expliciete uitsluitingsredenering
+in plaats van een drempeltest: noodsquawk → direct bevestigd; anders eerst
+route-corroboratie (anders blijft "de route klopt niet" over); dan geen actieve
+benigne verklaring; dan grondbewijs, óf minstens twee wezenlijk verschillende
+dimensies.
+
+### Waarom dit vrijwel geen meldingen kost
+
+`_maybe_notify` verstuurt al bij WAARSCHIJNLIJK. BEVESTIGD strenger maken
+verandert dus vrijwel niets aan wanneer er een Telegram uitgaat — het maakt
+alleen het hoogste label weer betekenisvol. Concreet bij AI850: het
+hold-gedreven incident haalt nu 65 (WAARSCHIJNLIJK) in plaats van 150
+(BEVESTIGD), maar de melding valt op exact hetzelfde moment — **+2h25m vóór de
+echte MAYDAY**, iets eerder zelfs dan de +2h21m die de oude test tegen de
+BEVESTIGD-drempel mat. Een urenlange hold bij de eigen bestemming heeft gewone
+verklaringen (congestie, weer op het veld, flow control) die door langer wachten
+niet verdwijnen; BEVESTIGD volgt bij AI850 nu bij de MAYDAY-squawk, wat het
+moment is waarop het werkelijk zeker werd.
+
+### Negen bevindingen, alle negen geïmplementeerd en gevalideerd
+
+1. De confidence-degradatie van `wrong_airport` was **volledig inert** —
+   `score_for_event` las `ev.confidence` buiten de emergency-tak nergens, dus
+   beide vetos in `enrich_events` (grondstatus én routebron) leverden nog steeds
+   90 punten en dus BEVESTIGD + Telegram-alarm op. Ronde 24 schreef die
+   observatie ("only `emergency` does") letterlijk op voor twee ándere
+   detectoren maar trok de conclusie niet door naar `wrong_airport`'s eigen, al
+   bestaande degradatie. Nu: 90 / 30 (routebron betwist) / 25 (grondstatus
+   onbevestigd).
+2. "Geen tweede mening" ≠ "tweede mening bevestigt" → route-corroboratie.
+3. Herhaling bereikte BEVESTIGD in minuten → verzadigingsplafonds.
+4. Detectoren opgeteld alsof ze onafhankelijk waren → bewijs-dimensies.
+5. De ontlastende checks (weer, peer-consensus) draaiden **alleen in cycli
+   zónder vers bewijs**, dus structureel nooit in het enige scenario waarin een
+   incident doorklimt. `main.py` haalde de SIGMET-polygonen elke cyclus op en
+   gaf ze door, waarna ze ongelezen werden weggegooid. Nu:
+   `apply_context_checks()`, elke cyclus.
+6. Weer/peer-consensus werden toegepast op bewijs dat ze niet verklaren. Een
+   `wrong_airport`-incident binnen een SIGMET-polygoon kreeg -50 en zakte van
+   BEVESTIGD naar MOGELIJK — terwijl slecht weer juist de meest voorkomende
+   oorzaak van een *echte* diversie is. Erger bij peer-consensus: een
+   luchthaven die sluit en tien toestellen die elk uitwijken is tien echte
+   diversies, en de ongescope regel onderdrukte ze alle tien (ieders "peers"
+   zijn de andere negen). Nu gescoped op {lateraal, wachtpatroon}.
+7. Eén token-hit ontgrendelde een score die voor ~85% uit één gedempte bron
+   kwam. Volgt weg uit 3 + 4: 55 (verzadigd lateraal) + 25 = 80 < 85.
+8. `emergency`-bewijs had géén herhalingsdemping, waardoor de in ronde 7
+   gebouwde "laag vertrouwen"-cap door herhaling werd omzeild. Plafond nu 24 —
+   bewust nét onder de dashboarddrempel (25), zodat een gedocumenteerd
+   decodeartefact in zijn eentje niet eens zichtbaar wordt.
+9. **Gevonden bij zelfcontrole van bevinding 2's eigen fix, vóór commit.** Ik
+   had `route_corroborated` drie manieren gegeven om waar te worden, waaronder
+   "wij zagen dit toestel zelf vertrekken vanaf het gefilede vertrekpunt". Die
+   bevestigt de **vertrek**helft van de route — terwijl elke route-afhankelijke
+   detector tegen de **bestemming** meet en `wrong_airport` er volledig over
+   gaat. Bij DLH8NK (gefiled EDDF→LEMG, werkelijk EDDF→EDDM) klópt de origin
+   juist, dus die weg liet precies de casus door die deze ronde motiveerde —
+   met een extra stap ertussen. En omdat dit systeem wereldwijd continu volgt,
+   is "wij zagen het vertrekken" niet zeldzaam maar het normale geval, dus dit
+   gat zou een groot deel van bevinding 2's winst hebben teruggegeven.
+
+   De vroege-terugkeercasus die die weg rechtvaardigde (TO3510) blijkt de route
+   helemaal niet nodig te hebben: "wij zagen dit toestel opstijgen van
+   luchthaven X en binnen 45 minuten weer landen op diezelfde luchthaven X" is
+   abnormaal ongeacht wat de schedule als bestemming noemde, en beide uiteinden
+   zijn onze eigen waarneming. Dat is nu een eigen route-onafhankelijke
+   bewijsbron (`wrong_airport_early_return`) naast de noodsquawk, in plaats van
+   via een te zwakke route-corroboratie binnengesmokkeld te worden. De
+   detector eist daarbij dat het zelf waargenomen VERTREKveld gelijk is aan het
+   landingsveld — vergelijken met `route["origin_icao"]` zou weer op de
+   referentiedata leunen waar deze vlag juist onafhankelijk van hoort te zijn.
+
+### Validatie
+
+`python backtest.py`: **10/10 cases**, **120 assertions**, geen enkele FAIL of
+MISSED. Vier nieuwe checkgroepen: `check_wrong_airport_evidence_weight`,
+`check_saturation_caps`, `check_route_corroboration`,
+`check_confirmed_bar_structure`, plus `check_real_case_confidence_outcomes`.
+
+Die laatste is bewust toegevoegd als tegenwicht: elke andere nieuwe check
+bewijst dat iets nu terecht *niet* bevestigd wordt, en een regel die nooit
+BEVESTIGD zegt is even nutteloos als een die het altijd zegt. Hij draait álle
+echte cases door de volledige engine en legt per case vast of BEVESTIGD terecht
+wel of niet bereikt wordt. Uitkomst: alle echte diversies met een waargenomen
+landing of noodsquawk halen nog steeds BEVESTIGD; DAL2778 (echte weersomweg,
+landde normaal) blijft op 30 en sluit als vals alarm.
+
+Het scherpste resultaat zit in de twee UA2078-varianten — dezelfde echte
+diversie, anders waargenomen. De variant met een waargenomen landing op Luke AFB
+haalt BEVESTIGD; de variant waarin het signaal alleen wegviel in de buurt komt
+op WAARSCHIJNLIJK, omdat die uit de *afwezigheid* van data redeneert en een
+ADS-B-dekkingsgat — precies wat de docstring van die detector zelf als gangbaar
+beschrijft bij kleine/militaire velden — een gewone alternatieve verklaring
+blijft. Verschillende bewijskwaliteit, verschillend zekerheidsniveau: dat is
+waar deze hele ronde over ging.
+
+### Twee harness-gaten die hierbij aan het licht kwamen
+
+- `run_case` voedde `signal_lost_near_airport`-events **nooit** aan de
+  incident-engine (alleen aan `fired`), terwijl `main.py` ze gewoon in
+  `events_by_hex` stopt. Die detector was daarmee de enige wiens bewijs in een
+  backtest nooit de zekerheidslogica bereikte — onzichtbaar zolang de engine
+  alleen met handgebouwde Events werd getest.
+- `run_case` zette wel `last_takeoff_ts` maar spiegelde `record_takeoff` niet,
+  dus `pending_origin` bleef leeg en de "zelf waargenomen vertrek"-
+  corroboratieweg kon in de backtest nooit aangaan. Zichtbaar geworden doordat
+  TO3510 (echte vroege terugkeer naar Orly) ongecorroboreerd bleef terwijl
+  productie hem meteen corroboreert.
+
+Beide opgelost; beide waren pre-existing, geen regressie van deze ronde.
+
+### Nog open (bewust niet in deze ronde meegenomen)
+
+Opgemerkt tijdens de analyse, uitgeschreven in CHECKPOINT.md's slotsectie:
+geen disconfirmatie-mechanisme (een toestel dat na een `premature_descent`
+gewoon terugklimt naar cruise levert tegenbewijs dat nergens wordt
+geconsumeerd), de harde rastercel van peer-consensus (2°, ~120nm), de ruime
+`nearest_large(max_km=90)` in `detect_holding_pattern`, en het ontbreken van een
+persistentie-eis op een enkele 7700-sample (geen live bewijs dat dat nu misgaat,
+dus niet aangepakt op verdenking alleen).
