@@ -198,6 +198,28 @@ _DIMENSION_FOR_SOURCE = {
 _SOFT_DIMENSIONS = {DIM_VANISHED, DIM_VERTICAL, DIM_LATERAL, DIM_LOITER,
                     DIM_GROUND_TRUTH_PROVISIONAL}
 
+# Dimensies waarvan de WAARNEMING volledig bestaat uit "waar bevindt dit toestel
+# zich ten opzichte van een lijn die maar één crowdsourced bron beweert". Zolang
+# die lijn niet onafhankelijk bevestigd is, verklaart de hypothese "de gefilede
+# bestemming klopt niet" ze alle drie tegelijk en even goed — meer van dit soort
+# bewijs maakt die hypothese dus niet onwaarschijnlijker, hoeveel detectoren er
+# ook afgaan.
+#
+# Bevinding 4 heeft dat al vastgesteld, maar de conclusie alleen in de
+# BEVESTIGD-POORT verwerkt (via bewijs-dimensies). De SCORE telde ze daarna nog
+# gewoon bij elkaar op: corridor_deviation (plafond 55) + premature_descent
+# (plafond 60) = 115. En juist de score bepaalt of er een Telegram uitgaat —
+# _maybe_notify vuurt op WAARSCHIJNLIJK (55), wat corridor_deviation in zijn
+# eentje al haalt. Elke eerdere ronde verdedigde het aanscherpen van de poort
+# met "dat kost vrijwel geen meldingen"; aan de kant waar de meldingen vandaan
+# komen was nog nooit iets aangescherpt. Zie CHECKPOINT.md bevinding 16.
+#
+# DIM_GROUND_TRUTH, DIM_VANISHED en DIM_DECLARED staan er bewust NIET in: die
+# bevatten een waarneming met eigen inhoud (een landing, een verdwijning op een
+# aanwijsbaar veld, een bewuste piloothandeling) die niet volledig wordt
+# weggeschreven door de aanname dat de gefilede bestemming fout is.
+_ROUTE_GEOMETRY_DIMENSIONS = {DIM_LATERAL, DIM_VERTICAL, DIM_LOITER}
+
 # Dimensies die een actieve weers-/luchtruimverklaring of een gedeelde
 # regionale oorzaak daadwerkelijk kán verklaren: eromheen vliegen en wachten.
 # NIET een waargenomen landing elders (slecht weer is juist de meest
@@ -688,17 +710,40 @@ class IncidentManager:
             "route onafhankelijk bevestigd (eigen waargenomen vertrek/voortgang of tweede routebron)", None,
         )
 
-    def _cap_delta(self, inc: dict | None, delta: float, source: str) -> float:
+    def _unverified_route_geometry_cap(self) -> float:
+        """Maximale GEZAMENLIJKE bijdrage van alle route-meetkundige dimensies
+        zolang de gefilede route niet onafhankelijk bevestigd is: net onder de
+        notificatiedrempel. Zie _ROUTE_GEOMETRY_DIMENSIONS en CHECKPOINT.md
+        bevinding 16.
+
+        Bewust één GEDEELD plafond en niet per bron: het punt is juist dat die
+        bronnen onder de openstaande alternatieve hypothese ("de gefilede
+        bestemming klopt niet") één en dezelfde waarneming zijn. Per bron
+        plafonneren zou ze opnieuw als onafhankelijk behandelen."""
+        return self.cfg["incident_score_likely_threshold"] - 1.0
+
+    def _cap_delta(self, inc: dict | None, delta: float, source: str,
+                    route_verified: bool = False) -> float:
         """Kapt `delta` af op de resterende ruimte onder deze bron z'n
         verzadigingsplafond, en boekt de toegekende bijdrage bij. Een
         afgekapte delta van 0.0 levert nog steeds een evidence-rij op — de
         tijdlijn moet blijven laten zien DAT het signaal aanhoudt, ook als het
-        de zekerheid niet meer verhoogt."""
+        de zekerheid niet meer verhoogt.
+
+        route_verified: of de gefilede route achter dit incident onafhankelijk
+        bevestigd is. Zo niet, dan geldt er bovenop het per-bron plafond een
+        tweede, GEDEELD plafond voor alle route-meetkundige dimensies samen —
+        die zijn dan immers niet meer dan verschillende metingen van dezelfde
+        onbevestigde aanname."""
         if delta <= 0:
             return delta
         cap = _SOURCE_SCORE_CAP.get(source, _DEFAULT_SOURCE_SCORE_CAP)
         contrib = self._source_contrib(inc) if inc is not None else {}
         granted = min(delta, max(0.0, cap - contrib.get(source, 0.0)))
+        if not route_verified and _DIMENSION_FOR_SOURCE.get(source) in _ROUTE_GEOMETRY_DIMENSIONS:
+            used = sum(v for s, v in contrib.items()
+                       if _DIMENSION_FOR_SOURCE.get(s) in _ROUTE_GEOMETRY_DIMENSIONS)
+            granted = min(granted, max(0.0, self._unverified_route_geometry_cap() - used))
         contrib[source] = contrib.get(source, 0.0) + granted
         return granted
 
@@ -720,8 +765,15 @@ class IncidentManager:
         schemawijziging, en meegewogen in _confirmed_bar_met."""
         inc = self._open.get(hex_id)
         old_state = None
+        # Dezelfde bron van waarheid als _confirmed_bar_met punt 2 gebruikt (de
+        # vlag van dit Event, OF een eerder vastgelegde route_corroborated-rij),
+        # zodat de score en de poort niet uit elkaar kunnen lopen. Zie
+        # CHECKPOINT.md bevinding 16.
+        route_verified = bool(route_corroborated) or (
+            inc is not None and "route_corroborated" in self._evidence_sources_seen(inc["id"])
+        )
         if inc is None:
-            delta = self._cap_delta(None, delta, source)
+            delta = self._cap_delta(None, delta, source, route_verified)
             initial_score = max(0.0, min(self.cfg.get("incident_score_max", 150), delta))
             state = self._resolve_state(None, initial_score, current_source=source,
                                         route_corroborated_now=route_corroborated)
@@ -740,7 +792,7 @@ class IncidentManager:
         else:
             old_state = inc["state"]
             self._record_route_corroboration(inc, now, route_corroborated)
-            delta = self._cap_delta(inc, delta, source)
+            delta = self._cap_delta(inc, delta, source, route_verified)
             inc["score"] = max(0.0, min(self.cfg.get("incident_score_max", 150), inc["score"] + delta))
             inc["peak_score"] = max(inc["peak_score"], inc["score"])
             inc["last_evidence_ts"] = now

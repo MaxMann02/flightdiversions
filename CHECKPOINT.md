@@ -2384,3 +2384,335 @@ Bestaande checks die dit mag raken en groen moeten blijven:
 `check_emergency_status_regressions`, `check_saturation_caps` (bevat
 `emergency_status`-plafondasserties), `check_confirmed_bar_structure`,
 `check_real_case_confidence_outcomes`.
+
+---
+
+## Bevinding 16 — De route-corroboratie wordt alleen toegepast op precies de gevallen die zij niet kan onderscheiden
+
+**Status:** gevalideerd (2026-08-11) — `check_route_corroboration_discriminates`
+(rastermeting: 24/28 combinaties laten `corridor_deviation` vuren op een foute
+route, daarvan zijn er nu **0** een volledig vals-positiefpad; was 21) en
+`check_unverified_route_geometry_cap` in `backtest.py`. Volledige run: 10/10
+cases, **180** assertions, geen FAIL. Geimplementeerd in `airports.py`
+(`ROUTE_CORROBORATION_MAX_XTD_PCT/_FLOOR_NM`), `incidents.py`
+(`_ROUTE_GEOMETRY_DIMENSIONS`, `_unverified_route_geometry_cap`, `_cap_delta`,
+`_apply_delta`) en `main.py` (`enrich_events`).
+
+**Tijdens de implementatie bijgesteld — belangrijk.** De assertie
+"EK225 boven Nyagan: gecorroboreerd" faalde na de fix. Nagerekend ligt dat punt
+**353nm (5.03% van de routelengte)** van de directe OMDB->KSFO-lijn — meer dan
+de 250nm die `corridor_deviation` daar zelf al "afwijking" noemt. Dat is een
+ECHT tegenvoorbeeld tegen de gekozen drempel van 2%, en het eerste harde
+gegeven over legitieme routebowing dat dit project heeft (de tracks in
+`backtest_cases.py` zijn grootcirkelinterpolaties en zeggen hier niets over).
+De assertie is daarom omgedraaid in plaats van de drempel opgerekt: één
+waarneming 353nm naast de lijn op 32% voortgang IS niet onderscheidend — zij is
+even goed verenigbaar met "dit toestel vliegt ergens anders heen". Wat EK225's
+route werkelijk corroboreert is de rest van zijn spoor (39 van zijn 661 samples
+liggen binnen 25nm/2% van de gefilede lijn, de beste op 2.05nm), en
+eind-tot-eind haalt de case onveranderd BEVESTIGD. Beide punten staan nu als
+losse assertie in `check_route_corroboration`, zodat het verschil expliciet
+bewaakt blijft.
+
+**Wat deze fix bewust NIET doet.** Van de 28 doorgerekende foute routes laten er
+nog steeds 24 `corridor_deviation` vuren. Het Event blijft dus bestaan en het
+incident komt op MOGELIJK op het dashboard. Alleen de OVERSCHATTING is weg: geen
+notificatie, geen BEVESTIGD. Het onderdrukken van het Event zelf zou een
+detectorwijziging zijn met echt misdetectierisico; het corrigeren van de
+zekerheid kan per constructie alleen omlaag en kan dus geen enkele detectie
+kosten.
+
+Dit is de bevinding achter de melding van de gebruiker dat "bijna alle valse
+positieven uit het routesysteem komen". Het is geen tuningprobleem: de toets die
+het systeem gebruikt om te beslissen of de gefilede route te vertrouwen is,
+levert per constructie geen informatie op in de situatie waarin hij wordt
+gesteld.
+
+### 1. Wat er precies mis is
+
+Sinds bevinding 2 rust de hele BEVESTIGD-poort op één vlag: `route_corroborated`
+(`incidents._confirmed_bar_met` punt 2). De redenering daarachter is juist —
+"de gefilede route klopt niet" is de gemeten hoofdfoutbron, en die ene hypothese
+verklaart élk route-afhankelijk signaal tegelijk, dus moet zij eerst uitgesloten
+worden. Er zijn twee wegen naar die vlag:
+
+1. een tweede routebron (hexdb.io) noemt dezelfde bestemming (`main.enrich_events`);
+2. `airports.route_corroborated_by_progress` — wij hebben het toestel de route
+   zelf een substantieel stuk zien afleggen.
+
+Weg 2 is in de praktijk de dominante: hexdb.io wordt maar voor **drie van de zes**
+route-afhankelijke detectoren geraadpleegd (`wrong_airport`,
+`premature_descent`, `signal_lost_near_airport`), en heeft bovendien lang niet
+altijd data. Voor `corridor_deviation`, `course_deviation` en `holding_pattern`
+— precies de drie luidruchtigste — bestaat weg 1 helemaal niet.
+
+**Weg 2 werkt niet.** `route_corroborated_by_progress` toetst:
+
+```python
+    dist_to_dest <= route_len * (1.0 - ROUTE_CORROBORATION_MIN_PROGRESS)   # 0.30
+```
+
+oftewel: "het toestel is minstens 30% dichter bij de gefilede bestemming
+gekomen". Het commentaar erbij motiveert dat zo:
+
+> "een verkeerd gematchte schedule wijst naar een bestemming waar het toestel
+> juist NIET naartoe vliegt, dus daar daalt de resterende afstand helemaal niet
+> en is 30% al onbereikbaar."
+
+Dat is de aanname, en zij is onjuist. Als het toestel in werkelijkheid naar
+luchthaven A vliegt terwijl D gefiled staat, en A ligt onder een hoek theta van
+D gezien vanaf het vertrekpunt, dan is de kleinst bereikte afstand tot D gelijk
+aan `L * sin(theta)`. Corroboratie treedt dus op zodra `sin(theta) <= 0.70`,
+oftewel **voor elke hoekfout tot 44 graden**.
+
+Meting (script in de scratchpad van deze sessie, `probe_route.py`; O op
+(50N,5E), D pal oost op afstand L, A onder hoek theta, toestel vliegt de
+grootcirkel O->A af):
+
+```
+ L(nm)  theta  corr.thr  max xtd  vuurt?  plausibel?  GECORROBOREERD?
+   400    15d        80      103    True        True            True   <== vals-positiefpad
+   900    10d        90      155    True        True            True   <== vals-positiefpad
+   900    30d        90      446    True        True            True   <== vals-positiefpad
+  2000    20d       200      650    True        True            True   <== vals-positiefpad
+  5000    30d       250     1788    True        True            True   <== vals-positiefpad
+```
+
+**21 van de 28 doorgerekende combinaties zijn een compleet vals-positiefpad**:
+de route is fout, `corridor_deviation` vuurt, en het systeem verklaart de route
+tegelijkertijd voor gecorroboreerd.
+
+De diepere fout is de VOLGORDE waarin de twee filters staan. `route_plausible`
+draait eerst en gooit routes weg die geometrisch onmogelijk zijn. Wat er
+overblijft is dus per definitie de verzameling foute routes waarvan de
+bestemming ruwweg de goede kant op ligt — en dat is exact de verzameling waarop
+"komt dichter bij D" geen onderscheidend vermogen heeft. De corroboratietoets
+wordt dus uitsluitend toegepast op de gevallen die hij niet kan beoordelen. Een
+toets die alleen wordt aangeroepen nadat de gevallen die hij wél zou afwijzen
+al zijn weggefilterd, is geen toets.
+
+**Bijkomend: `route_plausible`'s doorlopende hercontrole vuurt nooit.** In
+diezelfde meting staat `plausibel?` op **True in alle 28 rijen**, tot en met een
+hoekfout van 45 graden en 3562nm dwarsafstand op een route van 5000nm. De
+voorwaarde is `xtd > route_len` (`airports.py:218`), en dat vergt in de praktijk
+een hoekfout boven ~75 graden. De hercontrole is ingevoerd (`main.py:547-577`)
+om callsign-botsingen te vangen die zich pas later verraden; zij vangt
+feitelijk niets.
+
+**Bijkomend: de score telt niet-onafhankelijk bewijs gewoon bij elkaar op.**
+Bevinding 4 heeft vastgesteld dat vrijwel elke detector tegen dezelfde
+`track.route["destination_*"]` meet, en dat meerdere detectoren die tegelijk
+afgaan dus één fout is die meerdere keren wordt waargenomen. Die vaststelling
+is toen alleen in de BEVESTIGD-POORT verwerkt (via bewijs-dimensies). De SCORE
+telt ze nog steeds op alsof het onafhankelijke waarnemingen zijn:
+`corridor_deviation` (plafond 55) + `premature_descent` (plafond 60) = 115.
+
+Dat is niet alleen een BEVESTIGD-probleem, en dat is belangrijk: **notificatie
+gebeurt bij WAARSCHIJNLIJK (55)**. `corridor_deviation` haalt dat plafond in
+zijn eentje. Alle bevindingen tot nu toe hebben de BEVESTIGD-poort aangescherpt
+en steunden daarbij op het argument "dat kost vrijwel geen meldingen" — maar de
+klacht van de gebruiker gaat juist over MELDINGEN. Aan de kant waar de meldingen
+vandaan komen is er nog nooit iets aangescherpt.
+
+### 2. Waarom dit een probleem is
+
+Concreet scenario, precies de vorm die de meting hierboven doorrekent:
+
+> Een callsign vliegt vandaag EDDF -> LEPA (Palma). adsbdb's statische mapping
+> geeft de rotatie van gisteren: EDDF -> LEMG (Malaga). De hoek tussen Palma en
+> Malaga vanaf Frankfurt is ~20 graden; de routelengte is ~900nm.
+>
+> - `route_plausible` bij het toewijzen: het toestel staat aan de grond op EDDF,
+>   dwarsafstand 0, voortgang klopt. **Route geaccepteerd.**
+> - Onderweg loopt de dwarsafstand op tot 305nm. De doorlopende hercontrole
+>   eist >900nm. **Route blijft staan.**
+> - Bij ~55% van de weg naar Palma is de afstand tot Malaga gedaald tot onder
+>   0.70 x 900nm. **`route_corroborated = True`.**
+> - De dwarsafstand passeert de drempel van 90nm en houdt aan:
+>   `corridor_deviation` vuurt, drie samples op rij, en blijft vuren.
+>   30 + 10 + 10 + ... -> plafond 55 = **WAARSCHIJNLIJK -> Telegram**.
+> - Zodra het toestel aan Palma begint te dalen is het nog ~470nm van Malaga op
+>   10.000ft, terwijl de normale dalingsdrempel daar 90nm is:
+>   `premature_descent` vuurt, en blijft vuren -> +60.
+> - Score 115 (>= 85). `route_corroborated` staat op True, geen betwiste bron
+>   (hexdb wordt voor `corridor_deviation` niet eens geraadpleegd, en heeft voor
+>   `premature_descent` mogelijk geen data). Twee zachte dimensies
+>   (DIM_LATERAL + DIM_VERTICAL) -> `_confirmed_bar_met` punt 5 geeft True.
+>   **BEVESTIGD + sirene-Telegram.**
+>
+> Er is geen uitwijking. Het toestel heeft een volstrekt normale vlucht
+> uitgevoerd en is op zijn eigen bestemming geland. Elk van de vijf stappen
+> hierboven werkt precies zoals bedoeld.
+
+Merk op dat dit scenario ALLE beschermingen van bevindingen 1-14 doorloopt: de
+verzadigingsplafonds (elke bron blijft netjes onder zijn cap), de
+bewijs-dimensies (er zijn er echt twee), de weerlegging (er is niets weerlegd),
+de betwiste-bron-poort (er is geen tweede bron geraadpleegd). Die bevindingen
+hebben de poort verstevigd op de aanname dat `route_corroborated` betekent wat
+het zegt. Dat is de aanname die hier onderuit gaat, en daarmee hangt alles wat
+erop rust in de lucht.
+
+### 3. De exacte fix
+
+**a. `airports.py` — corroboratie eist voortaan dat het toestel daadwerkelijk
+OP de gefilede corridor is waargenomen, niet alleen dat het er dichterbij kwam.**
+
+Nieuw naast `ROUTE_CORROBORATION_MIN_PROGRESS`:
+
+```python
+# Hoe dicht bij de gefilede grootcirkel het toestel op dat moment moet zitten
+# voordat "dichterbij gekomen" ook echt "op de gefilede route gevlogen"
+# betekent. Dit is de voorwaarde die ontbrak, en zonder haar leverde de toets
+# geen informatie op: een toestel dat in werkelijkheid naar A vliegt terwijl D
+# gefiled staat, komt tot op L*sin(theta) van D, dus met alleen de
+# voortgangseis corroboreerde ELKE hoekfout tot 44 graden. Zie CHECKPOINT.md
+# bevinding 16.
+#
+# 2% van de routelengte met een ondergrens van 25nm. De ondergrens houdt korte
+# routes werkbaar (2% van 288nm is 6nm, krapper dan gewone ATC-vectoring); de
+# 2% houdt lange routes streng. Gekozen vanaf de KANT VAN DE FOUT, niet vanaf
+# de echte cases: de tracks in backtest_cases.py zijn grootcirkelinterpolaties
+# en halen dus per constructie ~0%, wat niets bewijst over echte
+# windgeoptimaliseerde routes. Doorgerekend op de foutkant sluit deze waarde
+# alle 21 gemeten vals-positiefpaden (zie bevinding 16 punt 4).
+ROUTE_CORROBORATION_MAX_XTD_PCT = 0.02
+ROUTE_CORROBORATION_MAX_XTD_FLOOR_NM = 25.0
+```
+
+en `route_corroborated_by_progress` krijgt er één voorwaarde bij, na de
+bestaande voortgangstoets:
+
+```python
+    dist_to_dest = haversine_nm(cur_lat, cur_lon, dest_lat, dest_lon)
+    if dist_to_dest > route_len * (1.0 - ROUTE_CORROBORATION_MIN_PROGRESS):
+        return False
+    max_xtd = max(ROUTE_CORROBORATION_MAX_XTD_FLOOR_NM,
+                  route_len * ROUTE_CORROBORATION_MAX_XTD_PCT)
+    return cross_track_distance_nm(origin_lat, origin_lon, dest_lat, dest_lon,
+                                   cur_lat, cur_lon) <= max_xtd
+```
+
+**b. `incidents.py` — bewijs dat niets anders is dan meetkunde tegen een
+onbevestigde lijn, kan niet in zijn eentje de notificatiedrempel halen.**
+
+Nieuw, naast `_SOFT_DIMENSIONS`:
+
+```python
+# Dimensies waarvan de WAARNEMING volledig bestaat uit "waar bevindt dit toestel
+# zich ten opzichte van een lijn die maar één crowdsourced bron beweert". Zolang
+# die lijn niet onafhankelijk bevestigd is, verklaart de hypothese "de gefilede
+# bestemming klopt niet" ze alle drie tegelijk en even goed — meer van dit soort
+# bewijs maakt die hypothese dus niet onwaarschijnlijker, hoeveel detectoren er
+# ook afgaan (bevinding 4). Bevinding 4 heeft die vaststelling alleen in de
+# BEVESTIGD-poort verwerkt; de SCORE telde ze daarna nog gewoon op, en juist de
+# score bepaalt of er een Telegram uitgaat. Zie CHECKPOINT.md bevinding 16.
+#
+# DIM_GROUND_TRUTH, DIM_VANISHED en DIM_DECLARED staan er bewust NIET in: die
+# bevatten een waarneming met eigen inhoud (een landing, een verdwijning op een
+# aanwijsbaar veld, een piloothandeling) die niet volledig door een verkeerde
+# bestemming wordt weggeschreven.
+_ROUTE_GEOMETRY_DIMENSIONS = {DIM_LATERAL, DIM_VERTICAL, DIM_LOITER}
+```
+
+`_cap_delta` krijgt een tweede plafondlaag:
+
+```python
+    def _cap_delta(self, inc, delta, source, route_verified: bool = False):
+        if delta <= 0:
+            return delta
+        cap = _SOURCE_SCORE_CAP.get(source, _DEFAULT_SOURCE_SCORE_CAP)
+        contrib = self._source_contrib(inc) if inc is not None else {}
+        granted = min(delta, max(0.0, cap - contrib.get(source, 0.0)))
+        if not route_verified and _DIMENSION_FOR_SOURCE.get(source) in _ROUTE_GEOMETRY_DIMENSIONS:
+            used = sum(v for s, v in contrib.items()
+                       if _DIMENSION_FOR_SOURCE.get(s) in _ROUTE_GEOMETRY_DIMENSIONS)
+            room = max(0.0, (self.cfg["incident_score_likely_threshold"] - 1) - used)
+            granted = min(granted, room)
+        contrib[source] = contrib.get(source, 0.0) + granted
+        return granted
+```
+
+`route_verified` wordt door `_apply_delta` doorgegeven als
+`route_corroborated or "route_corroborated" in self._evidence_sources_seen(...)`
+— dezelfde bron van waarheid als `_confirmed_bar_met` punt 2 gebruikt, zodat de
+score en de poort niet uit elkaar kunnen lopen.
+
+Effect: één of meer route-meetkundige signalen op een onbevestigde route komen
+samen tot maximaal 54 punten = **MOGELIJK**. Zichtbaar op het dashboard,
+onderzoekbaar, geen Telegram. Zodra de route wél bevestigd wordt (tweede bron of
+waargenomen corridorvlucht) valt het plafond weg en loopt de score gewoon door.
+Grondbewijs (`wrong_airport`, 90) en verdwijnbewijs (`signal_lost`, 40) vallen
+er buiten en kunnen dus nog steeds op eigen kracht notificeren.
+
+**c. `main.py` — de tweede routebron ook raadplegen voor de drie detectoren die
+hem nooit zagen.**
+
+In `enrich_events`, een nieuw blok voor `corridor_deviation`, `course_deviation`
+en `holding_pattern`: als hexdb.io DEZELFDE bestemming noemt, dan
+`ev.route_corroborated = True`.
+
+Bij ONENIGHEID gebeurt er bewust niets extra's: `route_corroborated` blijft dan
+False, en daarmee grijpt het plafond uit (b) al. Dat is precies de gewenste
+uitkomst, zonder drie nieuwe `_disputed`-bronnen, -plafonds en -dimensies te
+moeten invoeren.
+
+**d. Bewust NIET gedaan: `learned_routes` als corroboratiebron.**
+
+Voor de hand liggend — we hebben deze callsign zelf O->D zien vliegen, dat is
+onafhankelijk van adsbdb — maar het zou juist de fout terugbrengen die deze hele
+bevinding beschrijft. `get_learned_destinations` geeft alle bestemmingen die we
+ooit voor die callsign zagen. Bij een multi-leg-callsign (de gedocumenteerde
+hoofdoorzaak, zie `detect_landed_wrong_airport`'s origin-commentaar) staan daar
+meerdere velden in, en dan corroboreert het "deze callsign vliegt weleens naar
+D" terwijl de vraag is "gaat de vlucht van VANDAAG naar D". Dat is precies het
+verkeerde-leg-probleem. Blijft dus alleen een onderdrukkingsbron, zoals nu.
+
+### 4. Validatie
+
+Nieuwe check in `backtest.py`: `check_route_corroboration_discriminates()`.
+
+Het is een MEETcheck, niet een puntcontrole: hij rekent het raster
+(4 routelengtes x 7 hoekfouten = 28 combinaties) door en telt hoeveel ervan
+tegelijk (i) `corridor_deviation` laten vuren en (ii) de route gecorroboreerd
+verklaren. Gemeten:
+
+| | vals-positiefpaden |
+|---|---|
+| oude regel (alleen voortgang) | **21 / 28** |
+| nieuwe regel (voortgang + op-corridor) | **0 / 28** |
+
+De zeven combinaties die overblijven waar corroboratie nog optreedt (L=400 bij
+theta<=10, L=900 bij theta=5, ...) zijn precies de combinaties waar
+`corridor_deviation` NIET vuurt — de maximale dwarsafstand blijft daar onder de
+drempel. Er valt dus niets vals-positiefs te produceren.
+
+Tweede assertieblok, de andere kant op — dat de aanscherping geen echte
+detectie kost. `check_real_case_confidence_outcomes` draait ongewijzigd door en
+moet dezelfde tabel opleveren:
+
+| case | verwacht BEVESTIGD | waarom dit blijft werken |
+|---|---|---|
+| AI850 | ja | noodsquawk + landing: DIM_DECLARED/DIM_GROUND_TRUTH, buiten het nieuwe plafond |
+| AF9 | ja | noodsquawk |
+| UA2078 (geland) | ja | landing; voortgang ~100%, dwarsafstand ~0 -> gecorroboreerd |
+| UA2078 (signaal verloren) | nee | ongewijzigd |
+| EK225 (beide varianten) | ja | voortgang 34%, dwarsafstand 2nm op L=7030 (plafond 141nm) -> gecorroboreerd |
+| TO3510 | ja | `early_return`, route-onafhankelijk |
+| ATL-MCO-FLL | ja | voortgang 100% |
+| TK17 | ja | voortgang 33%, dwarsafstand ~0 -> gecorroboreerd |
+| Delta 2778 | nee | ongewijzigd |
+
+Derde assertie: het EDDF->LEPA/LEMG-scenario uit punt 2, eind-tot-eind door de
+incident-engine. Verwacht **vóór**: BEVESTIGD. Verwacht **ná**: MOGELIJK (score
+<= 54, geen notificatie).
+
+**Eerlijke afbakening van wat deze fix NIET kan.** De drempel van 2%/25nm is
+gekozen aan de foutkant, niet gemeten aan echte windgeoptimaliseerde routes —
+die zijn in dit project niet beschikbaar (backtest_cases.py interpoleert
+grootcirkels). Een echte uitwijking die begint op een moment dat het toestel
+door legitieme routebowing al meer dan 25nm/2% van de directe lijn af zit, en
+waarvoor hexdb.io geen data heeft, raakt daardoor niet meer gecorroboreerd en
+komt uit op WAARSCHIJNLIJK in plaats van BEVESTIGD. Dat is de bewuste
+richting van de fout: WAARSCHIJNLIJK notificeert nog steeds, en zodra zo'n
+vlucht ergens anders landt levert `wrong_airport` alsnog DIM_GROUND_TRUTH.
+Verkeerd-om zou wél kosten: dat is de huidige toestand.

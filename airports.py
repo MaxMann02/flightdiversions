@@ -239,6 +239,29 @@ def route_plausible(origin_lat, origin_lon, dest_lat, dest_lon, cur_lat, cur_lon
 # vertrekpunt) opgevangen.
 ROUTE_CORROBORATION_MIN_PROGRESS = 0.30
 
+# Hoe dicht bij de gefilede grootcirkel het toestel op dat moment moet zitten
+# voordat "dichterbij gekomen" ook echt "de gefilede route gevlogen" betekent.
+#
+# Dit is de voorwaarde die ontbrak, en zonder haar leverde de hele toets geen
+# informatie op. Het commentaar hierboven nam aan dat een verkeerd gematchte
+# schedule 30% voortgang "vrijwel nooit" haalt. Dat klopt niet: vliegt het
+# toestel in werkelijkheid naar A terwijl D gefiled staat, en ligt A onder een
+# hoek theta van D gezien vanaf het vertrekpunt, dan komt het tot op
+# L*sin(theta) van D. De voortgangseis alleen corroboreert dus ELKE hoekfout tot
+# 44 graden — en omdat route_plausible er al vóór staat en de wild verkeerde
+# routes wegfiltert, is dat precies de verzameling die overblijft. Doorgerekend:
+# 21 van 28 combinaties waren een volledig vals-positiefpad (route fout,
+# corridor_deviation vuurt, route toch "gecorroboreerd"). Zie CHECKPOINT.md
+# bevinding 16.
+#
+# 2% van de routelengte met een ondergrens van 25nm. De ondergrens houdt korte
+# routes werkbaar (2% van 288nm is 6nm, krapper dan gewone ATC-vectoring); de 2%
+# houdt lange routes streng. Gekozen vanaf de KANT VAN DE FOUT en niet vanaf de
+# echte cases: backtest_cases.py interpoleert grootcirkels, dus die halen per
+# constructie ~0% en bewijzen niets over echte windgeoptimaliseerde routes.
+ROUTE_CORROBORATION_MAX_XTD_PCT = 0.02
+ROUTE_CORROBORATION_MAX_XTD_FLOOR_NM = 25.0
+
 
 def route_corroborated_by_progress(origin_lat, origin_lon, dest_lat, dest_lon,
                                    cur_lat, cur_lon) -> bool:
@@ -260,7 +283,16 @@ def route_corroborated_by_progress(origin_lat, origin_lon, dest_lat, dest_lon,
                            cur_lat, cur_lon, check_progress=True):
         return False
     dist_to_dest = haversine_nm(cur_lat, cur_lon, dest_lat, dest_lon)
-    return dist_to_dest <= route_len * (1.0 - ROUTE_CORROBORATION_MIN_PROGRESS)
+    if dist_to_dest > route_len * (1.0 - ROUTE_CORROBORATION_MIN_PROGRESS):
+        return False
+    # ... en het toestel moet op dat moment ook daadwerkelijk OP de gefilede
+    # corridor zitten. Zonder deze regel is "dichter bij D gekomen" verenigbaar
+    # met een vlucht naar een heel ander veld dat toevallig dezelfde kant op
+    # ligt — zie ROUTE_CORROBORATION_MAX_XTD_PCT.
+    max_xtd = max(ROUTE_CORROBORATION_MAX_XTD_FLOOR_NM,
+                  route_len * ROUTE_CORROBORATION_MAX_XTD_PCT)
+    return cross_track_distance_nm(origin_lat, origin_lon, dest_lat, dest_lon,
+                                   cur_lat, cur_lon) <= max_xtd
 
 
 def _intermediate_point(lat1, lon1, lat2, lon2, fraction):
