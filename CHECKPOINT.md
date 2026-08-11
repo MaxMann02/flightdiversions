@@ -2053,3 +2053,334 @@ nooit, in plaats van laag te scoren.
 | UA2078: gefiled KPHX, verloren bij KLUF, hexdb noemt KPHX | niet onderdrukt, `route_corroborated` — de echte diversie blijft staan |
 
 Volledige run: 10/10 cases, **157** assertions, geen FAIL.
+
+---
+
+# SESSIE 3 (2026-08-11) — derde ronde
+
+Drie punten expliciet aangewezen door de gebruiker, plus doorlopende eigen
+analyse:
+
+1. **Emergency-meldingen die geen noodsituatie zijn** ("nordo", "lifeguard") —
+   bevinding 15.
+2. **Het routesysteem als bron van vrijwel alle valse positieven** — bevinding
+   16.
+3. **Onbegrensde groei van `events`/`incidents`/`learned_routes`** (>50.000
+   rijen in productie) — bevinding 17.
+
+---
+
+## Bevinding 15 — Het systeem verwart "er is iets mis" met "dit toestel wijkt uit", en vertrouwt daarbij op een veld dat het zelf al onbetrouwbaar heeft verklaard
+
+**Status:** gevalideerd (2026-08-11) — `check_emergency_semantics` in
+`backtest.py` (14 nieuwe assertions), plus de aangepaste plafondasserties in
+`check_saturation_caps`. Volledige run: 10/10 cases, **172** assertions, geen
+FAIL. Geimplementeerd in `detector.py` (`EMERGENCY_STATUS_MEANINGFUL`) en
+`incidents.py` (`score_for_event`'s emergency-tak, `_SOURCE_SCORE_CAP`,
+`_ROUTE_INDEPENDENT_SOURCES`, `_DIMENSION_FOR_SOURCE`).
+
+### 1. Wat er precies mis is
+
+Er zitten vier losse fouten in één keten, die elkaar versterken. De keten is
+`detector.detect_emergency` -> `main.enrich_events` -> `incidents.score_for_event`
+-> `incidents._confirmed_bar_met`.
+
+**(a) `detector.py:127-134` — het ADS-B `emergency`-STATUSVELD wordt behandeld
+als een noodmelding, ongeacht wat de waarde betekent.**
+
+```python
+    if emergency and emergency != "none":
+        return Event(..., confidence="BEVESTIGD", message=f"emergency status gemeld: {emergency}", ...)
+```
+
+Elke niet-`none`, niet-`reserved` waarde levert een Event op. De DO-260B-enum
+(par. 2.2.3.2.7.8.1.1) die readsb hier doorgeeft kent zeven waarden, en drie
+ervan betekenen operationeel het TEGENOVERGESTELDE van een uitwijking:
+
+| waarde | betekenis | wat het over een uitwijking zegt |
+|---|---|---|
+| `general` | algemene noodsituatie | zwak positief |
+| `lifeguard` | medische vlucht / ambulancevlucht met voorrang | **niets** — dit is een geplande operationele status van een traumaheli of ambulancevliegtuig, geen gebeurtenis |
+| `minfuel` | "minimum fuel" — advies dat vertraging tot een noodsituatie kan leiden | **negatief** — de hele strekking is "geef mij voorrang zodat ik zonder omweg op mijn BESTEMMING kan landen" |
+| `nordo` | radioverbinding uitgevallen | **negatief** — ICAO Annex 2 en 14 CFR 91.185 schrijven bij verlies van radioverbinding expliciet voor: vlieg het ingediende vluchtplan naar de BESTEMMING af |
+| `unlawful` | kaping | sterk positief, maar extreem zeldzaam |
+| `downed` | neergestort toestel | **onmogelijk** voor een toestel dat op dit moment een positie uitzendt op kruishoogte |
+| `reserved` | ongebruikt | al genormaliseerd naar `none` in `providers._normalize_aircraft` |
+
+De gebruiker meldt dat vrijwel alle emergency-meldingen `nordo` of `lifeguard`
+zijn en dat er nog nooit één echt was. Dat is geen toeval en geen tuningkwestie:
+dat zijn precies de twee waarden die per definitie geen uitwijking aankondigen.
+
+De lokale database bevestigt de aard van de rest. Uit `events`:
+
+```
+TRA6784 (Transavia, kruisvlucht)  emergency='downed'    squawk 1000
+CFG9EC  (Condor,    kruisvlucht)  emergency='unlawful'  squawk 1000
+KLM84A                            emergency='lifeguard' squawk 1000
+DLH7HV / DLH7TX / CTN4456         emergency='general'   squawk 1000
+EXS36BG                           emergency='nordo'     squawk 5212
+THY2ES                            emergency='general'   squawk 6522
+```
+
+Een normaal vliegende Transavia die "neergestort" meldt en een Condor die
+"kaping" meldt, is geen zeldzame samenloop maar het handtekeningpatroon van een
+decodeartefact: de waarden zijn over de hele enum uitgesmeerd terwijl de
+onderliggende toestellen niets bijzonders doen.
+
+**(b) `main.py:302-307` + `_SOURCE_SCORE_CAP["emergency_status"] = 55.0` — het
+statusveld haalt in twee cycli WAARSCHIJNLIJK, en dus een Telegram, op
+corroboratie waarvan dit project zelf al heeft vastgesteld dat zij niets waard
+is.**
+
+`emergency` staat NIET in `REPEATABLE_EVENT_TYPES`, dus elke tier0-cyclus (15s)
+levert de VOLLE 35 punten op. Plafond 55. Dus:
+
+- cyclus 1: 35 punten -> MOGELIJK
+- cyclus 2 (15 seconden later): 55 punten -> **WAARSCHIJNLIJK -> `_maybe_notify` -> Telegram**
+
+De enige zeef ervoor is `cross_provider_confirms_emergency`. Maar in
+`main.py:290-298` staat, voor de conspicuity-tak, al letterlijk opgeschreven
+waarom die zeef niet werkt:
+
+> "adsb.lol and airplanes.live have overlapping feeder coverage and share the
+> same decode convention for this subfield, so agreement here isn't independent
+> confirmation the way it is for ground state."
+
+Dat argument gaat over de PIJPLIJN van de twee providers, niet over de squawk.
+Het geldt dus net zo goed voor een discrete squawk. De redenering is wel
+opgeschreven maar maar op één van de twee takken toegepast: op een
+conspicuity-squawk wordt de corroboratie terecht genegeerd (cap 24, onder
+MOGELIJK), op elke andere squawk wordt diezelfde waardeloze corroboratie
+vervolgens gebruikt om de melding naar 55 (= notificatiedrempel) te tillen.
+EXS36BG (`nordo`, squawk 5212) en THY2ES (`general`, squawk 6522) in de tabel
+hierboven zijn precies die tak.
+
+**(c) `incidents.py:307-308` — één enkele waarneming van squawk 7600 of 7500
+levert onmiddellijk BEVESTIGD op.**
+
+```python
+        if ev.squawk in EMERGENCY_SQUAWKS:
+            return 100.0, "emergency_squawk", f"noodsquawk {ev.squawk}"
+```
+
+100 >= `incident_score_confirmed_threshold` (85), en `emergency_squawk` staat in
+`_ROUTE_INDEPENDENT_SOURCES`, dus `_confirmed_bar_met` punt 1 geeft direct True
+terug. Eén sample, geen persistentie-eis, hoogste label, Telegram met sirene.
+
+De drie codes worden hier als één ding behandeld terwijl ze operationeel
+volstrekt verschillend zijn:
+
+- **7700** — algemene noodsituatie. Sterk gecorreleerd met uitwijken (medisch,
+  drukverlies, motorstoring, rook: die eindigen vrijwel allemaal op een ander
+  veld dan gefiled). Terecht zwaar.
+- **7600** — radiostoring. Zie (a): de voorgeschreven procedure is juist
+  DOORVLIEGEN naar de bestemming. Dit is geen uitwijkbewijs. Bovendien
+  levert het in de praktijk lange nuisance-reeksen op: `N81051` (een
+  Amerikaans GA-toestel) staat 26 keer in de lokale `events`-tabel binnen ~4
+  minuten.
+- **7500** — kaping. Echte gevallen zijn wereldwijd een handvol per decennium.
+  Een KORTSTONDIGE 7500 is vrijwel altijd doordraaien tijdens het instellen van
+  een andere code — de bekende reden dat ATC hier spurious alerts van krijgt.
+  Zonder persistentie-eis is de aanname "een 4-cijferige piloothandeling kan
+  geen ruis zijn" (de rechtvaardiging in `_ROUTE_INDEPENDENT_SOURCES`) juist
+  hier het zwakst.
+
+**(d) De diepste fout: het hoogste label claimt iets anders dan het bewijs
+draagt.**
+
+Dit systeem is een UITWIJKdetector. `notifier.format_incident_transition` stuurt
+"BEVESTIGD — CALLSIGN", en `_confirmed_bar_met`'s eigen docstring definieert
+BEVESTIGD als "er blijft geen redelijke alternatieve verklaring meer over voor
+wat we waarnemen" — waarbij "wat we waarnemen" in dit systeem altijd een
+uitwijking is (`_check_landed` sluit af met "bevestigde diversie",
+`count_incidents_by_resolution` telt het als zodanig).
+
+Een noodsquawk bewijst dat er iets mis is. Hij bewijst NIET dat het toestel
+uitwijkt. Een 7700 wegens een zieke passagier vlak voor de bestemming, een 7700
+wegens een technische storing die op de geplande bestemming wordt afgehandeld —
+allebei echte noodsituaties, allebei geen uitwijking. Het systeem heeft op dat
+moment nul waarnemingen over de BESTEMMING gedaan, en zet toch het label dat
+juist over de bestemming gaat.
+
+### 2. Waarom dit een probleem is
+
+Concreet scenario dat vandaag optreedt (en dat de gebruiker rapporteert):
+
+> Een traumahelikopter of ambulancevliegtuig zendt de hele vlucht `emergency =
+> lifeguard` uit — een geplande voorrangsstatus, precies waar het veld voor
+> bedoeld is. Tier0 pikt hem niet op (geen 7x00-squawk), maar tier1 wel, via
+> `evaluate()` -> `detect_emergency`. `enrich_events` vraagt airplanes.live om
+> een tweede mening; die kijkt naar dezelfde feeders met dezelfde decoder en
+> zegt ook `lifeguard`. Geen degradatie. `score_for_event` geeft 35 punten,
+> bron `emergency_status`. Twee cycli later: 55 punten = WAARSCHIJNLIJK =
+> Telegram "er is waarschijnlijk een uitwijking aan de gang".
+>
+> Er is niets waargenomen. Geen koersafwijking, geen daling, geen landing
+> elders, geen route zelfs maar. De melding rust volledig op één bitveld dat
+> zegt "dit is een ambulancevlucht" — wat waar is, en wat geen uitwijking is.
+
+En het spiegelbeeld, dat net zo fout is de andere kant op:
+
+> `N81051` squawkt 7600 (radiostoring). Eén sample -> 100 punten -> BEVESTIGD.
+> Het toestel vliegt daarna volgens voorschrift gewoon door naar zijn
+> bestemming en landt daar. Het incident is nooit weerlegd (er is geen
+> weerleggingsbron voor DIM_DECLARED), dus het staat op BEVESTIGD tot het
+> vervalt of `_check_landed` het sluit.
+
+Het gevolg is niet alleen ruis. Het is dat het hoogste zekerheidsniveau precies
+zijn betekenis verliest die de rest van dit document (bevindingen 1-14) met veel
+moeite heeft opgebouwd: BEVESTIGD hoort te betekenen "geen redelijk alternatief
+meer". Voor `lifeguard` is het redelijke alternatief niet alleen aanwezig, het
+is de MEEST waarschijnlijke verklaring, en hij staat letterlijk in de waarde van
+het veld te lezen.
+
+Merk ook op hoe dit de bevindingen 3/4 ondergraaft. Die stelden vast dat één
+bewijsdimensie nooit alleen mag bevestigen, met als enige uitzondering bewijs
+dat "niet van de gefilede route afhangt". `emergency_squawk` kreeg die
+uitzondering omdat een 4-cijferige piloothandeling geen datafout kan zijn. Dat
+klopt — maar "geen datafout" is niet hetzelfde als "bewijs voor een uitwijking".
+De uitzondering is gemotiveerd met een argument over BETROUWBAARHEID en gebruikt
+om een vraag over RELEVANTIE te beantwoorden.
+
+### 3. De exacte fix
+
+**a. `detector.py` — het statusveld eerst op BETEKENIS filteren.**
+
+Nieuw, direct onder `SQUAWK_LABELS`:
+
+```python
+# ADS-B emergency/priority status (DO-260B par. 2.2.3.2.7.8.1.1), zoals readsb
+# hem doorgeeft. Niet elke niet-'none' waarde is bewijs voor een UITWIJKING — en
+# dat is de vraag die dit systeem stelt.
+#
+#  - 'lifeguard' is een GEPLANDE voorrangsstatus van een ambulancevlucht, geen
+#    gebeurtenis. Een traumaheli zendt hem de hele vlucht uit.
+#  - 'minfuel' is een advies ("vertraging kan tot een noodsituatie leiden"),
+#    geen verklaarde noodsituatie, en de strekking ervan is juist ZONDER omweg
+#    naar de gefilede bestemming.
+#  - 'nordo' (radiostoring): ICAO Annex 2 / 14 CFR 91.185 schrijven voor om het
+#    ingediende vluchtplan naar de BESTEMMING af te vliegen. Dit is dus eerder
+#    negatief dan positief bewijs voor uitwijken.
+#  - 'downed' op een toestel dat op dit moment een positie op hoogte uitzendt,
+#    is zelfweersprekend en kan alleen een decodeartefact zijn (live gezien:
+#    TRA6784, kruisvlucht, squawk 1000).
+#
+# Alleen deze twee blijven over als bewijs dat ergens naartoe wijst. Ze zijn nog
+# steeds ZWAK (zie incidents._SOURCE_SCORE_CAP) — het statusveld als geheel is
+# in dit project live onbetrouwbaar gebleken (MASTERPLAN sectie 1c/7) — maar ze
+# spreken zichzelf tenminste niet tegen.
+EMERGENCY_STATUS_MEANINGFUL = ("general", "unlawful")
+```
+
+en de tak in `detect_emergency` wordt:
+
+```python
+    if emergency in EMERGENCY_STATUS_MEANINGFUL:
+        return Event(...)   # ongewijzigd verder
+    return None
+```
+
+**b. `detector.py` — noodsquawks uit elkaar halen.** `detect_emergency` blijft
+één Event produceren; het onderscheid gebeurt in `score_for_event` op
+`ev.squawk`, dat al op het Event staat. Geen wijziging nodig in
+`detect_emergency` zelf behalve (a).
+
+**c. `incidents.py`, `score_for_event`, de `emergency`-tak wordt:**
+
+```python
+    if et == "emergency":
+        # De drie noodsquawks zijn operationeel niet hetzelfde signaal, en dit
+        # systeem stelt één specifieke vraag: wijkt dit toestel uit? Zie
+        # CHECKPOINT.md bevinding 15.
+        if ev.squawk == "7700":
+            return 100.0, "emergency_squawk", f"noodsquawk {ev.squawk}"
+        if ev.squawk == "7500":
+            return (100.0 if is_repeat_type else 20.0), "unlawful_squawk", f"noodsquawk {ev.squawk} (kaping)"
+        if ev.squawk == "7600":
+            return (8.0 if is_repeat_type else 25.0), "nordo_squawk", f"noodsquawk {ev.squawk} (radiostoring)"
+        if ev.confidence == "WAARSCHIJNLIJK":
+            return 8.0, "emergency_status_low_trust", "emergency-status (laag vertrouwen — conspicuity-squawk of niet bevestigd)"
+        return 20.0, "emergency_status", "emergency-status op discrete squawk"
+```
+
+Toelichting per tak:
+
+- **7700**: de enige van de drie die sterk met uitwijken samenhangt, en de enige
+  die in zijn eentje mag bevestigen. Ongewijzigd.
+- **7500**: persistentie-eis van één cyclus (~15s op tier0) via het bestaande
+  `is_repeat_type`-mechanisme: de eerste waarneming blijft onder
+  `incident_score_possible_threshold` (25) en is dus niet eens zichtbaar; houdt
+  hij aan, dan telt hij vol mee en mag hij bevestigen.
+- **7600**: blijft zichtbaar als context (25 = precies MOGELIJK), notificeert
+  nooit alleen, bevestigt nooit alleen.
+
+**d. `incidents.py`, `_SOURCE_SCORE_CAP` — nieuwe/gewijzigde plafonds:**
+
+```python
+    "emergency_squawk":            150.0,   # ongewijzigd (alleen nog 7700)
+    "unlawful_squawk":             150.0,   # NIEUW — na de persistentie-eis vol vertrouwen
+    "nordo_squawk":                 33.0,   # NIEUW — MOGELIJK, nooit WAARSCHIJNLIJK
+    "emergency_status":             24.0,   # WAS 55.0
+    "emergency_status_low_trust":   24.0,   # ongewijzigd
+```
+
+`emergency_status` van 55 naar 24 is de kern van punt (b): 55 is exact
+`incident_score_likely_threshold`, dus het oude plafond was precies zo gekozen
+dat het statusveld in zijn eentje een Telegram stuurde. De rechtvaardiging
+daarvoor was cross-provider-corroboratie, en die corroboratie is volgens de
+eigen analyse van dit project niet onafhankelijk. 24 zet het statusveld terug
+naar wat het is: een aanwijzing die met ander bewijs samen iets waard is en
+alleen niets.
+
+`nordo_squawk` op 33 en niet op 0: een 7600 is wel een echte, bewuste
+piloothandeling en hoort in de tijdlijn en op het dashboard te staan. 33 ligt
+boven `incident_score_possible_threshold` (25) en onder
+`incident_score_likely_threshold` (55): zichtbaar, nooit een Telegram op eigen
+kracht.
+
+**e. `incidents.py` — de dimensie- en poorttabellen bijwerken:**
+
+```python
+_ROUTE_INDEPENDENT_SOURCES = {"emergency_squawk", "unlawful_squawk", "wrong_airport_early_return"}
+```
+
+`nordo_squawk` staat er bewust NIET in: dat is nu juist de code waarvan de
+voorgeschreven procedure DOORVLIEGEN is. `emergency_status*` stond er al niet in.
+
+```python
+_DIMENSION_FOR_SOURCE = {
+    ...
+    "unlawful_squawk": DIM_DECLARED,
+    "nordo_squawk": DIM_DECLARED,
+    ...
+}
+```
+
+**f. `incidents.py`, `_confirmed_bar_met` punt 1 — de motivering herschrijven.**
+
+De uitzondering blijft bestaan maar krijgt de juiste rechtvaardiging: niet
+"dit kan geen datafout zijn" (een betrouwbaarheidsargument) maar "dit voorspelt
+een uitwijking" (een relevantieargument). Zie punt (d) van de analyse hierboven.
+Alleen een commentaarwijziging, geen gedragswijziging — maar wel de reden dat
+7600 er nu uit is en 7700 erin blijft.
+
+### 4. Validatie
+
+Nieuwe check in `backtest.py`: `check_emergency_semantics(airport_db)`.
+
+| scenario | voor de fix | na de fix |
+|---|---|---|
+| `emergency='lifeguard'`, squawk 1000, verder normale vlucht | Event, 8 pt (low_trust) | **geen Event** |
+| `emergency='nordo'`, squawk 5212, tweede provider bevestigt | Event, 35 pt -> na 2 cycli 55 = WAARSCHIJNLIJK + Telegram | **geen Event** |
+| `emergency='minfuel'` / `'downed'` | Event | **geen Event** |
+| `emergency='general'`, squawk 6522, tweede provider bevestigt | 35 pt, na 2 cycli WAARSCHIJNLIJK | 20 pt, plafond 24 -> blijft onder MOGELIJK (25), notificeert nooit alleen |
+| squawk 7700, één sample | BEVESTIGD | **BEVESTIGD** (ongewijzigd — regressiebewaking) |
+| squawk 7600, één sample | BEVESTIGD (100 pt) | MOGELIJK (25 pt); ook volgehouden nooit boven 33 -> nooit WAARSCHIJNLIJK/BEVESTIGD alleen |
+| squawk 7500, één sample | BEVESTIGD | 20 pt -> onder MOGELIJK, onzichtbaar |
+| squawk 7500, twee samples | BEVESTIGD | **BEVESTIGD** (persistentie gehaald) |
+| squawk 7600 + waargenomen landing op ander veld (gecorroboreerde route) | BEVESTIGD | **BEVESTIGD** — via DIM_GROUND_TRUTH, zoals het hoort |
+
+Bestaande checks die dit mag raken en groen moeten blijven:
+`check_emergency_status_regressions`, `check_saturation_caps` (bevat
+`emergency_status`-plafondasserties), `check_confirmed_bar_structure`,
+`check_real_case_confidence_outcomes`.

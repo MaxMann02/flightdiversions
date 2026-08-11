@@ -11,6 +11,29 @@ SQUAWK_LABELS = {
     "7500": "kaping / unlawful interference",
 }
 
+# ADS-B emergency/priority status (DO-260B par. 2.2.3.2.7.8.1.1), zoals readsb
+# hem doorgeeft. Niet elke niet-'none' waarde is bewijs voor een UITWIJKING —
+# en dat is de enige vraag die dit systeem stelt. Zie CHECKPOINT.md bevinding 15.
+#
+#  - 'lifeguard' is een GEPLANDE voorrangsstatus van een ambulancevlucht, geen
+#    gebeurtenis: een traumaheli zendt hem de hele vlucht uit.
+#  - 'minfuel' is een advies ("vertraging kan tot een noodsituatie leiden"),
+#    geen verklaarde noodsituatie, en de strekking ervan is juist ZONDER omweg
+#    naar de gefilede bestemming.
+#  - 'nordo' (radiostoring): ICAO Annex 2 / 14 CFR 91.185 schrijven voor om het
+#    ingediende vluchtplan naar de BESTEMMING af te vliegen. Dat is eerder
+#    negatief dan positief bewijs voor uitwijken.
+#  - 'downed' op een toestel dat op ditzelfde moment een positie op hoogte
+#    uitzendt is zelfweersprekend, en kan dus alleen een decodeartefact zijn
+#    (live waargenomen: TRA6784, kruisvlucht, squawk 1000).
+#  - 'reserved' is al in providers._normalize_aircraft naar 'none' genormaliseerd.
+#
+# Alleen deze twee blijven over als bewijs dat ergens naartoe wijst. Ze blijven
+# ZWAK (zie incidents._SOURCE_SCORE_CAP) — het statusveld is in dit project live
+# onbetrouwbaar gebleken, MASTERPLAN sectie 1c/7 — maar ze spreken zichzelf
+# tenminste niet tegen.
+EMERGENCY_STATUS_MEANINGFUL = ("general", "unlawful")
+
 
 @dataclass
 class Event:
@@ -124,7 +147,7 @@ def detect_emergency(track: AircraftTrack, ac: dict) -> Event | None:
             lat=ac.get("lat"), lon=ac.get("lon"), squawk=squawk, alt=ac.get("alt_baro"),
             origin_icao=origin_icao, dest_icao=dest_icao,
         )
-    if emergency and emergency != "none":
+    if emergency in EMERGENCY_STATUS_MEANINGFUL:
         return Event(
             hex=track.hex, callsign=track.callsign, event_type="emergency",
             confidence="BEVESTIGD",

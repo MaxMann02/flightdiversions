@@ -1169,11 +1169,22 @@ def check_saturation_caps(airport_db: AirportDB) -> bool:
         return Event(hex="cap5", callsign="TSTC", event_type="emergency", confidence="BEVESTIGD",
                      message=f"m{i}", squawk="7700")
 
+    def nordo_squawk(i):
+        # CHECKPOINT.md bevinding 15: 7600 blijft zichtbaar (>= MOGELIJK) maar
+        # mag ook volgehouden nooit op eigen kracht notificeren.
+        return Event(hex="cap6", callsign="TSTC", event_type="emergency", confidence="BEVESTIGD",
+                     message=f"m{i}", squawk="7600")
+
     for label, hex_id, factory, want_cap, want_state in (
         ("holding_non_destination", "cap1", hold_nd, 70.0, incidents_module.LIKELY),
         ("premature_descent", "cap2", descent, 60.0, incidents_module.LIKELY),
         ("emergency_status_low_trust", "cap3", low_trust_emergency, 24.0, incidents_module.WATCHING),
-        ("emergency_status", "cap4", status_emergency, 55.0, incidents_module.LIKELY),
+        # WAS 55.0/LIKELY — exact de WAARSCHIJNLIJK-drempel, dus zo gekozen dat
+        # het losse ADS-B-statusveld in zijn eentje een Telegram stuurde op
+        # cross-provider-corroboratie waarvan main.py's eigen commentaar al
+        # vaststelt dat zij niet onafhankelijk is. Zie CHECKPOINT.md bevinding 15.
+        ("emergency_status", "cap4", status_emergency, 24.0, incidents_module.WATCHING),
+        ("nordo_squawk", "cap6", nordo_squawk, 33.0, incidents_module.POSSIBLE),
     ):
         score, state = sustain(hex_id, factory)
         ok = abs(score - want_cap) < 0.01 and state == want_state and score < confirmed
@@ -2499,6 +2510,96 @@ def check_evidence_refutation(airport_db: AirportDB) -> bool:
     return all_ok
 
 
+def check_emergency_semantics(airport_db: AirportDB) -> bool:
+    """CHECKPOINT.md bevinding 15. Dit systeem is een UITWIJKdetector, maar de
+    emergency-tak beantwoordde een andere vraag: "is er iets mis?". Twee gaten:
+
+      1. Het ADS-B emergency-STATUSVELD leverde een Event op voor ELKE
+         niet-'none' waarde. Drie van de zeven DO-260B-waarden voorspellen
+         operationeel juist het TEGENDEEL van een uitwijking ('lifeguard' is een
+         geplande voorrangsstatus van een ambulancevlucht, 'minfuel' en 'nordo'
+         betekenen allebei "ik wil ZONDER omweg naar mijn bestemming"), en
+         'downed' is onmogelijk voor een toestel dat op dat moment een positie
+         op hoogte uitzendt. De gebruiker rapporteerde precies deze waarden als
+         de meldingen die nooit echt bleken.
+      2. De drie noodsquawks werden als één signaal behandeld: één sample van
+         7500 of 7600 gaf 100 punten en dus onmiddellijk BEVESTIGD, terwijl de
+         voorgeschreven lost-comms-procedure (ICAO Annex 2 / 14 CFR 91.185)
+         juist DOORVLIEGEN naar de gefilede bestemming is, en een kortstondige
+         7500 vrijwel altijd doordraaien tijdens het instellen van een andere
+         code is."""
+    import classify
+    import db as db_module
+    import incidents as incidents_module
+    from detector import Event, detect_emergency
+    from state import AircraftTrack
+
+    print("\n=== emergency-semantiek (statusveld + noodsquawks) ===")
+    all_ok = True
+    cfg = dict(CONFIG)
+
+    # --- 1. het statusveld op BETEKENIS ---
+    track = AircraftTrack(hex="abc123", callsign="TSTX")
+    for status, want_event in (
+        ("lifeguard", False), ("minfuel", False), ("nordo", False), ("downed", False),
+        ("none", False), ("general", True), ("unlawful", True),
+    ):
+        ev = detect_emergency(track, {"squawk": "2451", "emergency": status,
+                                       "lat": 50.0, "lon": 5.0, "alt_baro": 35000})
+        ok = (ev is not None) == want_event
+        all_ok = all_ok and ok
+        print(f"  emergency-status '{status}': {'Event' if ev else 'geen Event'} "
+              f"(verwacht {'Event' if want_event else 'geen Event'}): {'OK' if ok else 'FAIL'}")
+
+    # --- 2. de drie noodsquawks los van elkaar ---
+    def run(hex_id, squawk, cycles):
+        mgr = incidents_module.IncidentManager(db_module.connect(":memory:"), cfg, airport_db)
+        t = 1000.0
+        for i in range(cycles):
+            ev = Event(hex=hex_id, callsign="TSTX", event_type="emergency",
+                       confidence="BEVESTIGD", message=f"m{i}", squawk=squawk)
+            mgr.step(hex_id, "TSTX", classify.AIRLINER, [ev], {"squawk": squawk}, t)
+            t += 15.0
+        inc = mgr._open[hex_id]
+        return inc["score"], inc["state"]
+
+    for squawk, cycles, want_state, why in (
+        ("7700", 1, incidents_module.CONFIRMED, "algemene noodsituatie: ongewijzigd direct BEVESTIGD"),
+        ("7600", 1, incidents_module.POSSIBLE, "radiostoring: zichtbaar, niet bevestigd"),
+        ("7600", 30, incidents_module.POSSIBLE, "radiostoring, volgehouden: nog steeds geen notificatie"),
+        ("7500", 1, incidents_module.WATCHING, "kaping, één sample: nog onzichtbaar (doordraai-artefact)"),
+        ("7500", 2, incidents_module.CONFIRMED, "kaping, volgehouden: BEVESTIGD"),
+    ):
+        score, state = run(f"sq{squawk}{cycles}", squawk, cycles)
+        ok = state == want_state
+        all_ok = all_ok and ok
+        print(f"  squawk {squawk} x{cycles}: score {score:.0f}, state {state} "
+              f"(verwacht {want_state}) — {why}: {'OK' if ok else 'FAIL'}")
+
+    # --- 3. 7600 blokkeert een ECHTE uitwijking niet ---
+    # Een radiostoring die daadwerkelijk elders landt hoort gewoon BEVESTIGD te
+    # worden — via DIM_GROUND_TRUTH, niet via de squawk. Regressiebewaking dat
+    # het verlagen van 7600 geen echte detectie kost.
+    mgr = incidents_module.IncidentManager(db_module.connect(":memory:"), cfg, airport_db)
+    t = 1000.0
+    mgr.step("mix1", "TSTX", classify.AIRLINER, [Event(
+        hex="mix1", callsign="TSTX", event_type="emergency", confidence="BEVESTIGD",
+        message="7600", squawk="7600")], {"squawk": "7600"}, t)
+    t += 60.0
+    mgr.step("mix1", "TSTX", classify.AIRLINER, [Event(
+        hex="mix1", callsign="TSTX", event_type="wrong_airport", confidence="BEVESTIGD",
+        message="geland op EDDM", origin_icao="EDDF", dest_icao="LEMG",
+        observed_icao="EDDM", route_corroborated=True)], None, t)
+    inc = mgr._open.get("mix1")
+    state = inc["state"] if inc else "GESLOTEN"
+    ok = state in (incidents_module.CONFIRMED, "GESLOTEN")
+    all_ok = all_ok and ok
+    print(f"  7600 + waargenomen landing elders (gecorroboreerde route): state {state} "
+          f"— echte uitwijking blijft BEVESTIGD: {'OK' if ok else 'FAIL'}")
+
+    return all_ok
+
+
 def main():
     from backtest_cases import CASES
     airport_db = AirportDB()
@@ -2506,6 +2607,7 @@ def main():
     bad_route_ok = check_bad_route_regressions()
     holding_suppression_ok = check_course_deviation_holding_suppression()
     emergency_status_ok = check_emergency_status_regressions()
+    emergency_semantics_ok = check_emergency_semantics(airport_db)
     bow_suppression_ok = check_corridor_deviation_bow_suppression()
     signal_lost_origin_ok = check_signal_lost_origin_suppression(airport_db)
     holding_origin_gating_ok = check_holding_pattern_origin_gating(airport_db)
@@ -2538,6 +2640,7 @@ def main():
     print(f"bad-route regression checks: {'all OK' if bad_route_ok else 'FAIL — see above'}")
     print(f"course_deviation holding-pattern suppression: {'OK' if holding_suppression_ok else 'FAIL — see above'}")
     print(f"emergency-status normalization: {'OK' if emergency_status_ok else 'FAIL — see above'}")
+    print(f"emergency-semantiek (statusveld + noodsquawks): {'OK' if emergency_semantics_ok else 'FAIL — see above'}")
     print(f"corridor_deviation bow-tolerance suppression: {'OK' if bow_suppression_ok else 'FAIL — see above'}")
     print(f"signal_lost_near_airport origin-suppression: {'OK' if signal_lost_origin_ok else 'FAIL — see above'}")
     print(f"holding_pattern origin-streak gating: {'OK' if holding_origin_gating_ok else 'FAIL — see above'}")

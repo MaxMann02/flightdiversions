@@ -95,9 +95,20 @@ _WRONG_AIRPORT_SOURCES = {"wrong_airport", "wrong_airport_disputed", "wrong_airp
 # daarom als enige geen route-corroboratie nodig hebben om BEVESTIGD te halen
 # (zie _confirmed_bar_met punt 1):
 #
-#  - emergency_squawk: een bewuste 4-cijferige piloothandeling. Geen
-#    datakwaliteits- of routine-operatieverklaring produceert die, en welke
-#    bestemming er gefiled staat doet er niet aan toe.
+#  - emergency_squawk (7700) en unlawful_squawk (7500, na zijn persistentie-eis):
+#    een bewuste 4-cijferige piloothandeling. Twee dingen moeten hier los van
+#    elkaar waar zijn, en tot bevinding 15 werd alleen het eerste beargumenteerd:
+#      (i)  BETROUWBAARHEID — geen datakwaliteits- of routine-operatieverklaring
+#           produceert deze code, en welke bestemming er gefiled staat doet er
+#           niet aan toe;
+#      (ii) RELEVANTIE — de code voorspelt daadwerkelijk een UITWIJKING, want
+#           dat is het enige wat dit systeem beweert als het BEVESTIGD zegt.
+#    Voor 7700 (algemene noodsituatie) en 7500 (kaping) gelden ze allebei: die
+#    eindigen vrijwel altijd op een ander veld dan gefiled. Voor 7600 geldt (i)
+#    net zo goed maar (ii) juist NIET — de voorgeschreven lost-comms-procedure
+#    is het vluchtplan naar de gefilede bestemming afvliegen. 7600 heeft daarom
+#    een eigen bron (nordo_squawk) die hier bewust buiten valt. Zie CHECKPOINT.md
+#    bevinding 15.
 #  - wrong_airport_early_return: wij hebben dit toestel zelf zien opstijgen van
 #    luchthaven X en binnen early_return_max_minutes weer zien landen op
 #    diezelfde luchthaven X. Beide uiteinden zijn onze eigen waarneming, de
@@ -108,7 +119,7 @@ _WRONG_AIRPORT_SOURCES = {"wrong_airport", "wrong_airport_disputed", "wrong_airp
 #    vertrekken vanaf de gefilede origin" bevestigt de VERTREKhelft van de
 #    route, terwijl wrong_airport volledig over de BESTEMMING gaat — dat liet
 #    precies het DLH8NK-scenario (kloppende origin, foute bestemming) weer door.
-_ROUTE_INDEPENDENT_SOURCES = {"emergency_squawk", "wrong_airport_early_return"}
+_ROUTE_INDEPENDENT_SOURCES = {"emergency_squawk", "unlawful_squawk", "wrong_airport_early_return"}
 
 # Bronnamen die alleen ontstaan wanneer een TWEEDE routebron (hexdb.io) een
 # ANDERE bestemming noemt dan de gefilede — zie main.py's enrich_events. Hun
@@ -161,6 +172,8 @@ DIM_GROUND_TRUTH_PROVISIONAL = "ground_truth_provisional"
 
 _DIMENSION_FOR_SOURCE = {
     "emergency_squawk": DIM_DECLARED,
+    "unlawful_squawk": DIM_DECLARED,
+    "nordo_squawk": DIM_DECLARED,
     "emergency_status": DIM_DECLARED,
     "emergency_status_low_trust": DIM_DECLARED,
     "wrong_airport": DIM_GROUND_TRUTH,
@@ -255,13 +268,26 @@ _VANISHED_SOURCES = {"signal_lost", "signal_lost_disputed"}
 # wrong_airport (fysiek waargenomen landing) liggen erboven; die twee worden
 # apart begrensd door _confirmed_bar_met.
 _SOURCE_SCORE_CAP = {
-    # Een echte 7700/7600/7500 moet onmiddellijk én blijvend BEVESTIGD zijn.
+    # Een echte 7700 moet onmiddellijk én blijvend BEVESTIGD zijn.
     "emergency_squawk":            150.0,
-    # Precies de WAARSCHIJNLIJK-drempel: een volgehouden, cross-provider-
-    # bevestigd emergency-statusveld op een discrete squawk is een melding
-    # waard, maar het statusveld is live onbetrouwbaar gebleken (MASTERPLAN
-    # sectie 1c/7) en is zonder squawk of ander bewijs geen bevestiging.
-    "emergency_status":             55.0,
+    # 7500 na de persistentie-eis in score_for_event: dan vol vertrouwen.
+    "unlawful_squawk":             150.0,
+    # 7600 (radiostoring). Boven incident_score_possible_threshold (25) zodat
+    # het op het dashboard staat, onder incident_score_likely_threshold (55)
+    # zodat het nooit op eigen kracht notificeert: de voorgeschreven
+    # lost-comms-procedure is DOORVLIEGEN naar de gefilede bestemming, dus dit
+    # signaal wijst niet naar een uitwijking. Zie CHECKPOINT.md bevinding 15.
+    "nordo_squawk":                 33.0,
+    # WAS 55.0 — exact de WAARSCHIJNLIJK-drempel, dus zo gekozen dat het losse
+    # ADS-B-statusveld in twee tier0-cycli (30s) in zijn eentje een Telegram
+    # stuurde. De rechtvaardiging daarvoor was cross-provider-corroboratie, en
+    # main.py's eigen conspicuity-commentaar stelt al vast dat die corroboratie
+    # NIET onafhankelijk is (adsb.lol en airplanes.live delen feeders én
+    # decodeconventie voor juist dit subveld). Dat argument gaat over de
+    # pijplijn, niet over de squawk, dus het geldt op elke squawk. 24 zet het
+    # statusveld terug op wat het is: een aanwijzing die alleen samen met ander
+    # bewijs iets waard is. Zie CHECKPOINT.md bevinding 15.
+    "emergency_status":             24.0,
     # Bewust nét onder de MOGELIJK-drempel (25): het gedocumenteerde
     # conspicuity-squawk-decodeartefact (AUA96J/AUA12K/CFG6UA) komt in zijn
     # eentje niet eens op het dashboard, maar draagt nog wel bij aan een
@@ -304,14 +330,40 @@ def score_for_event(ev, is_repeat_type: bool) -> tuple[float, str, str]:
     behind each weight."""
     et = ev.event_type
     if et == "emergency":
-        if ev.squawk in EMERGENCY_SQUAWKS:
+        # De drie noodsquawks zijn operationeel niet hetzelfde signaal, en dit
+        # systeem stelt één specifieke vraag: wijkt dit toestel UIT? Ze werden
+        # tot nu toe als één ding behandeld (`ev.squawk in EMERGENCY_SQUAWKS` ->
+        # 100 punten -> onmiddellijk BEVESTIGD). Zie CHECKPOINT.md bevinding 15.
+        if ev.squawk == "7700":
+            # Algemene noodsituatie: de enige van de drie die sterk met
+            # uitwijken samenhangt (medisch, drukverlies, motorstoring, rook
+            # eindigen vrijwel allemaal op een ander veld dan gefiled), en
+            # daarmee de enige die in zijn eentje mag bevestigen.
             return 100.0, "emergency_squawk", f"noodsquawk {ev.squawk}"
+        if ev.squawk == "7500":
+            # Kaping. Echte gevallen zijn wereldwijd een handvol per decennium;
+            # een KORTSTONDIGE 7500 is vrijwel altijd doordraaien tijdens het
+            # instellen van een andere code — de bekende reden dat ATC hier
+            # spurious alerts van krijgt. Daarom een persistentie-eis van één
+            # cyclus (~15s op tier0) via het bestaande is_repeat_type-mechanisme:
+            # de eerste waarneming blijft onder incident_score_possible_threshold
+            # (25) en is dus niet eens zichtbaar. Houdt hij aan, dan telt hij vol
+            # mee en mag hij bevestigen.
+            return (100.0 if is_repeat_type else 20.0), "unlawful_squawk", f"noodsquawk {ev.squawk} (kaping)"
+        if ev.squawk == "7600":
+            # Radiostoring. ICAO Annex 2 / 14 CFR 91.185 schrijven bij verlies
+            # van radioverbinding voor om het ingediende vluchtplan naar de
+            # BESTEMMING af te vliegen — dit is dus geen bewijs voor een
+            # uitwijking maar eerder het tegendeel. In de praktijk bovendien een
+            # nuisance-reeks (N81051: 26 rijen in vier minuten). Blijft
+            # zichtbaar als context, notificeert en bevestigt nooit alleen.
+            return (8.0 if is_repeat_type else 25.0), "nordo_squawk", f"noodsquawk {ev.squawk} (radiostoring)"
         if ev.confidence == "WAARSCHIJNLIJK":
             # Already capped by main.py's enrich_events (conspicuity squawk
             # or cross-provider disagreement) — see providers.
             # CONSPICUITY_SQUAWKS / cross_provider_confirms_emergency.
             return 8.0, "emergency_status_low_trust", "emergency-status (laag vertrouwen — conspicuity-squawk of niet bevestigd)"
-        return 35.0, "emergency_status", "emergency-status op discrete squawk"
+        return 20.0, "emergency_status", "emergency-status op discrete squawk"
     if et == "wrong_airport":
         # CHECKPOINT.md bevinding 1: main.py's enrich_events kende voor
         # wrong_airport al twee vetos, maar allebei zetten ze alléén
