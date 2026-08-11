@@ -657,10 +657,32 @@ async def tier1_loop(session, store: TrackStore, airport_db: AirportDB, incident
                 # that callsign. Found while investigating a live report of
                 # bad-looking learned routes; the database itself has since
                 # been reset, this prevents it recurring.
+                # `skip_behavioral` alleen is niet genoeg gebleken: dat filtert
+                # op SUPPRESSED_CLASSES, en ONBEKEND staat daar niet in. Een
+                # toestel zonder dbFlags/category waarvoor ook de
+                # hexdb-verfijning niets opleverde, blijft ONBEKEND en werd
+                # gewoon opgenomen — live werd de hele tabel daardoor gevuld met
+                # circuitvluchten van GA-toestellen (N7041X KIWA->KIWA, BRW1
+                # KFCM->KFCM, ...). Zie CHECKPOINT.md bevinding 17.
+                #
+                # ONBEKEND aan SUPPRESSED_CLASSES toevoegen zou te grof zijn:
+                # dat schakelt ook de DETECTOREN uit voor een groot deel van het
+                # verkeer. De vervuiling zit specifiek in het LEREN. En daar
+                # hoort de bewijslast juist hoog te liggen, precies andersom dan
+                # bij detectie: een geleerde route is grondwaarheid die een
+                # ECHTE uitwijking kan onderdrukken (zie
+                # detect_landed_wrong_airport's get_learned_destinations-tak).
+                # Alleen de LANDINGSwaarneming (de schrijfkant van
+                # learned_routes) wordt hierop gefilterd, niet record_takeoff.
+                # Die zet namelijk óók track.last_takeoff_ts, en dáár hangt
+                # detect_landed_wrong_airport's early-return-tak van af — die
+                # moet gewoon blijven werken voor elk toestel waarvoor de
+                # detectoren draaien, ongeacht of we er routes van willen leren.
+                learn_routes = track.aircraft_class == classify.AIRLINER
                 if not skip_behavioral and just_took_off and ac.get("lat") is not None:
                     airport, _ = airport_db.nearest(ac["lat"], ac["lon"], max_km=15.0)
                     store.record_takeoff(track, airport, now)
-                elif not skip_behavioral and just_landed and ac.get("lat") is not None:
+                elif not skip_behavioral and learn_routes and just_landed and ac.get("lat") is not None:
                     airport, _ = airport_db.nearest(ac["lat"], ac["lon"], max_km=15.0)
                     if airport:
                         store.record_landing_observation(track, airport)
@@ -744,6 +766,31 @@ async def tier1_loop(session, store: TrackStore, airport_db: AirportDB, incident
         await asyncio.sleep(cfg["tier1_interval_seconds"])
 
 
+async def retention_loop(db_conn, cfg: dict):
+    """Ruimt periodiek op wat buiten zijn bewaarvenster valt (CHECKPOINT.md
+    bevinding 17). Een eigen lus, los van tier0/tier1, zodat een trage DELETE
+    nooit een detectiecyclus ophoudt. Draait één keer meteen bij het opstarten:
+    een VM die maanden aan stond moet niet eerst retention_interval_hours
+    wachten voor de eerste opruiming."""
+    while True:
+        try:
+            deleted = db_module.prune(
+                db_conn,
+                event_days=cfg["retention_event_days"],
+                incident_days=cfg["retention_incident_days"],
+                learned_route_days=cfg["retention_learned_route_days"],
+            )
+            total = sum(deleted.values())
+            if total:
+                log.info("retentie: %d rijen verwijderd %s", total, deleted)
+            # VACUUM vraagt exclusieve toegang, dus alleen wanneer er echt veel
+            # weg is; het checkpoint zelf draait altijd.
+            db_module.checkpoint(db_conn, vacuum=total > 10000)
+        except Exception:
+            log.exception("retentie-lus fout")
+        await asyncio.sleep(cfg["retention_interval_hours"] * 3600)
+
+
 async def main():
     cfg = CONFIG
     if not cfg["telegram_bot_token"]:
@@ -769,6 +816,7 @@ async def main():
             await asyncio.gather(
                 tier0_loop(session, store, incident_mgr, cfg, db_conn),
                 tier1_loop(session, store, airport_db, incident_mgr, cfg, db_conn),
+                retention_loop(db_conn, cfg),
             )
     finally:
         db_conn.close()

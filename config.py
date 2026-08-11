@@ -209,6 +209,13 @@ _DEFAULTS = {
 
     # Off by default: see fr24_confirm.py for the ToS/reliability tradeoffs.
     "fr24_confirm_enabled": False,
+
+    # Retentie (CHECKPOINT.md bevinding 17). Geen tabel had een bovengrens;
+    # niets leest verder terug dan 24 uur.
+    "retention_interval_hours": 6,
+    "retention_event_days": 7,
+    "retention_incident_days": 30,
+    "retention_learned_route_days": 180,
 }
 
 

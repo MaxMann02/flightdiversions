@@ -1,6 +1,9 @@
+import logging
 import os
 import sqlite3
 import time
+
+log = logging.getLogger("db")
 
 _DB_PATH = os.path.join(os.path.dirname(__file__), "data", "flightdiversions.sqlite3")
 
@@ -100,6 +103,21 @@ CREATE TABLE IF NOT EXISTS incident_evidence (
 CREATE INDEX IF NOT EXISTS idx_evidence_incident ON incident_evidence (incident_id);
 """
 
+# Retentie (CHECKPOINT.md bevinding 17). Geen enkele consument kijkt verder
+# terug dan server.py's FEED_WINDOW_SECONDS/INCIDENT_FEED_WINDOW_SECONDS (beide
+# 24 uur), dus deze vensters zijn ruim: ze zijn gekozen op wat een MENS bij een
+# onderzoek achteraf nog wil kunnen nakijken, niet op wat de code nodig heeft.
+EVENT_RETENTION_DAYS = 7
+INCIDENT_RETENTION_DAYS = 30
+LEARNED_ROUTE_RETENTION_DAYS = 180
+
+# Een detector die een ONVERANDERDE toestand blijft waarnemen (een toestel dat
+# een uur lang 7600 squawkt, een aanhoudende daling) levert anders één identieke
+# rij per cyclus op — bij tier0 elke 15 seconden. Live gemeten: N81051 stond 26x
+# in de events-tabel binnen 226 seconden. Zie CHECKPOINT.md bevinding 17.
+EVENT_DEDUPE_SECONDS = 600
+_last_event_ts: dict[tuple, float] = {}
+
 
 def connect(db_path: str | None = None) -> sqlite3.Connection:
     """db_path defaults to the real on-disk database; pass ':memory:' (or
@@ -125,6 +143,12 @@ def record_route_observation(conn: sqlite3.Connection, callsign: str, origin_ica
     (saw it depart, then land somewhere). Builds our own ground truth over
     time, independent of adsbdb's static/sometimes-stale mapping."""
     if not callsign or not origin_icao or not destination_icao:
+        return
+    if origin_icao == destination_icao:
+        # Circuitvlucht/touch-and-go, geen route. Dit vulde de tabel volledig
+        # (zie CHECKPOINT.md bevinding 17) en kan nooit ergens goed voor zijn:
+        # detect_landed_wrong_airport keert bij een origin-match al vóór de
+        # learned-check terug.
         return
     # `is not None`, not `ts or time.time()` — 0.0 is a falsy-but-valid
     # timestamp; see state.py's TrackStore.update for where this exact
@@ -176,13 +200,28 @@ def save_event(conn: sqlite3.Connection, ev, ts: float | None = None):
     see that file's FEED_WINDOW_SECONDS comment for the full explanation).
     `events` is a raw, append-only log of every detector hit; de-
     duplication/escalation happens entirely in the incident engine
-    (incidents.py's notified_state gate), not here."""
+    (incidents.py's notified_state gate), not here.
+
+    Sinds CHECKPOINT.md bevinding 17 wordt een identieke rij binnen
+    EVENT_DEDUPE_SECONDS overgeslagen. `events` is puur een weergavelog (alleen
+    server.py leest het; de incident-engine leest incident_evidence), dus
+    samenvouwen kost hier geen detectie-informatie en de tijdlijn van het
+    incident blijft ongemoeid. De sleutel bevat de confidence: verandert die,
+    dan is het wél nieuwe informatie en wordt er geschreven.
+    """
     # `is not None`, not `ts or time.time()` — see state.py's TrackStore.
     # update for where this exact pattern was found to actually bite
     # (BACKTEST_LOG.md ronde 24). Never actually called with an explicit ts
     # anywhere in this codebase today, so latent here rather than
     # triggered — fixed anyway to close the whole bug class.
     ts = ts if ts is not None else time.time()
+    # Bewust in-memory en niet als DB-query: dit schrijfpad komt per cyclus
+    # honderden keren langs, en na een herstart één extra rij per toestel
+    # schrijven is precies de goede kant om fout te gaan.
+    key = (ev.hex, ev.event_type, ev.confidence)
+    if ts - _last_event_ts.get(key, float("-inf")) < EVENT_DEDUPE_SECONDS:
+        return
+    _last_event_ts[key] = ts
     conn.execute(
         "INSERT INTO events (hex, callsign, event_type, confidence, message, squawk, alt, lat, lon, "
         "origin_icao, dest_icao, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -354,3 +393,68 @@ def get_sweep_status(conn: sqlite3.Connection) -> dict:
     return {"tracked_count": row[0], "last_tier0_ts": row[1], "last_tier1_ts": row[2]} if row else {
         "tracked_count": None, "last_tier0_ts": None, "last_tier1_ts": None,
     }
+
+
+def prune(conn: sqlite3.Connection, now: float | None = None,
+          event_days: float = EVENT_RETENTION_DAYS,
+          incident_days: float = INCIDENT_RETENTION_DAYS,
+          learned_route_days: float = LEARNED_ROUTE_RETENTION_DAYS) -> dict:
+    """Verwijdert alles wat buiten zijn bewaarvenster valt. Geeft
+    {tabel: aantal verwijderde rijen} terug. Zie CHECKPOINT.md bevinding 17.
+
+    Harde regel: een OPEN incident (resolved_ts IS NULL) wordt nooit verwijderd,
+    hoe oud ook — incidents.py houdt zijn in-memory _open-dict gesynchroniseerd
+    met die rijen, en een verdwenen rij zou daar een incident achterlaten dat
+    naar niets meer verwijst. Alleen afgesloten incidenten vervallen, en hun
+    evidence-rijen gaan mee."""
+    now = now if now is not None else time.time()
+    deleted = {}
+
+    cur = conn.execute("DELETE FROM events WHERE ts < ?", (now - event_days * 86400,))
+    deleted["events"] = cur.rowcount
+
+    cutoff = now - incident_days * 86400
+    cur = conn.execute(
+        "DELETE FROM incident_evidence WHERE incident_id IN "
+        "(SELECT id FROM incidents WHERE resolved_ts IS NOT NULL AND resolved_ts < ?)",
+        (cutoff,),
+    )
+    deleted["incident_evidence"] = cur.rowcount
+    cur = conn.execute(
+        "DELETE FROM incidents WHERE resolved_ts IS NOT NULL AND resolved_ts < ?", (cutoff,))
+    deleted["incidents"] = cur.rowcount
+
+    # origin == destination is geen route maar een circuitvlucht/touch-and-go —
+    # live gezien als de complete top van deze tabel (N7041X KIWA->KIWA, BRW1
+    # KFCM->KFCM, ...). Altijd weg, ongeacht ouderdom.
+    cur = conn.execute("DELETE FROM learned_routes WHERE origin_icao = destination_icao")
+    deleted["learned_routes_self"] = cur.rowcount
+    cur = conn.execute(
+        "DELETE FROM learned_routes WHERE last_seen < ?", (now - learned_route_days * 86400,))
+    deleted["learned_routes_stale"] = cur.rowcount
+
+    # Dode tabel (zie het schemacommentaar bovenaan dit bestand): de tabel
+    # blijft staan zodat een bestaande deployment geen migratie nodig heeft, de
+    # rijen niet.
+    cur = conn.execute("DELETE FROM alert_cooldowns")
+    deleted["alert_cooldowns"] = cur.rowcount
+
+    conn.commit()
+    return deleted
+
+
+def checkpoint(conn: sqlite3.Connection, vacuum: bool = False):
+    """Rekent het WAL-bestand af. server.py is een tweede, langlevend
+    leesproces; een openstaande leestransactie blokkeert het automatische
+    checkpointen, waardoor het WAL onbegrensd doorgroeit (live gezien: 4,1 MB
+    WAL bij een database van 131 KB). Best-effort: een mislukt checkpoint is
+    nooit een reden om de monitor te laten vallen."""
+    try:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except sqlite3.Error as e:
+        log.warning("wal_checkpoint mislukt: %s", e)
+    if vacuum:
+        try:
+            conn.execute("VACUUM")
+        except sqlite3.Error as e:
+            log.warning("VACUUM mislukt (database in gebruik): %s", e)
