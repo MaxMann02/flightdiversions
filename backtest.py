@@ -1275,13 +1275,42 @@ def check_route_corroboration(airport_db: AirportDB) -> bool:
     print("\n=== route-corroboratie (bevestigd vs. slechts onweersproken) ===")
     all_ok = True
 
-    # Real geometry, EK225's own case: DXB->SFO, at the point over Nyagan
-    # where it actually turned back. It had genuinely flown most of the way
-    # toward SFO, so the filed route is corroborated by our own observation.
+    # Real geometry, EK225's own case: DXB->SFO (7030nm).
+    #
+    # Deze assertie is bij bevinding 16 OMGEDRAAID, en dat verdient uitleg —
+    # het is geen test die is bijgesteld om te laten slagen.
+    #
+    # Zij testte één los punt: de positie boven Nyagan (62.1N, 65.4E) waar
+    # EK225 daadwerkelijk terugkeerde, en eiste dat DAT punt de route
+    # corroboreert. Nagerekend ligt dat punt echter 353nm van de directe
+    # OMDB->KSFO-lijn: 5.0% van de routelengte, en meer dan de 250nm die
+    # corridor_deviation zelf als "afwijking" telt. Eén waarneming 353nm naast
+    # de gefilede lijn op 32% voortgang is nu juist NIET onderscheidend — zij is
+    # even goed verenigbaar met "dit toestel vliegt ergens anders heen", wat de
+    # gemeten hoofdfoutbron van dit systeem is (bevinding 16: 21 van 28
+    # doorgerekende combinaties).
+    #
+    # Wat EK225's route wél corroboreert is de rest van zijn spoor: de cruise
+    # over Siberië ligt op 2.1nm van de gefilede grootcirkel. Dat is de
+    # waarneming die een verkeerd gematchte schedule niet kan produceren, en
+    # daarop corroboreert de case eind-tot-eind nog steeds — zie
+    # check_real_case_confidence_outcomes, waar EK225 onveranderd BEVESTIGD
+    # haalt. Beide punten staan hieronder, zodat het verschil expliciet bewaakt
+    # blijft in plaats van impliciet te verdwijnen.
     dxb, sfo = airport_db.get("OMDB"), airport_db.get("KSFO")
-    ok = route_corroborated_by_progress(dxb["lat"], dxb["lon"], sfo["lat"], sfo["lon"], 62.1, 65.4)
-    all_ok = all_ok and ok
-    print(f"  EK225 boven Nyagan op de gefilede OMDB->KSFO-route: gecorroboreerd: {'OK' if ok else 'FAIL'}")
+    # Een ECHT sample uit EK225's eigen spoor (backtest_cases.py), niet een
+    # verzonnen coördinaat: 2.05nm van de gefilede lijn op 32% voortgang.
+    # 39 van de 661 samples van deze case halen deze toets — ruim genoeg om de
+    # route eenmalig als gecorroboreerd vast te leggen.
+    on_route = route_corroborated_by_progress(dxb["lat"], dxb["lon"], sfo["lat"], sfo["lon"], 62.9851, 52.7412)
+    all_ok = all_ok and on_route
+    print(f"  EK225 op de gefilede OMDB->KSFO-corridor (2.1nm ernaast, 32% voortgang): "
+          f"gecorroboreerd: {'OK' if on_route else 'FAIL'}")
+
+    nyagan = route_corroborated_by_progress(dxb["lat"], dxb["lon"], sfo["lat"], sfo["lon"], 62.1, 65.4)
+    all_ok = all_ok and not nyagan
+    print(f"  ...maar het losse keerpunt boven Nyagan (353nm = 5.0% naast de lijn) corroboreert "
+          f"in zijn eentje NIET: {'OK' if not nyagan else 'FAIL'}")
 
     # Same function, the schedule-mismatch shape that drives the live false
     # positives (DLH8NK: adsbdb filed EDDF->LEMG, aircraft actually near
@@ -2510,6 +2539,159 @@ def check_evidence_refutation(airport_db: AirportDB) -> bool:
     return all_ok
 
 
+def check_route_corroboration_discriminates(airport_db: AirportDB) -> bool:
+    """CHECKPOINT.md bevinding 16 — de bevinding achter "bijna alle valse
+    positieven komen uit het routesysteem".
+
+    `route_corroborated_by_progress` eiste alleen dat het toestel 30% dichter
+    bij de gefilede bestemming was gekomen, met als motivering dat een verkeerd
+    gematchte schedule dat "vrijwel nooit" haalt. Nagerekend klopt dat niet:
+    vliegt het toestel in werkelijkheid naar A terwijl D gefiled staat, en ligt
+    A onder hoek theta van D gezien vanaf het vertrekpunt, dan komt het tot op
+    L*sin(theta) van D — dus corroboreerde ELKE hoekfout tot 44 graden.
+
+    Erger nog is de VOLGORDE: route_plausible staat ervoor en filtert de wild
+    verkeerde routes al weg, dus deze toets werd uitsluitend toegepast op
+    precies de verzameling die hij niet kan beoordelen.
+
+    Dit is bewust een METING en geen puntcontrole: hij rekent het raster van
+    routelengtes x hoekfouten door en telt hoeveel combinaties tegelijk (i)
+    corridor_deviation laten vuren en (ii) de route gecorroboreerd verklaren —
+    een volledig vals-positiefpad. Faalt zodra dat aantal boven nul komt."""
+    import math
+
+    from airports import (cross_track_distance_nm, haversine_nm,
+                          route_corroborated_by_progress, _intermediate_point)
+
+    print("\n=== route-corroboratie onderscheidt foute routes (rastermeting) ===")
+    R_NM = 3440.065
+
+    def dest_point(lat, lon, brg, dist_nm):
+        br, d = math.radians(brg), dist_nm / R_NM
+        p1, l1 = math.radians(lat), math.radians(lon)
+        p2 = math.asin(math.sin(p1) * math.cos(d) + math.cos(p1) * math.sin(d) * math.cos(br))
+        l2 = l1 + math.atan2(math.sin(br) * math.sin(d) * math.cos(p1),
+                             math.cos(d) - math.sin(p1) * math.sin(p2))
+        return math.degrees(p2), math.degrees(l2)
+
+    cfg = CONFIG
+    origin = (50.0, 5.0)
+    false_positive_paths = []
+    fires_total = 0
+    for route_len in (400, 900, 2000, 5000):
+        threshold = max(cfg["corridor_deviation_min_nm"],
+                        min(cfg["corridor_deviation_max_nm"], route_len * cfg["corridor_deviation_pct"]))
+        buffer_nm = max(30.0, min(150.0, route_len * 0.05))
+        for theta in (5, 10, 15, 20, 30, 40, 45):
+            filed = dest_point(origin[0], origin[1], 90.0, route_len)
+            actual = dest_point(origin[0], origin[1], 90.0 + theta, route_len)
+            fires = corroborated = False
+            for i in range(1, 301):
+                cur = _intermediate_point(origin[0], origin[1], actual[0], actual[1], i / 300.0)
+                xtd = cross_track_distance_nm(origin[0], origin[1], filed[0], filed[1], cur[0], cur[1])
+                d_from_origin = haversine_nm(origin[0], origin[1], cur[0], cur[1])
+                d_to_dest = haversine_nm(cur[0], cur[1], filed[0], filed[1])
+                if d_from_origin >= buffer_nm and d_to_dest >= buffer_nm and xtd >= threshold:
+                    fires = True
+                if route_corroborated_by_progress(origin[0], origin[1], filed[0], filed[1], cur[0], cur[1]):
+                    corroborated = True
+            if fires:
+                fires_total += 1
+            if fires and corroborated:
+                false_positive_paths.append((route_len, theta))
+
+    ok = not false_positive_paths
+    print(f"  {fires_total}/28 combinaties laten corridor_deviation vuren op een FOUTE route")
+    print(f"  daarvan verklaren er {len(false_positive_paths)} de route óók nog gecorroboreerd "
+          f"(= volledig vals-positiefpad; was 21 vóór bevinding 16): "
+          f"{'OK' if ok else 'FAIL ' + str(false_positive_paths)}")
+
+    # De andere kant op: de toets mag niet zó streng zijn dat niets meer
+    # corroboreert. Een toestel dat de gefilede route daadwerkelijk aflegt moet
+    # hem wél bevestigen — anders is de poort niet streng maar kapot.
+    filed = dest_point(origin[0], origin[1], 90.0, 2000)
+    on_route_ok = any(
+        route_corroborated_by_progress(origin[0], origin[1], filed[0], filed[1], *cur)
+        for cur in (_intermediate_point(origin[0], origin[1], filed[0], filed[1], f / 20.0)
+                    for f in range(1, 20))
+    )
+    print(f"  een toestel dat de gefilede route wél aflegt corroboreert nog steeds: "
+          f"{'OK' if on_route_ok else 'FAIL'}")
+
+    return ok and on_route_ok
+
+
+def check_unverified_route_geometry_cap(airport_db: AirportDB) -> bool:
+    """CHECKPOINT.md bevinding 16, tweede helft. Bevinding 4 stelde vast dat
+    vrijwel elke detector tegen dezelfde track.route["destination_*"] meet, en
+    dat meerdere detectoren die tegelijk afgaan dus één fout is die meerdere
+    keren wordt waargenomen. Die conclusie is toen alleen in de BEVESTIGD-poort
+    verwerkt; de SCORE telde ze daarna nog gewoon op (corridor_deviation 55 +
+    premature_descent 60 = 115).
+
+    Dat is niet alleen een BEVESTIGD-probleem: _maybe_notify vuurt op
+    WAARSCHIJNLIJK (55), en corridor_deviation haalt dat plafond in zijn eentje.
+    Elke eerdere ronde verdedigde het aanscherpen van de poort met "dat kost
+    vrijwel geen meldingen" — maar de klacht van de gebruiker gaat juist over
+    meldingen, en aan die kant was nog nooit iets aangescherpt."""
+    import classify
+    import db as db_module
+    import incidents as incidents_module
+    from detector import Event
+
+    print("\n=== gedeeld plafond op onbevestigde route-meetkunde ===")
+    all_ok = True
+    cfg = dict(CONFIG)
+    likely = cfg["incident_score_likely_threshold"]
+
+    def replay(hex_id, corroborated, cycles=30):
+        mgr = incidents_module.IncidentManager(db_module.connect(":memory:"), cfg, airport_db)
+        t = 1000.0
+        for i in range(cycles):
+            for et in ("corridor_deviation", "premature_descent", "holding_pattern"):
+                mgr.step(hex_id, "TSTG", classify.AIRLINER, [Event(
+                    hex=hex_id, callsign="TSTG", event_type=et, confidence="MOGELIJK",
+                    message=f"m{i}", origin_icao="EDDF", dest_icao="LEMG",
+                    at_destination=False, route_corroborated=corroborated)], {"squawk": "1200"}, t)
+            t += 60.0
+        inc = mgr._open[hex_id]
+        return inc["score"], inc["state"]
+
+    # Het EDDF->LEPA/LEMG-scenario uit bevinding 16 punt 2: drie
+    # route-meetkundige detectoren die alle drie blijven vuren omdat de gefilede
+    # bestemming fout is. Vóór deze fix: 115+ punten -> BEVESTIGD + Telegram.
+    score, state = replay("geo1", corroborated=False)
+    ok = score <= likely - 1 and state == incidents_module.POSSIBLE
+    all_ok = all_ok and ok
+    print(f"  3 route-meetkundige detectoren, 30 cycli, ONbevestigde route: score {score:.0f} "
+          f"(plafond {likely - 1:.0f}), state {state} — geen notificatie: {'OK' if ok else 'FAIL'}")
+
+    # Regressiebewaking de andere kant op: met een bevestigde route valt het
+    # gedeelde plafond weg en gedraagt de score zich als voorheen.
+    score, state = replay("geo2", corroborated=True)
+    ok = score > likely and state in (incidents_module.LIKELY, incidents_module.CONFIRMED)
+    all_ok = all_ok and ok
+    print(f"  dezelfde drie detectoren op een BEVESTIGDE route: score {score:.0f}, state {state} "
+          f"— plafond valt weg: {'OK' if ok else 'FAIL'}")
+
+    # Grondbewijs valt buiten het plafond: een waargenomen landing elders is
+    # geen meetkunde tegen een onbevestigde lijn, en moet ook op een
+    # ongecorroboreerde route nog steeds kunnen notificeren.
+    mgr = incidents_module.IncidentManager(db_module.connect(":memory:"), cfg, airport_db)
+    mgr.step("geo3", "TSTG", classify.AIRLINER, [Event(
+        hex="geo3", callsign="TSTG", event_type="wrong_airport", confidence="BEVESTIGD",
+        message="geland elders", origin_icao="EDDF", dest_icao="LEMG",
+        observed_icao="EDDM", route_corroborated=False)], {"squawk": "1200"}, 1000.0)
+    inc = mgr._open.get("geo3")
+    state = inc["state"] if inc else "GESLOTEN"
+    ok = state in (incidents_module.LIKELY, incidents_module.CONFIRMED, "GESLOTEN")
+    all_ok = all_ok and ok
+    print(f"  grondbewijs (wrong_airport) op een ongecorroboreerde route valt buiten het plafond: "
+          f"state {state}: {'OK' if ok else 'FAIL'}")
+
+    return all_ok
+
+
 def check_emergency_semantics(airport_db: AirportDB) -> bool:
     """CHECKPOINT.md bevinding 15. Dit systeem is een UITWIJKdetector, maar de
     emergency-tak beantwoordde een andere vraag: "is er iets mis?". Twee gaten:
@@ -2619,6 +2801,8 @@ def main():
     pd_sl_crosscheck_ok = check_premature_descent_signal_lost_route_crosscheck(airport_db)
     saturation_caps_ok = check_saturation_caps(airport_db)
     route_corroboration_ok = check_route_corroboration(airport_db)
+    route_discriminates_ok = check_route_corroboration_discriminates(airport_db)
+    geometry_cap_ok = check_unverified_route_geometry_cap(airport_db)
     confirmed_bar_ok = check_confirmed_bar_structure(airport_db)
     incident_engine_ok = check_incident_engine_regressions(airport_db)
     incident_engine_real_case_ok = check_incident_engine_real_case_escalation(airport_db)
@@ -2652,6 +2836,8 @@ def main():
     print(f"premature_descent/signal_lost route-source cross-check: {'OK' if pd_sl_crosscheck_ok else 'FAIL — see above'}")
     print(f"verzadigingsplafonds per bewijsbron: {'OK' if saturation_caps_ok else 'FAIL — see above'}")
     print(f"route-corroboratie: {'OK' if route_corroboration_ok else 'FAIL — see above'}")
+    print(f"route-corroboratie onderscheidt foute routes: {'OK' if route_discriminates_ok else 'FAIL — see above'}")
+    print(f"gedeeld plafond op onbevestigde route-meetkunde: {'OK' if geometry_cap_ok else 'FAIL — see above'}")
     print(f"structuur van de BEVESTIGD-poort: {'OK' if confirmed_bar_ok else 'FAIL — see above'}")
     print(f"incident engine: {'OK' if incident_engine_ok else 'FAIL — see above'}")
     print(f"incident engine (real-case escalation, AI850): {'OK' if incident_engine_real_case_ok else 'FAIL — see above'}")

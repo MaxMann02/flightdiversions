@@ -280,6 +280,35 @@ async def enrich_events(session, cfg: dict, events: list, airport_db=None) -> li
                 # staat.
                 ev.route_corroborated = True
 
+        # De drie overgebleven route-afhankelijke detectoren. Zij meten tegen
+        # exact dezelfde track.route["destination_*"] als de drie hierboven,
+        # maar hebben de tweede routebron nooit gezien — terwijl juist zij de
+        # luidruchtigste zijn (corridor_deviation haalt in zijn eentje de
+        # notificatiedrempel).
+        #
+        # Sinds bevinding 16 is corroboratie het schaarse goed: de
+        # voortgangsweg (airports.route_corroborated_by_progress) eist nu ook
+        # dat het toestel daadwerkelijk OP de gefilede corridor is waargenomen,
+        # en een tweede onafhankelijke bron is daarmee vaak de enige
+        # beschikbare weg. Die bron hier niet raadplegen zou betekenen dat deze
+        # drie detectoren structureel op MOGELIJK blijven steken, ook als de
+        # route aantoonbaar klopt.
+        #
+        # Alleen de INSTEMMENDE tak, bewust. Bij onenigheid gebeurt er niets
+        # extra's: route_corroborated blijft dan False, en het gedeelde plafond
+        # op onbevestigde route-meetkunde (incidents._ROUTE_GEOMETRY_DIMENSIONS)
+        # houdt het incident dan al onder de notificatiedrempel. Dat is precies
+        # de gewenste uitkomst, zonder drie nieuwe _disputed-bronnen, -plafonds
+        # en -dimensies te moeten invoeren voor een geval dat al goed afloopt.
+        if (ev.event_type in ("corridor_deviation", "course_deviation", "holding_pattern")
+                and cfg.get("route_secondary_source_enabled") and ev.callsign
+                and ev.dest_icao and not ev.route_corroborated):
+            hexdb_pair = await providers.lookup_route_hexdb(session, ev.callsign)
+            if hexdb_pair is not None and hexdb_pair[1] == ev.dest_icao:
+                ev.route_corroborated = True
+                log.info("%s voor %s: tweede routebron (hexdb.io) bevestigt bestemming %s",
+                          ev.event_type, ev.callsign, ev.dest_icao)
+
         # The 'emergency status' ADS-B subfield (nordo/lifeguard/minfuel/...)
         # is a separate, much less reliable signal than the 7700/7600/7500
         # squawk codes — see providers.cross_provider_confirms_emergency's
