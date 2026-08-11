@@ -2716,3 +2716,362 @@ komt uit op WAARSCHIJNLIJK in plaats van BEVESTIGD. Dat is de bewuste
 richting van de fout: WAARSCHIJNLIJK notificeert nog steeds, en zodra zo'n
 vlucht ergens anders landt levert `wrong_airport` alsnog DIM_GROUND_TRUTH.
 Verkeerd-om zou wél kosten: dat is de huidige toestand.
+
+---
+
+## Bevinding 17 — Geen enkele tabel heeft een bovengrens, en één ervan verzamelt bovendien rijen die per definitie geen route kunnen zijn
+
+**Status:** gevalideerd (2026-08-11) — `check_retention` in `backtest.py`
+(9 assertions). Volledige run: 10/10 cases, **189** assertions, geen FAIL.
+Geimplementeerd in `db.py` (`prune`, `checkpoint`, `save_event`-dedupe,
+`record_route_observation`-guard), `config.py` (vier retentiesleutels),
+`main.py` (`retention_loop`, en de leerkant gefilterd op AIRLINER) en
+`incidents.py` (throttle op verzadigde nulrijen).
+
+**Gemeten op de echte lokale database, na de analyse — de vervuiling is erger
+dan de steekproef in punt (c) suggereerde:**
+
+```
+learned_routes met origin == destination :  69 van 81  (85%)
+learned_routes ouder dan 180 dagen       :   0
+events ouder dan 7 dagen                 :   0 van 193
+afgesloten incidenten ouder dan 30 dagen :   0 van 30
+alert_cooldowns (dode tabel)             :   4
+```
+
+**85% van de "geleerde routes" is dus een circuitvlucht.** Dat is geen
+opslagprobleem meer maar een detectieprobleem: elk van die 69 rijen wordt door
+`get_learned_destinations` als eigen grondwaarheid teruggegeven aan
+`detect_landed_wrong_airport` om een uitwijking te ONDERDRUKKEN. De tabel die
+bedoeld was als tegenwicht tegen adsbdb's verouderde data bestond voor vijf
+zesde uit ruis.
+
+De vensters zelf (7/30/180 dagen) raken de lokale database nog niet — die
+draaide te kort. Ze zijn er voor de VM, waar de gebruiker de 50.000+ rijen zag.
+
+**Tijdens de implementatie bijgesteld.** Punt (g) van de fix wilde de leerkant
+op `AIRLINER` filteren door `record_takeoff` en `record_landing_observation`
+allebei te poorten. Dat is fout: `record_takeoff` zet óók
+`track.last_takeoff_ts`, en daar hangt `detect_landed_wrong_airport`'s
+early-return-tak van af (de TO3510-case). Alleen de LANDINGSwaarneming — de
+schrijfkant van `learned_routes` — wordt nu gefilterd; `record_takeoff` blijft
+draaien voor elk toestel waarvoor de detectoren draaien.
+
+Aangewezen door de gebruiker: ">50.000 rijen, dat moet echt anders ingericht".
+
+### 1. Wat er precies mis is
+
+**(a) Vier tabellen groeien onbegrensd; niets leest ze ooit terug.**
+
+`db.py` kent geen enkele `DELETE`. Wat er geschreven wordt blijft er staan, voor
+altijd. Tegelijk leest `server.py` maar een klein, recent venster:
+
+| tabel | wie leest | leesvenster |
+|---|---|---|
+| `events` | `get_recent_events`, `count_events_since` | `FEED_WINDOW_SECONDS` = **24 uur**, `limit=200` |
+| `incidents` | `get_active_incidents`, `get_recent_resolved_incidents`, `count_incidents_by_resolution` | open incidenten + **24 uur** afgesloten, `limit=20` |
+| `incident_evidence` | `get_incident_evidence` | per incident, alleen voor incidenten die het dashboard toont |
+| `learned_routes` | `get_learned_destinations`, `get_top_learned_routes` | per callsign, `limit=20` |
+
+Alles ouder dan 24 uur is dus voor niemand meer zichtbaar, maar wordt wel
+bewaard, geïndexeerd (`idx_events_ts`) en bij elke query meegesleept. Er is niet
+één consument die meer dan een dag terugkijkt.
+
+**(b) De schrijfkant logt een ONVERANDERDE toestand elke cyclus opnieuw.**
+
+`save_event` wordt aangeroepen voor elk ruw detector-Event, elke cyclus, zonder
+enige de-duplicatie. Voor tier0 is dat elke **15 seconden**. Meetbaar in de
+lokale database:
+
+```
+ab0c7d / N81051, squawk 7600:  26 rijen in 226 seconden
+899006,          squawk 7700:   6 rijen in  60 seconden
+```
+
+Eén toestel dat twee uur lang 7600 squawkt levert **480 rijen** op die alle 480
+exact hetzelfde zeggen. De docstring van `save_event` noemt `events` bewust "a
+raw, append-only log of every detector hit" — dat is een verdedigbare keuze voor
+een LOG, maar niet als er nooit iets af gaat.
+
+Dezelfde vorm zit in `incident_evidence`: `_cap_delta` schrijft bewust ook een
+rij met delta 0.0 zodra een bron verzadigd is ("de tijdlijn moet blijven laten
+zien DAT het signaal aanhoudt"). Die redenering klopt, maar bij een tier0-bron
+levert zij vier identieke nulrijen per minuut op, onbeperkt.
+
+**(c) `learned_routes` verzamelt rijen waarin vertrek- en aankomstveld gelijk
+zijn — die kunnen per definitie geen route zijn.**
+
+De lokale tabel, gesorteerd op `times_seen`:
+
+```
+N7041X  KIWA -> KIWA  (3x)
+BRW1    KFCM -> KFCM  (3x)
+N429BH  KFTW -> KFTW  (3x)
+CFGLY   CYKF -> CYKF  (3x)
+N669FS  KPVU -> KPVU  (2x)
+...
+```
+
+**Elke** rij in de top is `origin == destination`: circuitvluchten en
+touch-and-go's van GA-toestellen, opgeslagen als "geleerde route". Ze halen
+allemaal `learned_route_min_times_seen` (2) en worden dus door
+`get_learned_destinations` als betrouwbare eigen grondwaarheid teruggegeven.
+
+`main.py` heeft hier al een filter voor — `record_landing_observation` draait
+alleen als `not skip_behavioral` — maar dat filter lekt: `SUPPRESSED_CLASSES` is
+`{MILITARY, HELICOPTER, LIGHT_OTHER, GA_PRIVATE, BUSINESS_JET}` en **`UNKNOWN`
+staat er niet in**. Een toestel zonder `dbFlags`/`category` waarvoor ook de
+hexdb-verfijning niets opleverde, blijft `ONBEKEND` en wordt gewoon opgenomen.
+Precies de N-nummers hierboven.
+
+**(d) Het WAL-bestand wordt niet afgerekend.**
+
+```
+flightdiversions.sqlite3       131.072 bytes
+flightdiversions.sqlite3-wal 4.124.152 bytes
+```
+
+Een WAL van 31x de database zelf. `connect()` zet `journal_mode=WAL` en
+`busy_timeout=5000` maar checkpoint nooit expliciet, en `server.py` is een
+tweede, langlevend proces dat leest — een lezer die een leestransactie
+openhoudt, blokkeert het automatische checkpointen. Zonder dat groeit het
+WAL-bestand door, ook als de database zelf niet groeit.
+
+### 2. Waarom dit een probleem is
+
+Dit is geen esthetisch punt over schijfruimte. Concreet:
+
+> Bij ~10 events per minuut (rond 16 mat alleen al 44 verschillende toestellen
+> met `premature_descent` in één venster van 20 minuten) levert dat ~14.400
+> rijen per dag op. De 50.000 rijen die de gebruiker ziet zijn dus ongeveer
+> drie tot vier dagen draaien. Op een VM die maanden doorloopt betekent dat
+> miljoenen rijen.
+>
+> `get_recent_events` doet `WHERE ts >= ? ORDER BY ts DESC LIMIT 200`. Met
+> `idx_events_ts` blijft dat snel. Maar `count_events_since` telt, en
+> `count_incidents_by_resolution` groepeert zonder index op `resolved_ts`, dus
+> die scannen. Het dashboard wordt dus langzamer naarmate het systeem langer
+> draait, terwijl het exact dezelfde 24 uur toont.
+
+En (c) is geen groeiprobleem maar een CORRECTHEIDSprobleem dat als groeiprobleem
+zichtbaar werd:
+
+> `detect_landed_wrong_airport` raadpleegt `get_learned_destinations` om een
+> uitwijking te ONDERDRUKKEN: "wij hebben deze callsign hier al vaker zien
+> landen, dus dit is normaal". Elke vervuilde rij is dus een potentiële
+> blinde vlek. Een `origin == destination`-rij is bovendien nooit ergens goed
+> voor: `detect_landed_wrong_airport` keert bij `nearest["icao"] == origin` al
+> vóór de learned-check terug (op de early-return-tak na). Het is pure ballast
+> die de tabel vult en de kans op een toevallige botsing met een echte callsign
+> vergroot.
+
+Merk op dat dit ook de bevindingen 15 en 16 raakt vanaf de andere kant: die
+verlagen wat er GEMELD wordt, maar niet wat er wordt WEGGESCHREVEN. Een 7600 die
+niet meer notificeert, schrijft nog steeds 480 rijen.
+
+### 3. De exacte fix
+
+**a. `db.py` — één retentiefunctie, met per tabel een expliciet bewaarvenster.**
+
+```python
+# Retentie (CHECKPOINT.md bevinding 17). Geen enkele consument kijkt verder
+# terug dan server.py's FEED_WINDOW_SECONDS/INCIDENT_FEED_WINDOW_SECONDS (beide
+# 24 uur), dus deze vensters zijn ruim: ze zijn gekozen op wat een MENS bij een
+# onderzoek achteraf nog wil kunnen nakijken, niet op wat de code nodig heeft.
+EVENT_RETENTION_DAYS = 7
+INCIDENT_RETENTION_DAYS = 30
+LEARNED_ROUTE_RETENTION_DAYS = 180
+
+
+def prune(conn, now=None, event_days=EVENT_RETENTION_DAYS,
+          incident_days=INCIDENT_RETENTION_DAYS,
+          learned_route_days=LEARNED_ROUTE_RETENTION_DAYS) -> dict:
+    """Verwijdert alles wat buiten zijn bewaarvenster valt. Geeft
+    {tabel: aantal verwijderde rijen} terug.
+
+    Harde regel: een OPEN incident (resolved_ts IS NULL) wordt nooit verwijderd,
+    hoe oud ook — incidents.py houdt zijn in-memory _open-dict gesynchroniseerd
+    met die rijen, en een verdwenen rij zou daar een incident achterlaten dat
+    naar niets meer verwijst. Alleen afgesloten incidenten vervallen, en hun
+    evidence-rijen gaan mee.
+    """
+    now = now if now is not None else time.time()
+    deleted = {}
+
+    cur = conn.execute("DELETE FROM events WHERE ts < ?", (now - event_days * 86400,))
+    deleted["events"] = cur.rowcount
+
+    cutoff = now - incident_days * 86400
+    cur = conn.execute(
+        "DELETE FROM incident_evidence WHERE incident_id IN "
+        "(SELECT id FROM incidents WHERE resolved_ts IS NOT NULL AND resolved_ts < ?)",
+        (cutoff,),
+    )
+    deleted["incident_evidence"] = cur.rowcount
+    cur = conn.execute(
+        "DELETE FROM incidents WHERE resolved_ts IS NOT NULL AND resolved_ts < ?", (cutoff,))
+    deleted["incidents"] = cur.rowcount
+
+    # origin == destination is geen route maar een circuitvlucht/touch-and-go;
+    # zie bevinding 17 punt (c). Altijd weg, ongeacht ouderdom.
+    cur = conn.execute("DELETE FROM learned_routes WHERE origin_icao = destination_icao")
+    deleted["learned_routes_self"] = cur.rowcount
+    cur = conn.execute(
+        "DELETE FROM learned_routes WHERE last_seen < ?", (now - learned_route_days * 86400,))
+    deleted["learned_routes_stale"] = cur.rowcount
+
+    # Dode tabel (zie het schemacommentaar): de tabel blijft staan zodat een
+    # bestaande deployment geen migratie nodig heeft, de rijen niet.
+    cur = conn.execute("DELETE FROM alert_cooldowns")
+    deleted["alert_cooldowns"] = cur.rowcount
+
+    conn.commit()
+    return deleted
+```
+
+**b. `db.py` — WAL afrekenen en ruimte teruggeven.**
+
+```python
+def checkpoint(conn, vacuum: bool = False):
+    """Rekent het WAL-bestand af. server.py is een tweede, langlevend
+    leesproces; een openstaande leestransactie blokkeert het automatische
+    checkpointen, waardoor het WAL onbegrensd doorgroeit (live gezien: 4,1 MB
+    WAL bij een database van 131 KB). Best-effort: een mislukt checkpoint is
+    nooit een reden om de monitor te laten vallen.
+    """
+    try:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except sqlite3.Error as e:
+        log.warning("wal_checkpoint mislukt: %s", e)
+    if vacuum:
+        try:
+            conn.execute("VACUUM")
+        except sqlite3.Error as e:
+            log.warning("VACUUM mislukt (database in gebruik): %s", e)
+```
+
+`VACUUM` alleen wanneer er daadwerkelijk veel verwijderd is (drempel in
+`main.py`), want hij vraagt exclusieve toegang.
+
+**c. `db.py` — de schrijfkant: geen identieke rij per cyclus.**
+
+`save_event` krijgt een de-duplicatievenster:
+
+```python
+EVENT_DEDUPE_SECONDS = 600
+
+
+def save_event(conn, ev, ts=None):
+    ...
+    # Een detector die een ONVERANDERDE toestand blijft waarnemen (een toestel
+    # dat een uur lang 7600 squawkt, een aanhoudende daling) levert anders één
+    # identieke rij per cyclus op — bij tier0 elke 15 seconden. Live gemeten:
+    # N81051 stond 26x in deze tabel binnen 226 seconden. `events` is puur een
+    # weergavelog (alleen server.py leest het; de incident-engine leest
+    # incident_evidence), dus samenvouwen kost hier geen enkele
+    # detectie-informatie. De TIJDLIJN van het incident blijft ongemoeid.
+    if ts - _last_event_ts.get(key, -inf) < EVENT_DEDUPE_SECONDS: return
+```
+
+Sleutel: `(ev.hex, ev.event_type, ev.confidence)` — verandert de confidence, dan
+is het wél nieuwe informatie en wordt er geschreven.
+
+Bewust in-memory (een dict op moduleniveau) en niet als DB-query: dit is een
+schrijfpad dat per cyclus honderden keren langskomt, en na een herstart één
+extra rij per toestel schrijven is precies de goede kant om fout te gaan.
+
+**d. `incidents.py` — verzadigde nulrijen niet vaker dan één per minuut.**
+
+In `_apply_delta`, alleen wanneer de toegekende delta exact 0.0 is (de bron is
+verzadigd, de rij draagt dus geen score-informatie meer):
+
+```python
+        if delta == 0.0 and self._last_zero_delta_ts.get((inc["id"], source), 0.0) > now - 60.0:
+            skip de evidence-rij
+```
+
+Bewust 60 seconden en geen langer venster: dat is exact de tier1-cadans, dus
+voor elke tier1-gedreven bron verandert er niets, en alleen tier0's extra drie
+samples per minuut vallen weg. Dat is belangrijk, want `_active_dimensions`
+vergelijkt TIJDSTEMPELS van bewijs en weerlegging (bevinding 12) — een langer
+venster zou de "laatste bewijs"-tijdstempel van een dimensie kunnen laten
+achterlopen op een weerlegging die daarna binnenkomt, en zo een dimensie ten
+onrechte laten vervallen. Weerleggingen komen uit tier1, dus met 60 seconden kan
+die volgorde niet omdraaien.
+
+**e. `main.py` — een retentielus.**
+
+```python
+async def retention_loop(db_conn, cfg):
+    """Draait het opschonen periodiek. Los van tier0/tier1 zodat een trage
+    DELETE nooit een detectiecyclus ophoudt."""
+    while True:
+        await asyncio.sleep(cfg["retention_interval_hours"] * 3600)
+        try:
+            deleted = db_module.prune(db_conn)
+            total = sum(deleted.values())
+            log.info("retentie: %d rijen verwijderd %s", total, deleted)
+            db_module.checkpoint(db_conn, vacuum=total > 10000)
+        except Exception:
+            log.exception("retentie-lus fout")
+```
+
+met één keer draaien bij het opstarten (een VM die maanden aan stond, moet niet
+`retention_interval_hours` wachten voor de eerste opruiming), en aangemeld naast
+de bestaande loops in `main()`.
+
+**f. `config.py` — twee nieuwe sleutels.**
+
+```python
+    # Retentie (CHECKPOINT.md bevinding 17).
+    "retention_interval_hours": 6,
+    "retention_event_days": 7,
+    "retention_incident_days": 30,
+    "retention_learned_route_days": 180,
+```
+
+**g. `classify.py` / `main.py` — het lek dat (c) veroorzaakte.**
+
+`UNKNOWN` toevoegen aan `SUPPRESSED_CLASSES` zou te grof zijn: dat zou ook de
+DETECTOREN uitschakelen voor elk toestel dat we niet konden classificeren, en
+dat is een groot deel van het verkeer. De vervuiling zit specifiek in het
+LEREN, niet in het detecteren. Daarom alleen de leerkant strenger:
+
+```python
+                if (not skip_behavioral and track.aircraft_class == classify.AIRLINER
+                        and just_took_off and ac.get("lat") is not None):
+```
+
+oftewel: alleen van toestellen die we positief als lijnverkeer herkennen leren
+we routes. Een geleerde route is grondwaarheid die een echte uitwijking kan
+ONDERDRUKKEN, dus daar hoort de bewijslast hoog te liggen — precies andersom
+dan bij detectie.
+
+En in `record_route_observation` de tweede helft van (c):
+
+```python
+    if origin_icao == destination_icao:
+        return   # circuitvlucht/touch-and-go, geen route
+```
+
+### 4. Validatie
+
+Nieuwe check in `backtest.py`: `check_retention()`.
+
+| assertie | verwacht |
+|---|---|
+| `events` ouder dan `retention_event_days` weg, jonger blijft | ja |
+| afgesloten incident ouder dan venster weg, inclusief zijn `incident_evidence` | ja |
+| **open** incident van 400 dagen oud blijft staan, inclusief evidence | ja (harde regel) |
+| `learned_routes` met `origin == destination` altijd weg | ja |
+| `learned_routes` ouder dan venster weg, recent blijft | ja |
+| `record_route_observation` met `origin == destination` schrijft niets | ja |
+| `save_event` 30x hetzelfde binnen `EVENT_DEDUPE_SECONDS` -> 1 rij | ja |
+| `save_event` met gewijzigde confidence -> wél een tweede rij | ja |
+| `prune` op een lege database gooit niets | ja |
+
+Plus regressiebewaking dat de bestaande incident-engine-checks ongewijzigd
+groen blijven: de nulrij-throttle uit (d) raakt `_source_contrib` niet (die telt
+alleen positieve deltas) en mag `check_saturation_caps`,
+`check_evidence_refutation` en `check_real_case_confidence_outcomes` niet
+veranderen.

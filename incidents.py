@@ -466,6 +466,9 @@ class IncidentManager:
         self.cfg = cfg
         self.airport_db = airport_db
         self._open: dict[str, dict] = {}
+        # (incident_id, source) -> tijdstip van de laatste VERZADIGDE (delta 0)
+        # evidence-rij. Zie _apply_delta / CHECKPOINT.md bevinding 17.
+        self._last_zero_delta_ts: dict[tuple, float] = {}
         for hex_id in self._distinct_hexes_with_open_incidents():
             inc = db_module.get_open_incident(self.db, hex_id, OPEN_STATES)
             if inc:
@@ -811,7 +814,35 @@ class IncidentManager:
         if squawk is not None:
             inc["last_squawk"] = squawk
 
-        db_module.add_incident_evidence(self.db, inc["id"], now, source, delta, description, detector_confidence)
+        # Een VERZADIGDE bron (delta afgekapt tot 0.0) blijft bewust een
+        # evidence-rij opleveren: de tijdlijn moet laten zien DAT het signaal
+        # aanhoudt, ook als het de zekerheid niet meer verhoogt (zie
+        # _cap_delta). Bij een tier0-bron zijn dat vier identieke nulrijen per
+        # minuut, onbeperkt — zie CHECKPOINT.md bevinding 17. Hooguit één per
+        # minuut is genoeg om diezelfde vraag te beantwoorden.
+        #
+        # Precies 60 seconden, en dat is geen willekeurige keuze: dat is exact
+        # de tier1-cadans, dus voor élke tier1-gedreven bron verandert er niets
+        # en vallen alleen tier0's extra samples weg. Dat is nodig omdat
+        # _active_dimensions TIJDSTEMPELS van bewijs en weerlegging vergelijkt
+        # (bevinding 12): een langer venster zou de laatste-bewijs-tijdstempel
+        # van een dimensie kunnen laten achterlopen op een weerlegging die
+        # daarna binnenkomt. Nagelopen welke bronnen dat zou kunnen raken:
+        # _REFUTES_DIMENSION dekt DIM_VANISHED (signal_lost — een eenmalig
+        # Event, herhaalt niet per cyclus) en DIM_LATERAL (course/corridor_
+        # deviation — tier1, dus 60s uit elkaar en nooit afgekapt door dit
+        # venster). Wat overblijft is DIM_DECLARED, en daarvoor bestaat geen
+        # weerleggingsbron. De volgorde kan hier dus niet omdraaien.
+        zero_key = (inc["id"], source)
+        if delta == 0.0 and self._last_zero_delta_ts.get(zero_key, float("-inf")) > now - 60.0:
+            skip_evidence_row = True
+        else:
+            skip_evidence_row = False
+            if delta == 0.0:
+                self._last_zero_delta_ts[zero_key] = now
+
+        if not skip_evidence_row:
+            db_module.add_incident_evidence(self.db, inc["id"], now, source, delta, description, detector_confidence)
         db_module.update_incident(
             self.db, inc["id"],
             state=inc["state"], score=inc["score"], peak_score=inc["peak_score"],

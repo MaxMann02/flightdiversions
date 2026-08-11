@@ -2539,6 +2539,108 @@ def check_evidence_refutation(airport_db: AirportDB) -> bool:
     return all_ok
 
 
+def check_retention() -> bool:
+    """CHECKPOINT.md bevinding 17. Geen enkele tabel had een bovengrens terwijl
+    geen enkele consument verder terugkijkt dan 24 uur (server.py's
+    FEED_WINDOW_SECONDS/INCIDENT_FEED_WINDOW_SECONDS), en de schrijfkant logde
+    een onveranderde toestand elke cyclus opnieuw — live gemeten: N81051 stond
+    26x in `events` binnen 226 seconden.
+
+    Daarnaast verzamelde `learned_routes` rijen met origin == destination
+    (circuitvluchten/touch-and-go's van GA-toestellen), die per definitie geen
+    route kunnen zijn en wél als eigen grondwaarheid worden teruggegeven aan
+    detect_landed_wrong_airport om een uitwijking te ONDERDRUKKEN."""
+    import db as db_module
+    from detector import Event
+
+    print("\n=== retentie / begrensde groei ===")
+    all_ok = True
+    now = 1_000_000.0
+    day = 86400.0
+    conn = db_module.connect(":memory:")
+
+    # --- events: buiten het venster weg, binnen het venster blijft ---
+    for age_days, hex_id in ((10, "old1"), (1, "new1")):
+        db_module.save_event(conn, Event(hex=hex_id, callsign="T", event_type="course_deviation",
+                                          confidence="MOGELIJK", message="m"), ts=now - age_days * day)
+    db_module.prune(conn, now=now, event_days=7)
+    rows = {r[0] for r in conn.execute("SELECT hex FROM events")}
+    ok = rows == {"new1"}
+    all_ok = all_ok and ok
+    print(f"  events ouder dan het venster verwijderd, recente behouden ({rows}): {'OK' if ok else 'FAIL'}")
+
+    # --- open incidenten worden NOOIT verwijderd, hoe oud ook ---
+    open_id = db_module.create_incident(conn, "openx", "T", "MOGELIJK", 30.0, now - 400 * day)
+    db_module.add_incident_evidence(conn, open_id, now - 400 * day, "corridor_deviation", 30.0, "d", None)
+    closed_id = db_module.create_incident(conn, "closedx", "T", "GESLOTEN_VALS_ALARM", 10.0, now - 400 * day)
+    db_module.add_incident_evidence(conn, closed_id, now - 400 * day, "corridor_deviation", 10.0, "d", None)
+    db_module.update_incident(conn, closed_id, resolved_ts=now - 400 * day)
+    db_module.prune(conn, now=now, incident_days=30)
+    remaining = {r[0] for r in conn.execute("SELECT hex FROM incidents")}
+    ok = remaining == {"openx"}
+    all_ok = all_ok and ok
+    print(f"  open incident van 400 dagen oud blijft, afgesloten incident weg ({remaining}): "
+          f"{'OK' if ok else 'FAIL'}")
+    ev_ids = {r[0] for r in conn.execute("SELECT DISTINCT incident_id FROM incident_evidence")}
+    ok = ev_ids == {open_id}
+    all_ok = all_ok and ok
+    print(f"  de evidence van het verwijderde incident ging mee, die van het open incident niet: "
+          f"{'OK' if ok else 'FAIL'}")
+
+    # --- learned_routes ---
+    db_module.record_route_observation(conn, "SELF1", "KIWA", "KIWA", ts=now)
+    ok = conn.execute("SELECT COUNT(*) FROM learned_routes WHERE callsign='SELF1'").fetchone()[0] == 0
+    all_ok = all_ok and ok
+    print(f"  record_route_observation weigert origin == destination (circuitvlucht): "
+          f"{'OK' if ok else 'FAIL'}")
+
+    # Zoals ze er live al in stonden, vóór die weigering bestond.
+    conn.execute("INSERT INTO learned_routes (callsign, origin_icao, destination_icao, times_seen, last_seen) "
+                 "VALUES ('N7041X','KIWA','KIWA',3,?)", (now,))
+    db_module.record_route_observation(conn, "STALE1", "EHAM", "EGLL", ts=now - 400 * day)
+    db_module.record_route_observation(conn, "FRESH1", "EHAM", "EGLL", ts=now - day)
+    db_module.prune(conn, now=now, learned_route_days=180)
+    left = {r[0] for r in conn.execute("SELECT callsign FROM learned_routes")}
+    ok = left == {"FRESH1"}
+    all_ok = all_ok and ok
+    print(f"  bestaande origin==destination-rijen en verouderde routes opgeruimd ({left}): "
+          f"{'OK' if ok else 'FAIL'}")
+
+    # --- schrijfkant: dezelfde onveranderde toestand vouwt samen ---
+    conn2 = db_module.connect(":memory:")
+    ev = Event(hex="spam1", callsign="N81051", event_type="emergency",
+               confidence="BEVESTIGD", message="squawk 7600", squawk="7600")
+    for i in range(30):  # 30 tier0-cycli van 15s = 450s, binnen EVENT_DEDUPE_SECONDS
+        db_module.save_event(conn2, ev, ts=now + i * 15.0)
+    n = conn2.execute("SELECT COUNT(*) FROM events WHERE hex='spam1'").fetchone()[0]
+    ok = n == 1
+    all_ok = all_ok and ok
+    print(f"  30 identieke tier0-hits binnen het dedupe-venster -> {n} rij (was 30): "
+          f"{'OK' if ok else 'FAIL'}")
+
+    # ...maar een gewijzigde confidence is wél nieuwe informatie.
+    ev2 = Event(hex="spam1", callsign="N81051", event_type="emergency",
+                confidence="WAARSCHIJNLIJK", message="squawk 7600", squawk="7600")
+    db_module.save_event(conn2, ev2, ts=now + 60.0)
+    n = conn2.execute("SELECT COUNT(*) FROM events WHERE hex='spam1'").fetchone()[0]
+    ok = n == 2
+    all_ok = all_ok and ok
+    print(f"  een gewijzigde confidence schrijft wél een nieuwe rij ({n}): {'OK' if ok else 'FAIL'}")
+
+    # --- prune/checkpoint op een lege database ---
+    try:
+        db_module.prune(db_module.connect(":memory:"))
+        db_module.checkpoint(conn2)
+        ok = True
+    except Exception as e:
+        ok = False
+        print(f"    {e}")
+    all_ok = all_ok and ok
+    print(f"  prune/checkpoint op een lege database gooit niets: {'OK' if ok else 'FAIL'}")
+
+    return all_ok
+
+
 def check_route_corroboration_discriminates(airport_db: AirportDB) -> bool:
     """CHECKPOINT.md bevinding 16 — de bevinding achter "bijna alle valse
     positieven komen uit het routesysteem".
@@ -2803,6 +2905,7 @@ def main():
     route_corroboration_ok = check_route_corroboration(airport_db)
     route_discriminates_ok = check_route_corroboration_discriminates(airport_db)
     geometry_cap_ok = check_unverified_route_geometry_cap(airport_db)
+    retention_ok = check_retention()
     confirmed_bar_ok = check_confirmed_bar_structure(airport_db)
     incident_engine_ok = check_incident_engine_regressions(airport_db)
     incident_engine_real_case_ok = check_incident_engine_real_case_escalation(airport_db)
@@ -2838,6 +2941,7 @@ def main():
     print(f"route-corroboratie: {'OK' if route_corroboration_ok else 'FAIL — see above'}")
     print(f"route-corroboratie onderscheidt foute routes: {'OK' if route_discriminates_ok else 'FAIL — see above'}")
     print(f"gedeeld plafond op onbevestigde route-meetkunde: {'OK' if geometry_cap_ok else 'FAIL — see above'}")
+    print(f"retentie / begrensde groei: {'OK' if retention_ok else 'FAIL — see above'}")
     print(f"structuur van de BEVESTIGD-poort: {'OK' if confirmed_bar_ok else 'FAIL — see above'}")
     print(f"incident engine: {'OK' if incident_engine_ok else 'FAIL — see above'}")
     print(f"incident engine (real-case escalation, AI850): {'OK' if incident_engine_real_case_ok else 'FAIL — see above'}")
