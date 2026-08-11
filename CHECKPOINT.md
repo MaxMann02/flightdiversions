@@ -3075,3 +3075,100 @@ groen blijven: de nulrij-throttle uit (d) raakt `_source_contrib` niet (die telt
 alleen positieve deltas) en mag `check_saturation_caps`,
 `check_evidence_refutation` en `check_real_case_confidence_outcomes` niet
 veranderen.
+
+---
+
+## Sessie 3 — afsluiting, live verificatie en bewust NIET gedane dingen
+
+**STAND VAN ZAKEN SESSIE 3 (2026-08-12):** bevindingen 15, 16 en 17 zijn alle
+drie geimplementeerd, gevalideerd (`python backtest.py`: 10/10 cases, **189**
+assertions, geen FAIL — 32 nieuw) en gemerged naar `main`.
+
+### Live rookproef (2026-08-11/12, 150 seconden, Telegram uit)
+
+| waarneming | uitkomst |
+|---|---|
+| exceptions | **0** |
+| emergency-STATUSVELD-events (`nordo`/`lifeguard`/`downed`/`minfuel`/`general`) | **0** — dit was de door de gebruiker gerapporteerde hoofdruis |
+| echte noodsquawk | ENY3927 squawkte 7700 en ging correct direct naar BEVESTIGD |
+| `events`-rijen voor die 12 opeenvolgende tier0-waarnemingen | **1** (was: 12) |
+| retentie bij het opstarten | 73 rijen verwijderd: **69** `learned_routes` met `origin == destination` + 4 dode `alert_cooldowns` |
+| `learned_routes` | 81 -> **12** rijen |
+| WAL-bestand | 4.124.152 -> **1.054.752** bytes |
+
+De 7700-tak is dus intact gebleven terwijl de statusveldruis volledig weg is —
+precies de scheiding waar bevinding 15 om draaide.
+
+### Bewust overwogen en NIET gedaan
+
+Twee dingen die tijdens deze ronde zijn doorgedacht en waarvan het antwoord
+"niet doen" is. Expliciet vastgelegd, omdat stilzwijgen hier niet te
+onderscheiden zou zijn van "niet aan gedacht".
+
+**1. `route_plausible`'s doorlopende hercontrole strenger maken.**
+
+Bevinding 16 mat dat die hercontrole nooit vuurt: `plausibel? = True` in alle 28
+combinaties, tot en met 3562nm dwarsafstand op een route van 5000nm, omdat de
+voorwaarde `xtd > route_len` is. Verleidelijk om aan te scherpen. Niet gedaan,
+om drie redenen die pas samen doorslaggevend zijn:
+
+- Het vals-positiefpad dat deze hercontrole zou moeten afsluiten, is al
+  afgesloten door het gedeelde plafond op onbevestigde route-meetkunde
+  (bevinding 16b). Er is geen melding meer die hij zou tegenhouden.
+- De route LOSLATEN is niet gratis: zonder `track.route` kan
+  `detect_landed_wrong_airport` niet meer vuren. Juist bij een ECHTE uitwijking
+  op een ongecorroboreerde route zouden we dan de grondwaarneming verliezen —
+  het enige bewijs dat zo'n incident nog kan bevestigen. De strengere regel zou
+  dus precies het sterkste bewijstype wegnemen in het scenario waar het het
+  hardst nodig is.
+- `main.py` zet bij loslaten `track.route_checked = False`, waarna dezelfde
+  route de volgende cyclus uit de cache terugkomt en opnieuw wordt losgelaten:
+  een oscillatie die alleen lookupbudget kost.
+
+De hercontrole is dus feitelijk dode code, maar het onschadelijke soort. Als
+zij ooit iets moet doen, is de juiste vorm haar te CONDITIONEREN op
+`route_corroborated` (streng zolang de route nooit bevestigd is, los zodra dat
+wel zo is) — niet haar drempel verlagen.
+
+**2. `wrong_airport` op een ongecorroboreerde route onder de
+notificatiedrempel brengen.**
+
+Na bevinding 16 is dit de enige overgebleven bron die zonder route-corroboratie
+nog een melding kan veroorzaken: 90 punten -> WAARSCHIJNLIJK -> Telegram. En de
+verleiding is groot, want ronde 18 mat dat 24 van de 25 live
+`wrong_airport`-hits geen enkel ander bewijs hadden, en ronde 24 dat 6 van de 8
+hexdb-lookups een andere bestemming noemden die exact de "onverwachte"
+luchthaven was.
+
+Toch niet gedaan. De logische vorm lijkt op bevinding 16 (de duiding hangt
+volledig aan een onbevestigde referentie), maar er is een beslissend verschil:
+bij `wrong_airport` weten we PRECIES naar welk veld het toestel is gegaan
+(`observed_icao`). Dat maakt de gerichte toets van bevinding 14 mogelijk —
+noemt de tweede routebron precies dat veld, dan wordt het Event helemaal
+onderdrukt in plaats van gedempt. Bij een koersafwijking bestaat dat aanknoping
+niet; daar is alleen "ergens anders dan de lijn" bekend.
+
+Bovendien is dit de kerndetector van het hele systeem. Hem naar MOGELIJK
+brengen zou betekenen dat een fysiek waargenomen landing op een ander veld dan
+gefiled geen melding meer oplevert, en dat is precies de gebeurtenis waar dit
+project voor bestaat. De huidige calibratie is eerlijk: WAARSCHIJNLIJK
+("waarschijnlijk een uitwijking") beschrijft een waargenomen landing buiten de
+schedule met onbevestigde referentiedata correct, en BEVESTIGD blijft
+onbereikbaar zonder corroboratie (bevinding 1/2).
+
+### Wat hierna nog openstaat
+
+De vier punten onder "Nog niet uitgewerkt" (hierboven) staan nog steeds, met
+één aanvulling uit deze ronde:
+
+- **`corridor_deviation`'s drempel is nooit tegen ECHTE routebowing geijkt.**
+  Bevinding 16 leverde het eerste harde gegeven: EK225's keerpunt boven Nyagan
+  ligt 353nm (5.0%) van de directe OMDB->KSFO-lijn terwijl het toestel op dat
+  moment nog gewoon onderweg was naar SFO. Dat is meer dan de 250nm die de
+  detector daar zelf al "afwijking" noemt. Eén datapunt is geen ijking, maar het
+  suggereert dat de drempel voor lange routes te krap staat — en dat verklaart
+  mogelijk een deel van de historische `corridor_deviation`-ruis die tot nu toe
+  volledig aan foute routedata is toegeschreven (AAL168 KPDX->KCLT 503nm op een
+  route van ~2100nm = 24%, ASH4002 KIAH->KOKC 85nm op ~370nm = 23%). Vergt echte
+  vluchtsporen om te ijken; `backtest_cases.py` interpoleert grootcirkels en kan
+  deze vraag per constructie niet beantwoorden.
